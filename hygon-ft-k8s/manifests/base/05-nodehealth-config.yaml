@@ -1,0 +1,85 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nodehealth-config
+  namespace: hygon-ft
+data:
+  run_nhc.sh: |
+    #!/usr/bin/env bash
+    set -uo pipefail
+
+    readonly NHC_OK=0
+    readonly NHC_BAD=2
+    readonly NHC_REPORT_ONLY=3
+    readonly NHC_PROBE_ERROR=125
+
+    probe_error() {
+      echo "[NHC PROBE ERROR]: $*"
+      echo "[nhc-adapter] ERROR: $*" >&2
+    }
+
+    # Both lookup and execution use the node host namespaces, never the Pod PATH.
+    host_nsenter() (
+      nsenter_path="$(command -v nsenter)" || exit 127
+      unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT BASH_ENV ENV CDPATH \
+        PYTHONHOME PYTHONPATH PYTHONINSPECT PYTHONSTARTUP PYTHONWARNINGS
+      exec "$nsenter_path" \
+        --target "${NHC_HOST_PID:-1}" \
+        --mount --uts --ipc --net --root -- \
+        /usr/bin/env -i \
+        USER=root LOGNAME=root HOME=/root \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+        NODE_CHECK_READ_ONLY=1 PYTHONDONTWRITEBYTECODE=1 \
+        /bin/sh -c 'cd / || exit 126; exec "$@"' sh "$@"
+    )
+
+    resolve_host_run_nhc() {
+      host_nsenter /bin/sh -c '
+        case "$1" in
+          /*) test -f "$1" && test -x "$1" && printf "%s\n" "$1" ;;
+          *) command -v "$1" 2>/dev/null ;;
+        esac
+      ' sh "$1"
+    }
+
+    # Old run_nhc is text-protocol based. Convert [CHECK RESULT] to exit codes.
+    run_and_classify() {
+      local backend="$1" report_only="$2"
+      shift 2
+      local output rc line
+      output="$(mktemp /tmp/hygon-ft-nhc-output.XXXXXX)" || return "$NHC_PROBE_ERROR"
+      "$@" >"$output" 2>&1
+      rc=$?
+      echo "[nhc-adapter] backend=$backend command_exit=$rc"
+      cat "$output"
+      line="$(grep -E '^\[CHECK RESULT\]:' "$output" | tail -n 1 || true)"
+      rm -f -- "$output"
+
+      if [[ "$line" == "[CHECK RESULT]: PASSED" && "$rc" -eq 0 ]]; then
+        return "$NHC_OK"
+      fi
+      if [[ "$line" == "[CHECK RESULT]:"* && ( "$rc" -eq 0 || "$rc" -eq "$NHC_BAD" ) ]]; then
+        if [[ "$report_only" == "true" ]]; then
+          echo "[NHC REPORT ONLY]: ${line#*:}"
+          return "$NHC_REPORT_ONLY"
+        fi
+        return "$NHC_BAD"
+      fi
+      probe_error "$backend returned no valid [CHECK RESULT] (exit=$rc)"
+      return "$NHC_PROBE_ERROR"
+    }
+
+    host_command="${NHC_HOST_COMMAND:-run_nhc}"
+    host_run_nhc=""
+    if command -v nsenter >/dev/null 2>&1; then
+      host_run_nhc="$(resolve_host_run_nhc "$host_command")" || true
+    fi
+    if [[ -z "$host_run_nhc" ]]; then
+      probe_error "host run_nhc is unavailable through nsenter: $host_command"
+      exit "$NHC_PROBE_ERROR"
+    fi
+    run_and_classify "host:$host_run_nhc" false host_nsenter "$host_run_nhc"
+    exit $?

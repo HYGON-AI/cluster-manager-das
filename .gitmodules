@@ -1,0 +1,3 @@
+[submodule "hcu_resiliency_ext/nvidia_resiliency_ext"]
+	path = hcu_resiliency_ext/nvidia_resiliency_ext
+	url = https://github.com/NVIDIA/nvidia-resiliency-ext.git

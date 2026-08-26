@@ -1,0 +1,24 @@
+{
+  "protocol": "roce-v2",
+  "versions": ["v2"],
+  "address_families": ["ipv4"],
+  "allowed_prefixes": ["10.20.0.0/16"],
+  "vlan_ids": [120],
+  "minimum_mtu": 9000,
+  "minimum_rate_mbps": 200000,
+  "lossless_priorities": [3],
+  "app_mappings": {
+    "dscp-prio": {
+      "24": 3
+    },
+    "pcp-prio": {
+      "3": 3
+    }
+  },
+  "priority_to_tc": {
+    "3": 3
+  },
+  "dcbx_mode": ["host"],
+  "global_pause": "off",
+  "fec_mode": ["rs"]
+}

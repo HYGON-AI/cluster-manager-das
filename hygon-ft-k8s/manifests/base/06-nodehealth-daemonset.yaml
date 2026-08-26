@@ -1,0 +1,97 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nodehealth-agent
+  namespace: hygon-ft
+spec:
+  selector:
+    matchLabels:
+      app: nodehealth-agent
+  template:
+    metadata:
+      labels:
+        app: nodehealth-agent
+    spec:
+      serviceAccountName: nodehealth-agent
+      hostPID: true
+      hostNetwork: true
+      nodeSelector:
+        node-role.hygon.io/training: "true"
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nodehealth-agent
+          image: hygon/ft-controller:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "hygon_ft.nodehealth.agent"]
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NHC_SCRIPT_PATH
+              value: /opt/hygon-ft/nhc/run_nhc.sh
+            - name: NHC_HOST_COMMAND
+              value: "run_nhc"
+            - name: NHC_INTERVAL_SECONDS
+              value: "30"
+            - name: NHC_TIMEOUT_SECONDS
+              value: "300"
+            - name: NHC_FAILURE_SUPPRESS_SECONDS
+              value: "300"
+            - name: NHC_TIMEOUT_IS_FAILURE
+              value: "false"
+            - name: FT_TAINT_NODE_ON_NHC_FAIL
+              value: "true"
+            - name: FT_DELETE_PODS_ON_NHC_FAIL
+              value: "false"
+          volumeMounts:
+            - name: nhc-script
+              mountPath: /opt/hygon-ft/nhc
+              readOnly: true
+            - name: dev
+              mountPath: /dev
+              readOnly: true
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: var-log
+              mountPath: /host/var/log
+              readOnly: true
+            - name: host-tmp
+              mountPath: /host/tmp
+      volumes:
+        - name: nhc-script
+          configMap:
+            name: nodehealth-config
+            defaultMode: 0555
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: var-log
+          hostPath:
+            path: /var/log
+        - name: host-tmp
+          hostPath:
+            path: /tmp

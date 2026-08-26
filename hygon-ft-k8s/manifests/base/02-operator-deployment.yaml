@@ -1,0 +1,110 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ft-operator
+  namespace: hygon-ft
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ft-operator
+  template:
+    metadata:
+      labels:
+        app: ft-operator
+    spec:
+      serviceAccountName: ft-operator
+      nodeSelector:
+        node-role.hygon.io/system: "true"
+      tolerations:
+        - key: node-role.hygon.io/system
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: ft-operator
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: ft-operator
+          image: hygon/ft-controller:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "hygon_ft.operator.controller"]
+          ports:
+            - name: reporter
+              containerPort: 8080
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FT_UNHEALTHY_TAINT_KEY
+              value: ft.hygon.io/node-unhealthy
+            - name: FT_DELETE_POD_GRACE_SECONDS
+              value: "0"
+            - name: FT_DELETE_POD_AFTER_TAINT
+              value: "true"
+            - name: FT_FAULT_AGGREGATE_WINDOW_SECONDS
+              value: "5"
+            - name: FT_RANKS_PER_POD
+              value: "8"
+            - name: FT_REPORTER_PORT
+              value: "8080"
+            - name: FT_LEADER_ELECTION
+              value: "true"
+            - name: FT_LEADER_LEASE_NAME
+              value: ft-operator-leader
+            - name: FT_LEASE_DURATION_SECONDS
+              value: "30"
+            - name: FT_LEADER_RENEW_SECONDS
+              value: "10"
+            - name: FT_ENABLE_NODE_NOT_READY_WATCH
+              value: "true"
+            - name: FT_NODE_NOT_READY_GRACE_SECONDS
+              value: "60"
+            - name: FEISHU_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hygon-ft-alert
+                  key: feishu-webhook-url
+                  optional: true
+            - name: FT_ALERT_COMMAND
+              valueFrom:
+                secretKeyRef:
+                  name: hygon-ft-alert
+                  key: alert-command
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: reporter
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: reporter
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ft-operator
+  namespace: hygon-ft
+spec:
+  selector:
+    app: ft-operator
+  ports:
+    - name: reporter
+      port: 8080
+      targetPort: reporter

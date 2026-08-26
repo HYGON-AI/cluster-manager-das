@@ -1,0 +1,10 @@
+# Runtime release inputs. Format: required|optional PATH
+required VERSION
+required hcu_envcheck
+required bin
+required hcu-envcheck.sh
+required install.sh
+required examples
+required MANIFEST.release
+required README.md
+required USER_GUIDE.md

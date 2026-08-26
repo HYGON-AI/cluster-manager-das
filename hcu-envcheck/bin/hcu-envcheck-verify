@@ -1,0 +1,44 @@
+#!/bin/sh
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Verify that the extracted offline package matches its build-time checksums.
+set -u
+
+resolve_script_dir() {
+    target=$1
+    while [ -h "$target" ]; do
+        target_dir=$(CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd) || return 1
+        link=$(readlink "$target") || return 1
+        case "$link" in /*) target=$link ;; *) target=$target_dir/$link ;; esac
+    done
+    CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd
+}
+
+SCRIPT_DIR=$(resolve_script_dir "$0") || {
+    printf 'hcu-envcheck-verify: cannot resolve launcher path\n' >&2
+    exit 70
+}
+ROOT=$(CDPATH= cd -P -- "$SCRIPT_DIR/.." 2>/dev/null && pwd) || {
+    printf 'hcu-envcheck-verify: cannot resolve package root\n' >&2
+    exit 70
+}
+[ -r "$ROOT/RELEASE-MANIFEST.sha256" ] || {
+    printf 'hcu-envcheck-verify: RELEASE-MANIFEST.sha256 is missing\n' >&2
+    exit 65
+}
+
+if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$ROOT" && sha256sum -c RELEASE-MANIFEST.sha256)
+    rc=$?
+elif command -v shasum >/dev/null 2>&1; then
+    (cd "$ROOT" && shasum -a 256 -c RELEASE-MANIFEST.sha256)
+    rc=$?
+else
+    printf 'hcu-envcheck-verify: sha256sum or shasum is required\n' >&2
+    exit 69
+fi
+[ "$rc" -eq 0 ] || {
+    printf 'hcu-envcheck-verify: package verification failed\n' >&2
+    exit 65
+}
+printf 'Package verification: PASS\n'

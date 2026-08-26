@@ -1,0 +1,71 @@
+#!/bin/sh
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Lightweight launcher/capability check. It does not inspect HCUs, contact
+# cluster nodes, compile software, or create network traffic.
+set -u
+
+resolve_script_dir() {
+    target=$1
+    while [ -h "$target" ]; do
+        target_dir=$(CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd) || return 1
+        link=$(readlink "$target") || return 1
+        case "$link" in /*) target=$link ;; *) target=$target_dir/$link ;; esac
+    done
+    CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd
+}
+
+SCRIPT_DIR=$(resolve_script_dir "$0") || { printf 'PACKAGE       FAIL cannot resolve launcher path\n' >&2; exit 70; }
+ROOT=$(CDPATH= cd -P -- "$SCRIPT_DIR/.." 2>/dev/null && pwd) || { printf 'PACKAGE       FAIL cannot resolve package root\n' >&2; exit 70; }
+status=0
+if [ -r "$ROOT/hcu_envcheck/__main__.py" ] && [ -x "$ROOT/bin/hcu-envcheck" ]; then
+    printf 'PACKAGE       PASS %s\n' "$ROOT"
+else
+    printf 'PACKAGE       FAIL required runtime files are missing\n'
+    status=2
+fi
+
+python_found=''
+for candidate in "${HCU_ENVCHECK_PYTHON-}" python3 python3.14 python3.13 python3.12 python3.11 python3.10 \
+    /usr/local/python3.14/bin/python3 /usr/local/python3.13/bin/python3 /usr/local/python3.12/bin/python3 \
+    /usr/local/python3.11/bin/python3 /usr/local/python3.10/bin/python3
+do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+        python_found=$candidate
+        break
+    fi
+done
+if [ -n "$python_found" ]; then
+    python_version=$("$python_found" -c 'import platform; print(platform.python_version())' 2>/dev/null)
+    printf 'PYTHON        PASS %s (%s)\n' "$python_found" "$python_version"
+else
+    printf 'PYTHON        FAIL Python 3.10 or newer was not found\n'
+    status=2
+fi
+
+for command_name in clush ssh scontrol sinfo squeue kubectl; do
+    if command_path=$(command -v "$command_name" 2>/dev/null); then
+        printf 'CAPABILITY    FOUND %-8s %s\n' "$command_name" "$command_path"
+    else
+        printf 'CAPABILITY    ABSENT %-8s (only required by matching execution mode)\n' "$command_name"
+    fi
+done
+
+if [ -r "$ROOT/RELEASE-MANIFEST.sha256" ]; then
+    if "$ROOT/bin/hcu-envcheck-verify" >/dev/null 2>&1; then
+        printf 'CHECKSUM      PASS RELEASE-MANIFEST.sha256\n'
+    else
+        printf 'CHECKSUM      FAIL run bin/hcu-envcheck-verify for details\n'
+        status=2
+    fi
+else
+    printf 'CHECKSUM      SKIP source tree has no generated RELEASE-MANIFEST.sha256\n'
+fi
+if [ "$status" -eq 0 ]; then
+    printf 'DOCTOR        PASS launcher is ready\n'
+else
+    printf 'DOCTOR        INCOMPLETE fix failed prerequisites before scanning\n'
+fi
+exit "$status"

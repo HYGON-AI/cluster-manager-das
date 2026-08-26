@@ -1,0 +1,7 @@
+# One Kubernetes node name per line is recommended.
+# k8s-cluster probes nodes with bounded parallelism (default 16, maximum 128).
+# Tune --api-qps/--api-burst to the API Server policy instead of using unbounded fanout.
+compute001
+compute002
+compute003
+compute004

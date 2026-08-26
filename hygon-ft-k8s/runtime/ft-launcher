@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+
+if [[ "$#" -eq 0 ]]; then
+  echo "[hygon-ft] no training command was provided" >&2
+  exit 64
+fi
+
+LOG_DIR="${FT_LOG_DIR:-/tmp}"
+POD_LOG_NAME="${FT_POD_NAME:-unknown}"
+LOG_FILE="${FT_LOG_FILE:-${LOG_DIR}/train-${POD_LOG_NAME}.log}"
+LAUNCHER_LOG_FILE="${FT_LAUNCHER_LOG_FILE:-${LOG_DIR}/launcher-${POD_LOG_NAME}.log}"
+SCAN_INTERVAL="${FT_SCAN_INTERVAL_SECONDS:-10}"
+EXTERNAL_MONITOR_CMD="${FT_EXTERNAL_MONITOR_CMD:-}"
+FAULT_MARKER_FILE="${FT_FAULT_MARKER_FILE:-/tmp/hygon-ft-fault.json}"
+FAULT_EVENT_ENABLED="${FT_FAULT_EVENT_ENABLED:-true}"
+FAULT_REPORT_URL="${FT_FAULT_REPORT_URL:-http://ft-operator.hygon-ft.svc.cluster.local:8080/report}"
+EXIT_AFTER_FAULT_EVENT_REPORT="${FT_EXIT_AFTER_FAULT_EVENT_REPORT:-true}"
+FAULT_EVENT_ACK_TIMEOUT="${FT_FAULT_EVENT_ACK_TIMEOUT_SECONDS:-30}"
+FAULT_EVENT_ACK_INTERVAL="${FT_FAULT_EVENT_ACK_INTERVAL_SECONDS:-1}"
+TRAIN_STOP_GRACE_SECONDS="${FT_TRAIN_STOP_GRACE_SECONDS:-5}"
+LOG_MONITOR_K8S_EVENT_FILE="${LOG_MONITOR_K8S_EVENT_FILE:-${LOG_DIR}/log-monitor-events-${POD_LOG_NAME}.jsonl}"
+MONITOR_DRAIN_SECONDS="${FT_MONITOR_DRAIN_SECONDS:-3}"
+
+mkdir -p "$LOG_DIR" "$(dirname "$LOG_FILE")" "$(dirname "$LAUNCHER_LOG_FILE")"
+: > "$LOG_FILE"
+touch "$LAUNCHER_LOG_FILE"
+
+# Persist launcher and external monitor diagnostics independently from training output.
+exec > >(tee -a "$LAUNCHER_LOG_FILE") 2>&1
+
+FT_LOG_FILE="$LOG_FILE"
+export FT_LOG_FILE FT_LOG_DIR FT_LAUNCHER_LOG_FILE LOG_MONITOR_K8S_EVENT_FILE
+
+echo "[hygon-ft] launcher started"
+echo "[hygon-ft] command: $*"
+echo "[hygon-ft] pod=${FT_POD_NAME:-unknown} node=${FT_NODE_NAME:-unknown} job=${FT_JOB_NAME:-unknown}"
+
+set +e
+"$@" > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2) &
+train_pid=$!
+set -e
+
+monitor_pid=""
+if [[ -n "$EXTERNAL_MONITOR_CMD" ]]; then
+  export FT_LOG_FILE FT_POD_NAME FT_POD_UID FT_POD_NAMESPACE FT_NODE_NAME FT_JOB_NAME FT_REPLICA_ROLE
+  export FT_FAULT_MARKER_FILE FT_FAULT_REPORT_URL
+  echo "[hygon-ft] external log monitor command: ${EXTERNAL_MONITOR_CMD}"
+  set +e
+  bash -lc "$EXTERNAL_MONITOR_CMD" &
+  monitor_pid=$!
+  set -e
+fi
+
+terminate_train() {
+  local signal="$1"
+  if kill -0 "$train_pid" 2>/dev/null; then
+    kill "-$signal" "$train_pid" 2>/dev/null || kill "$train_pid" 2>/dev/null || true
+  fi
+}
+
+terminate_monitor() {
+  if [[ -n "${monitor_pid:-}" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+    kill "$monitor_pid" 2>/dev/null || true
+  fi
+}
+
+python_bin() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return 0
+  fi
+  return 1
+}
+
+fault_action_from_marker() {
+  local marker="$1"
+  local py=""
+  py="$(python_bin || true)"
+  if [[ -z "$py" ]]; then
+    if grep -Eiq '"(launcherAction|action)"[[:space:]]*:[[:space:]]*"[^"]*(fault|event|report)' "$marker"; then
+      echo "faultevent"
+    else
+      echo "kill"
+    fi
+    return 0
+  fi
+
+  "$py" - "$marker" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    print("kill")
+    raise SystemExit(0)
+
+action = data.get("launcherAction", "")
+if not action and isinstance(data.get("action"), str):
+    action = data.get("action", "")
+action = str(action).lower().replace("_", "-")
+if action in {"kill", "terminate", "local-kill", "kill-process"}:
+    print("kill")
+elif action in {"faultevent", "fault-event", "report", "report-fault"}:
+    print("faultevent")
+else:
+    fault_type = str(data.get("type", data.get("faultType", ""))).lower()
+    print("kill" if "hang" in fault_type else "faultevent")
+PY
+}
+
+send_fault_event() {
+  local marker="${1:-}"
+  local default_type="${2:-TrainingFault}"
+  local default_reason="${3:-ft_launcher_detected_fault}"
+  local default_message="${4:-training fault detected by ft-launcher}"
+  local py=""
+
+  if [[ "$FAULT_EVENT_ENABLED" != "true" ]]; then
+    echo "[hygon-ft] FaultEvent report disabled, skip reporting" >&2
+    return 1
+  fi
+
+  py="$(python_bin || true)"
+  if [[ -z "$py" ]]; then
+    echo "[hygon-ft] python not found, cannot report FaultEvent through reporter" >&2
+    return 1
+  fi
+
+  FT_MARKER_FILE="$marker" \
+  FT_DEFAULT_FAULT_TYPE="$default_type" \
+  FT_DEFAULT_FAULT_REASON="$default_reason" \
+  FT_DEFAULT_FAULT_MESSAGE="$default_message" \
+  "$py" <<'PY'
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+marker = os.environ.get("FT_MARKER_FILE", "")
+payload = {}
+if marker and os.path.exists(marker):
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        with open(marker, "r", encoding="utf-8", errors="replace") as f:
+            payload = {"message": f.read()}
+
+payload.pop("launcherAction", None)
+
+payload.setdefault("type", payload.get("faultType") or os.environ.get("FT_DEFAULT_FAULT_TYPE", "TrainingFault"))
+payload.setdefault("severity", "Critical")
+payload.setdefault("source", "ft-launcher")
+payload.setdefault("reason", os.environ.get("FT_DEFAULT_FAULT_REASON", "ft_launcher_detected_fault"))
+payload.setdefault("message", os.environ.get("FT_DEFAULT_FAULT_MESSAGE", "training fault detected by ft-launcher"))
+payload.setdefault("observedAt", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+payload.setdefault("podName", os.environ.get("FT_POD_NAME", ""))
+payload.setdefault("podNamespace", os.environ.get("FT_POD_NAMESPACE", ""))
+payload.setdefault("nodeName", os.environ.get("FT_NODE_NAME", ""))
+payload.setdefault("jobName", os.environ.get("FT_JOB_NAME", ""))
+payload.setdefault("replicaRole", os.environ.get("FT_REPLICA_ROLE", ""))
+payload.setdefault("logFile", os.environ.get("FT_LOG_FILE", ""))
+if not isinstance(payload.get("action"), dict):
+    payload["action"] = {"taintNode": False, "deletePod": True, "deletePods": False}
+
+url = os.environ.get("FT_FAULT_REPORT_URL", "")
+if not url:
+    raise SystemExit("FT_FAULT_REPORT_URL is empty")
+
+body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+with urllib.request.urlopen(request, timeout=10) as response:
+    report_response = json.loads(response.read().decode("utf-8", errors="replace"))
+
+event_name = report_response.get("faultEvent", "")
+if not event_name:
+    print(f"[hygon-ft] reporter did not return a FaultEvent name: {report_response}", file=sys.stderr)
+    raise SystemExit(2)
+
+print(f"[hygon-ft] created FaultEvent {event_name}; waiting for Operator acknowledgement", flush=True)
+status_url = url.rstrip("/") + "/" + urllib.parse.quote(event_name, safe="")
+timeout = max(1.0, float(os.environ.get("FT_FAULT_EVENT_ACK_TIMEOUT_SECONDS", "30")))
+interval = max(0.1, float(os.environ.get("FT_FAULT_EVENT_ACK_INTERVAL_SECONDS", "1")))
+deadline = time.monotonic() + timeout
+last_error = ""
+
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(status_url, timeout=10) as response:
+            status = json.loads(response.read().decode("utf-8", errors="replace"))
+        if status.get("processed"):
+            if status.get("readyToRestart"):
+                print(
+                    f"[hygon-ft] FaultEvent {event_name} processed; Operator actions completed",
+                    flush=True,
+                )
+                raise SystemExit(0)
+            print(
+                f"[hygon-ft] FaultEvent {event_name} processed but not ready to restart: "
+                f"{status.get('message', 'unknown action failure')}",
+                file=sys.stderr,
+            )
+            raise SystemExit(3)
+    except urllib.error.HTTPError as exc:
+        last_error = f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        last_error = str(exc)
+    time.sleep(interval)
+
+print(
+    f"[hygon-ft] timed out after {timeout:g}s waiting for FaultEvent {event_name}; "
+    f"last_error={last_error or 'event still pending'}",
+    file=sys.stderr,
+)
+raise SystemExit(4)
+PY
+}
+
+handle_fault_event_reported() {
+  if kill -0 "$train_pid" 2>/dev/null; then
+    echo "[hygon-ft] Operator acknowledged the fault; terminating training process" >&2
+    terminate_train TERM
+    sleep "$TRAIN_STOP_GRACE_SECONDS"
+    terminate_train KILL
+  fi
+  terminate_monitor
+  monitor_pid=""
+  if [[ "$EXIT_AFTER_FAULT_EVENT_REPORT" == "true" ]]; then
+    exit 89
+  fi
+  return 0
+}
+
+process_fault_marker() {
+  if [[ ! -f "$FAULT_MARKER_FILE" ]]; then
+    return 1
+  fi
+
+  echo "[hygon-ft] external monitor created fault marker: ${FAULT_MARKER_FILE}" >&2
+  cat "$FAULT_MARKER_FILE" >&2 || true
+  marker_action="$(fault_action_from_marker "$FAULT_MARKER_FILE")"
+  if [[ "$marker_action" == "faultevent" ]] && send_fault_event "$FAULT_MARKER_FILE" "TrainingFault" "external_monitor_fault" "external monitor reported a training fault"; then
+    mv "$FAULT_MARKER_FILE" "${FAULT_MARKER_FILE}.reported" 2>/dev/null || rm -f "$FAULT_MARKER_FILE"
+    handle_fault_event_reported
+  else
+    echo "[hygon-ft] marker action=${marker_action}, terminating training process locally" >&2
+    terminate_train TERM
+    sleep 5
+    terminate_train KILL
+    terminate_monitor
+    exit 88
+  fi
+  return 0
+}
+
+while kill -0 "$train_pid" 2>/dev/null; do
+  process_fault_marker || true
+
+  if [[ -n "${monitor_pid:-}" ]] && ! kill -0 "$monitor_pid" 2>/dev/null; then
+    set +e
+    wait "$monitor_pid"
+    monitor_exit_code="$?"
+    set -e
+    monitor_pid=""
+    if [[ "$monitor_exit_code" -ne 0 ]]; then
+      echo "[hygon-ft] external monitor exited with code ${monitor_exit_code}, terminating training process" >&2
+      terminate_train TERM
+      sleep 5
+      terminate_train KILL
+      exit 88
+    fi
+  fi
+
+  sleep "$SCAN_INTERVAL"
+done
+
+set +e
+wait "$train_pid"
+exit_code="$?"
+set -e
+if [[ -n "${monitor_pid:-}" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+  sleep "$MONITOR_DRAIN_SECONDS"
+fi
+process_fault_marker || true
+terminate_monitor
+echo "[hygon-ft] training process exited with code ${exit_code}"
+exit "$exit_code"

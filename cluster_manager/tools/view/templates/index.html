@@ -1,0 +1,128 @@
+<!--
+Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>Megatron 训练曲线（增量加载）</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: auto; }
+        h1 { text-align: center; color: #333; }
+        .chart-card { background: white; border-radius: 8px; padding: 15px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .chart-title { font-size: 18px; font-weight: bold; margin-bottom: 10px; border-left: 4px solid #3b82f6; padding-left: 10px; }
+        .chart { width: 100%; height: 400px; }
+        .info { text-align: center; color: #666; margin-top: 20px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Megatron 训练曲线（增量加载）</h1>
+    <div class="chart-card">
+        <div class="chart-title">📉 Loss 曲线</div>
+        <div id="chart-loss" class="chart"></div>
+    </div>
+    <div class="chart-card">
+        <div class="chart-title">⚡ TFLOPs 曲线</div>
+        <div id="chart-tflops" class="chart"></div>
+    </div>
+    <div class="chart-card">
+        <div class="chart-title">⏱️ 累计时间</div>
+        <div id="chart-elapsed" class="chart"></div>
+    </div>
+    <div class="info">数据每 5 秒自动增量加载（基于 step 递增）</div>
+</div>
+
+<script>
+    // 全局存储完整数据
+    let steps = [];
+    let lossData = [];
+    let tflopsData = [];
+    let elapsedData = [];
+
+    let lossChart, tflopsChart, elapsedChart;
+
+    function initCharts() {
+        lossChart = echarts.init(document.getElementById('chart-loss'));
+        tflopsChart = echarts.init(document.getElementById('chart-tflops'));
+        elapsedChart = echarts.init(document.getElementById('chart-elapsed'));
+    }
+
+    // 更新所有图表（根据当前完整数据）
+    function updateAllCharts() {
+        // 通用配置
+        const baseOption = {
+            tooltip: { trigger: 'axis' },
+            xAxis: { type: 'value', name: 'Step' },
+            yAxis: { type: 'value' },
+            series: []
+        };
+        // Loss
+        lossChart.setOption({
+            ...baseOption,
+            yAxis: { name: 'Loss' },
+            series: [{ name: 'Loss', type: 'line', data: lossData, lineStyle: { color: '#3b82f6' }, symbol: 'none' }]
+        }, true); // true 表示完全替换
+        // TFLOPs
+        tflopsChart.setOption({
+            ...baseOption,
+            yAxis: { name: 'TFLOPS' },
+            series: [{ name: 'TFLOPS', type: 'line', data: tflopsData, lineStyle: { color: '#10b981' }, symbol: 'none' }]
+        }, true);
+        // Elapsed
+        elapsedChart.setOption({
+            ...baseOption,
+            yAxis: { name: 'Seconds' },
+            series: [{ name: 'Elapsed Time', type: 'line', data: elapsedData, lineStyle: { color: '#f59e0b' }, symbol: 'none' }]
+        }, true);
+        // 设置 x 轴数据（steps 作为 x 轴的值）
+        [lossChart, tflopsChart, elapsedChart].forEach(chart => {
+            chart.setOption({ xAxis: { data: steps } });
+        });
+    }
+
+    // 请求增量数据
+    function fetchIncrementalData() {
+        const lastStep = steps.length > 0 ? steps[steps.length - 1] : 0;
+        fetch(`/api/data?last_step=${lastStep}`)
+            .then(res => res.json())
+            .then(newData => {
+                if (newData.steps.length === 0) return; // 无新数据
+                // 追加到全局数组
+                steps = steps.concat(newData.steps);
+                lossData = lossData.concat(newData.loss);
+                tflopsData = tflopsData.concat(newData.tflops);
+                elapsedData = elapsedData.concat(newData.elapsed);
+                // 更新图表
+                updateAllCharts();
+            })
+            .catch(err => console.error('增量加载失败:', err));
+    }
+
+    // 初始加载
+    function initialLoad() {
+        fetch(`/api/data?last_step=0`)
+            .then(res => res.json())
+            .then(data => {
+                steps = data.steps;
+                lossData = data.loss;
+                tflopsData = data.tflops;
+                elapsedData = data.elapsed;
+                updateAllCharts();
+            })
+            .catch(err => console.error('初始加载失败:', err));
+    }
+
+    window.addEventListener('load', () => {
+        initCharts();
+        initialLoad();
+        // 每 5 秒请求一次增量数据（可调整间隔）
+        setInterval(fetchIncrementalData, 5000);
+    });
+</script>
+</body>
+</html>

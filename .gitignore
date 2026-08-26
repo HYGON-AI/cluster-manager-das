@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.test-tmp/
+.test_tmp/
+pytest-cache-files-*/
+.codex_doc_review/
+.codex_tmp/
+
+# Runtime logs and state
+*.log
+*.out
+blacklist.json
+blacklist.json.bak
+blacklist.json.tmp
+slurm_job_id
+train_daily_token.json
+
+# Python packaging output
+build/
+dist/
+*.egg-info/
+
+# Local configuration and editor backups
+*.bak
+*.orig
+.env
+.env.*
+!.env.example

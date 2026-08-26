@@ -1,0 +1,84 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ft-webhook
+  namespace: hygon-ft
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ft-webhook
+  template:
+    metadata:
+      labels:
+        app: ft-webhook
+    spec:
+      serviceAccountName: ft-webhook
+      nodeSelector:
+        node-role.hygon.io/system: "true"
+      tolerations:
+        - key: node-role.hygon.io/system
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: ft-webhook
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: ft-webhook
+          image: hygon/ft-controller:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "hygon_ft.webhook.server"]
+          env:
+            - name: WEBHOOK_PORT
+              value: "9443"
+            - name: FT_RUNTIME_IMAGE
+              value: hygon/ft-controller:latest
+            - name: TLS_CERT_FILE
+              value: /tls/tls.crt
+            - name: TLS_KEY_FILE
+              value: /tls/tls.key
+          ports:
+            - name: https
+              containerPort: 9443
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: ft-webhook-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ft-webhook
+  namespace: hygon-ft
+spec:
+  selector:
+    app: ft-webhook
+  ports:
+    - name: https
+      port: 443
+      targetPort: https

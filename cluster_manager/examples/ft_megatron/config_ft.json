@@ -1,0 +1,18 @@
+{
+  "base_dir": "/public/home/user/workspace/new_labs/hcu_cluster_manager/cluster_manager",
+  "slots": 1,
+  "launch_model" :"mpirun",
+  "Program":"ft_megatron",
+  "mpi_env": "mpi/hpcx/2.18.0/gcc-8.5.0/mlnx",
+  "dtk_env": "/opt/dtk-25.04.1/env.sh",
+  "nccl_env": "/public/home/user/labs/hcu_megatron/requirements/env.sh",
+  "conda_env": "/public/home/user/anaconda3/etc/profile.d/conda.sh",
+  "conda_name": "megatron_train",
+  "training_exec_path":"/public/home/user/workspace/new_labs/ft_hcu_megatron/examples/llama/run.sh",
+  "ckpt_file":"/public/home/user/ckpt/llama",
+  "training_output_log":"/public/home/user/workspace/new_labs/hcu_cluster_manager/cluster_manager/mega.log",
+  "is_gemm_std": false,
+  "std_multiplier": 2,
+  "relative_threshold": 1.5
+
+}

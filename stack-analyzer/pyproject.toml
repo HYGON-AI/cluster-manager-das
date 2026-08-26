@@ -1,0 +1,44 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stack-analyzer"
+version = "0.1.0"
+description = "Distributed training hang diagnosis via py-spy stack aggregation"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.10"
+dependencies = [
+  "py-spy>=0.3.14",
+  "psutil>=5.9.0",
+]
+authors = [
+  { name = "stack-analyzer maintainers" },
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: System :: Monitoring",
+]
+
+[project.optional-dependencies]
+ansible = ["ansible>=8.0.0"]
+test = ["pytest>=7.0.0"]
+all = ["ansible>=8.0.0", "pytest>=7.0.0"]
+
+[project.scripts]
+stack-analyzer = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["stack_analyzer", "stack_analyzer.scripts", "examples"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+stack_analyzer = ["scripts/*.py"]

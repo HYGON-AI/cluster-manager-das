@@ -1,0 +1,9 @@
+{
+    "total_nodes": 4,
+    "hcu_per_node": 8,
+    "tp_size": 2,
+    "pp_size": 2,
+    "dp_size": 4,
+    "timeout": 60,
+    "retry_count": 3
+}

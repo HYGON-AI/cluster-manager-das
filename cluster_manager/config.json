@@ -1,0 +1,18 @@
+{
+  "base_dir": "/workspace/hcu_cluster_manager",
+  "slots": 8,
+  "launch_model" :"mpirun",
+  "Program":"base",
+  "mpi_env": "mpi/hpcx/2.18.0/gcc-8.5.0/shca",
+  "dtk_env": "/opt/dtk/env.sh",
+  "nccl_env": "/workspace/hcu_megatron/requirements/env.sh",
+  "conda_env": "/opt/conda/etc/profile.d/conda.sh",
+  "conda_name": "hcu-training",
+  "training_exec_path":"/workspace/train/run.sh",
+  "exec_proc_name":"train.py",
+  "clush_f_num":"1200",
+  "log_dir":"/workspace/logs/",
+  "is_gemm_std": false,
+  "std_multiplier": 2,
+  "relative_threshold": 1.5
+}

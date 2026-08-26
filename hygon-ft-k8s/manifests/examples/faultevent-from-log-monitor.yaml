@@ -1,0 +1,25 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: ft.hygon.io/v1alpha1
+kind: FaultEvent
+metadata:
+  name: log-monitor-nan-example
+  namespace: hygon-ft
+  labels:
+    ft.hygon.io/source: log-monitor
+spec:
+  type: TrainingNaN
+  severity: Critical
+  source: log-monitor
+  reason: loss_nan
+  nodeName: node-a
+  podNamespace: default
+  podName: llm-train-2n16g-worker-0
+  jobName: llm-train-2n16g
+  replicaRole: Worker
+  message: "Log monitor detected NaN in aggregated training log."
+  observedAt: "2026-06-16T00:00:00Z"
+  action:
+    taintNode: false
+    deletePod: true
+    deletePods: false

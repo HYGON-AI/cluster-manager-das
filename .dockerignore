@@ -1,0 +1,18 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
+# The hygon-ft-k8s image is built from the repository root so it can include
+# the canonical legal files. Keep unrelated source and Git data out of the
+# Docker build context.
+**
+!LICENSE
+!NOTICE
+!THIRD_PARTY_NOTICES.md
+!hygon-ft-k8s/
+!hygon-ft-k8s/packaging/
+!hygon-ft-k8s/packaging/docker/
+!hygon-ft-k8s/packaging/docker/requirements.txt
+!hygon-ft-k8s/hygon_ft/
+!hygon-ft-k8s/hygon_ft/**
+!hygon-ft-k8s/runtime/
+!hygon-ft-k8s/runtime/**

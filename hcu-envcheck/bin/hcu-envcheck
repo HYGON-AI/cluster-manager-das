@@ -1,0 +1,104 @@
+#!/bin/sh
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Offline launcher for hcu-envcheck. It resolves its own location, so callers
+# may invoke it from any working directory or through an installation symlink.
+
+set -u
+
+EX_OK=0
+EX_USAGE=64
+EX_UNAVAILABLE=69
+EX_SOFTWARE=70
+
+error() {
+    code=$1
+    shift
+    printf 'hcu-envcheck: %s\n' "$*" >&2
+    exit "$code"
+}
+
+resolve_script_dir() {
+    target=$1
+    while [ -h "$target" ]; do
+        target_dir=$(CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd) \
+            || return 1
+        link=$(readlink "$target") || return 1
+        case "$link" in
+            /*) target=$link ;;
+            *) target=$target_dir/$link ;;
+        esac
+    done
+    CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd
+}
+
+SCRIPT_DIR=$(resolve_script_dir "$0") \
+    || error "$EX_SOFTWARE" "cannot resolve launcher path: $0"
+PACKAGE_ROOT=$(CDPATH= cd -P -- "$SCRIPT_DIR/.." 2>/dev/null && pwd) \
+    || error "$EX_SOFTWARE" "cannot resolve package root"
+
+[ -r "$PACKAGE_ROOT/hcu_envcheck/__main__.py" ] \
+    || error "$EX_SOFTWARE" "package is incomplete: hcu_envcheck/__main__.py is missing"
+[ -r "$PACKAGE_ROOT/VERSION" ] \
+    || error "$EX_SOFTWARE" "package is incomplete: VERSION is missing"
+
+case "${1-}" in
+    --version|-V)
+        printf 'hcu-envcheck %s\n' "$(tr -d '\r\n' < "$PACKAGE_ROOT/VERSION")"
+        exit "$EX_OK"
+        ;;
+esac
+
+python_compatible() {
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+        >/dev/null 2>&1
+}
+
+select_python() {
+    if [ -n "${HCU_ENVCHECK_PYTHON-}" ]; then
+        command -v "$HCU_ENVCHECK_PYTHON" >/dev/null 2>&1 || return 2
+        python_compatible "$HCU_ENVCHECK_PYTHON" || return 3
+        printf '%s\n' "$HCU_ENVCHECK_PYTHON"
+        return 0
+    fi
+
+    # Prefer the active environment's python3, then common versioned commands
+    # and common absolute paths used on bare-metal cluster login nodes.
+    for candidate in \
+        python3 \
+        python3.14 python3.13 python3.12 python3.11 python3.10 \
+        /usr/local/python3.14/bin/python3 \
+        /usr/local/python3.13/bin/python3 \
+        /usr/local/python3.12/bin/python3 \
+        /usr/local/python3.11/bin/python3 \
+        /usr/local/python3.10/bin/python3
+    do
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        if python_compatible "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+PYTHON=$(select_python)
+select_rc=$?
+case "$select_rc" in
+    0) ;;
+    2) error "$EX_UNAVAILABLE" "HCU_ENVCHECK_PYTHON is not executable: $HCU_ENVCHECK_PYTHON" ;;
+    3) error "$EX_UNAVAILABLE" "HCU_ENVCHECK_PYTHON must be Python 3.10 or newer: $HCU_ENVCHECK_PYTHON" ;;
+    *) error "$EX_UNAVAILABLE" "Python 3.10 or newer was not found; set HCU_ENVCHECK_PYTHON to an existing interpreter" ;;
+esac
+
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${PYTHONPATH-}" ]; then
+    PYTHONPATH=$PACKAGE_ROOT:$PYTHONPATH
+else
+    PYTHONPATH=$PACKAGE_ROOT
+fi
+export PYTHONPATH
+
+# Native result exit codes are preserved: 0=READY, 1=BLOCKED, 2=INCOMPLETE.
+exec "$PYTHON" -m hcu_envcheck "$@"
+

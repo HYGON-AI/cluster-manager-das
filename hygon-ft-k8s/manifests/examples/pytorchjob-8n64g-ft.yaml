@@ -1,0 +1,98 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: llm-train-8n64g
+  labels:
+    ft.hygon.io/enabled: "true"
+  annotations:
+    ft.hygon.io/enabled: "true"
+    ft.hygon.io/inject-launcher: "true"
+    ft.hygon.io/log-monitor-roles: "all"
+    # ft.hygon.io/log-monitor-command: "/opt/your-monitor/bin/log-monitor --log-file ${FT_LOG_FILE}"
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+    schedulingPolicy:
+      minAvailable: 8
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            training-job: llm-train-8n64g
+        spec:
+          nodeSelector:
+            node-role.hygon.io/training: "true"
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: training-job
+                        operator: In
+                        values:
+                          - llm-train-8n64g
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: pytorch
+              image: nvcr.io/nvidia/pytorch:24.05-py3
+              imagePullPolicy: IfNotPresent
+              command: ["bash", "-lc"]
+              args:
+                - |
+                  echo "master start rank=${RANK:-unknown} node=$(hostname)"
+                  python - <<'PY'
+                  import time
+                  for step in range(3600):
+                      print(f"master training step={step}", flush=True)
+                      time.sleep(5)
+                  PY
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+                requests:
+                  nvidia.com/gpu: 8
+    Worker:
+      replicas: 7
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            training-job: llm-train-8n64g
+        spec:
+          nodeSelector:
+            node-role.hygon.io/training: "true"
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: training-job
+                        operator: In
+                        values:
+                          - llm-train-8n64g
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: pytorch
+              image: nvcr.io/nvidia/pytorch:24.05-py3
+              imagePullPolicy: IfNotPresent
+              command: ["bash", "-lc"]
+              args:
+                - |
+                  echo "worker start rank=${RANK:-unknown} node=$(hostname)"
+                  python - <<'PY'
+                  import time
+                  for step in range(3600):
+                      print(f"worker training step={step}", flush=True)
+                      time.sleep(5)
+                  PY
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+                requests:
+                  nvidia.com/gpu: 8
+

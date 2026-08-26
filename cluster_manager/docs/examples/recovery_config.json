@@ -1,0 +1,5 @@
+{
+    "fault_retry_count": 3,
+    "node_replace_timeout": 30,
+    "detection_interval": 5
+}

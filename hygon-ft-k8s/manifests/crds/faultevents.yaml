@@ -1,0 +1,102 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: faultevents.ft.hygon.io
+spec:
+  group: ft.hygon.io
+  names:
+    kind: FaultEvent
+    listKind: FaultEventList
+    plural: faultevents
+    singular: faultevent
+    shortNames:
+      - fte
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - nodeName
+                - type
+              properties:
+                nodeName:
+                  type: string
+                podNamespace:
+                  type: string
+                podName:
+                  type: string
+                jobName:
+                  type: string
+                workloadKind:
+                  type: string
+                replicaRole:
+                  type: string
+                faultClass:
+                  type: string
+                confidence:
+                  type: integer
+                host:
+                  type: string
+                rank:
+                  type: integer
+                localRank:
+                  type: integer
+                exitCode:
+                  type: integer
+                type:
+                  type: string
+                severity:
+                  type: string
+                source:
+                  type: string
+                reason:
+                  type: string
+                message:
+                  type: string
+                observedAt:
+                  type: string
+                action:
+                  type: object
+                  properties:
+                    taintNode:
+                      type: boolean
+                    deletePod:
+                      type: boolean
+                    deletePods:
+                      type: boolean
+            status:
+              type: object
+              properties:
+                processed:
+                  type: boolean
+                processedAt:
+                  type: string
+                actions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.nodeName
+        - name: Type
+          type: string
+          jsonPath: .spec.type
+        - name: Severity
+          type: string
+          jsonPath: .spec.severity
+        - name: Processed
+          type: boolean
+          jsonPath: .status.processed

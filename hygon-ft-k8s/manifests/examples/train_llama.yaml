@@ -1,0 +1,262 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Four-node Llama/Megatron example for Kubeflow PyTorchJob.
+# Replace the training image and every /path/to/shared_root value before use.
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-pytorchjob-headless
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: llama-pytorchjob-train
+  ports:
+    - name: training
+      port: 29511
+      targetPort: 29511
+  publishNotReadyAddresses: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-pytorchjob-master
+  namespace: default
+spec:
+  selector:
+    app: llama-pytorchjob-train
+    role: master
+  ports:
+    - name: training
+      port: 29511
+      targetPort: 29511
+  publishNotReadyAddresses: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llama-pytorchjob-env
+  namespace: default
+data:
+  WORK_DIR: "/workspace/hcu_megatron/examples/llama3"
+  TRAIN_SCRIPT: "/workspace/hcu_megatron/examples/llama3/train_llama3_8B_torchrun.sh"
+  DATA_PATH: "/workspace/datasets/llama3"
+  TOKENIZER_MODEL_PATH: "/workspace/datasets/llama3/tokenizer.model"
+  CHECKPOINT_PATH: "/workspace/checkpoints/llama3"
+  TRAIN_LOG_DIR: "/workspace/logs"
+  NNODES: "4"
+  MASTER_PORT: "29511"
+  NPROC_PER_NODE: "8"
+  TORCHINDUCTOR_WORKER_START: "spawn"
+  TORCHINDUCTOR_COMPILE_THREADS: "1"
+---
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: llama-megatron-pytorchjob
+  namespace: default
+  labels:
+    ft.hygon.io/enabled: "true"
+  annotations:
+    ft.hygon.io/enabled: "true"
+    ft.hygon.io/inject-launcher: "true"
+    ft.hygon.io/log-dir: "/workspace/hygon-ft-logs"
+    ft.hygon.io/log-monitor-roles: "all"
+    ft.hygon.io/log-monitor-command: >-
+      python /workspace/hcu_cluster_manager/cluster_manager/cluster_manager/monitor/log_monitor.py
+      --log-file "${FT_LOG_FILE}" --mode k8s
+    ft.hygon.io/exit-after-fault-event-report: "true"
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+    schedulingPolicy:
+      minAvailable: 4
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            app: llama-pytorchjob-train
+            role: master
+        spec:
+          nodeSelector:
+            node-role.hygon.io/training: "true"
+          subdomain: llama-pytorchjob-headless
+          terminationGracePeriodSeconds: 30
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: app
+                        operator: In
+                        values:
+                          - llama-pytorchjob-train
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: pytorch
+              image: registry.example.com/hcu-training/megatron:tag
+              imagePullPolicy: IfNotPresent
+              lifecycle:
+                preStop:
+                  exec:
+                    command:
+                      - /bin/bash
+                      - -lc
+                      - |
+                        pkill -TERM -P 1 || true
+                        sleep 5
+                        pkill -KILL -P 1 || true
+              envFrom:
+                - configMapRef:
+                    name: llama-pytorchjob-env
+              env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: MASTER_ADDR
+                  value: llama-pytorchjob-master
+                - name: MASTER_PORT
+                  value: "29511"
+              command:
+                - /bin/bash
+                - -c
+              args:
+                - |
+                  set -euo pipefail
+                  if [[ -f /opt/dtk/env.sh ]]; then
+                    source /opt/dtk/env.sh
+                  fi
+                  cd "${WORK_DIR}"
+
+                  export NODE_RANK="0"
+                  mkdir -p "${TRAIN_LOG_DIR}"
+                  LOG_FILE="${TRAIN_LOG_DIR}/node-${NODE_RANK}-$(date +%Y%m%d-%H%M%S).log"
+                  exec &> >(tee -a "${LOG_FILE}")
+
+                  echo "Pod name: ${POD_NAME}"
+                  echo "Node rank: ${NODE_RANK}, Master: ${MASTER_ADDR}:${MASTER_PORT}"
+                  exec bash "${TRAIN_SCRIPT}"
+              resources:
+                limits:
+                  hygon.com/hcu: 8
+                  memory: 128Gi
+                  cpu: "8"
+                requests:
+                  hygon.com/hcu: 8
+                  memory: 64Gi
+                  cpu: "8"
+              volumeMounts:
+                - name: workspace
+                  mountPath: /workspace
+                - name: shm
+                  mountPath: /dev/shm
+          volumes:
+            - name: workspace
+              hostPath:
+                path: /path/to/shared_root
+                type: Directory
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 128Gi
+    Worker:
+      replicas: 3
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            app: llama-pytorchjob-train
+            role: worker
+        spec:
+          nodeSelector:
+            node-role.hygon.io/training: "true"
+          subdomain: llama-pytorchjob-headless
+          terminationGracePeriodSeconds: 30
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: app
+                        operator: In
+                        values:
+                          - llama-pytorchjob-train
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: pytorch
+              image: registry.example.com/hcu-training/megatron:tag
+              imagePullPolicy: IfNotPresent
+              lifecycle:
+                preStop:
+                  exec:
+                    command:
+                      - /bin/bash
+                      - -lc
+                      - |
+                        pkill -TERM -P 1 || true
+                        sleep 5
+                        pkill -KILL -P 1 || true
+              envFrom:
+                - configMapRef:
+                    name: llama-pytorchjob-env
+              env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: MASTER_ADDR
+                  value: llama-pytorchjob-master
+                - name: MASTER_PORT
+                  value: "29511"
+              command:
+                - /bin/bash
+                - -c
+              args:
+                - |
+                  set -euo pipefail
+                  if [[ -f /opt/dtk/env.sh ]]; then
+                    source /opt/dtk/env.sh
+                  fi
+                  cd "${WORK_DIR}"
+
+                  ORDINAL="${POD_NAME##*-}"
+                  if [[ ! "${ORDINAL}" =~ ^[0-9]+$ ]]; then
+                    echo "Cannot derive NODE_RANK from POD_NAME=${POD_NAME}" >&2
+                    exit 1
+                  fi
+                  export NODE_RANK="$((ORDINAL + 1))"
+
+                  mkdir -p "${TRAIN_LOG_DIR}"
+                  LOG_FILE="${TRAIN_LOG_DIR}/node-${NODE_RANK}-$(date +%Y%m%d-%H%M%S).log"
+                  exec &> >(tee -a "${LOG_FILE}")
+
+                  echo "Pod name: ${POD_NAME}"
+                  echo "Node rank: ${NODE_RANK}, Master: ${MASTER_ADDR}:${MASTER_PORT}"
+                  exec bash "${TRAIN_SCRIPT}"
+              resources:
+                limits:
+                  hygon.com/hcu: 8
+                  memory: 128Gi
+                  cpu: "8"
+                requests:
+                  hygon.com/hcu: 8
+                  memory: 64Gi
+                  cpu: "8"
+              volumeMounts:
+                - name: workspace
+                  mountPath: /workspace
+                - name: shm
+                  mountPath: /dev/shm
+          volumes:
+            - name: workspace
+              hostPath:
+                path: /path/to/shared_root
+                type: Directory
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 128Gi

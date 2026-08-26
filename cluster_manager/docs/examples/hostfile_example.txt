@@ -1,0 +1,4 @@
+b11r4n20 slots=8
+b11r4n21 slots=8
+b11r4n22 slots=8
+b11r4n23 slots=8
