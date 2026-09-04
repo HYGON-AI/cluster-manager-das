@@ -20,7 +20,10 @@ from cluster_manager.utils.string_utils import (
 
 
 def test_event_bus_preserves_publish_order_and_empty_semantics():
-    """Consumers receive queued events in publication order and then no event."""
+    """Consumers receive queued events in publication order and then no event.
+
+    The empty queue sentinel is intentionally ``None``.
+    """
     bus = EventBus()
     first = Event("first", {"value": 1})
     second = Event("second")
