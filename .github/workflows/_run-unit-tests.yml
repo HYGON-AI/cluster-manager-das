@@ -1,0 +1,131 @@
+name: Reusable unit test
+
+on:
+  workflow_call:
+    inputs:
+      module-id:
+        description: Stable identifier used in isolated Docker resource names.
+        required: true
+        type: string
+      test-name:
+        description: Check name shown in GitHub Actions.
+        required: true
+        type: string
+      test-path:
+        description: Repository-relative pytest target.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CLUSTER_MANAGER_CI_IMAGE: hygon/ft-controller:latest
+  CLUSTER_MANAGER_CI_IMAGE_ID: sha256:e2bab66a143d17a9526c14af34f6ba2bd6486d74c51b5c4deb74f33f9d98eb93
+
+jobs:
+  unit:
+    name: ${{ inputs.test-name }}
+    runs-on:
+      group: ci-general
+      labels: [self-hosted, ci, nmz2, bw1100]
+    timeout-minutes: 30
+    env:
+      CI_DEPS_VOLUME: >-
+        cluster-manager-pr-deps-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.module-id }}
+    steps:
+      - name: Authorize PR source
+        shell: bash
+        env:
+          BASE_REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${HEAD_REPOSITORY}" != "${BASE_REPOSITORY}" ]]; then
+            echo "ERROR: fork pull requests cannot execute code on the shared CI runner." >&2
+            exit 1
+          fi
+
+      - name: Checkout PR source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+
+      - name: Validate fixed CI image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! docker image inspect "${CLUSTER_MANAGER_CI_IMAGE}" >/dev/null 2>&1; then
+            echo "ERROR: ${CLUSTER_MANAGER_CI_IMAGE} is not loaded on this runner." >&2
+            echo "Load the reviewed hygon-ft-controller-latest.tar before retrying." >&2
+            exit 1
+          fi
+
+          actual_id="$(docker image inspect --format '{{.Id}}' "${CLUSTER_MANAGER_CI_IMAGE}")"
+          if [[ "${actual_id}" != "${CLUSTER_MANAGER_CI_IMAGE_ID}" ]]; then
+            echo "ERROR: unexpected image ID for ${CLUSTER_MANAGER_CI_IMAGE}: ${actual_id}" >&2
+            echo "Expected ${CLUSTER_MANAGER_CI_IMAGE_ID}." >&2
+            exit 1
+          fi
+
+      - name: Install fixed test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker volume create "${CI_DEPS_VOLUME}" >/dev/null
+          docker run --rm \
+            --pull never \
+            --volume "${CI_DEPS_VOLUME}:/ci-deps" \
+            "${CLUSTER_MANAGER_CI_IMAGE_ID}" \
+            python3 -m pip install \
+              --disable-pip-version-check \
+              --no-cache-dir \
+              --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+              --target /ci-deps \
+              numpy==2.3.5 \
+              pytest==9.1.1
+
+      - name: Run ${{ inputs.test-name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pythonpath="/ci-deps:/workspace"
+          pythonpath="${pythonpath}:/workspace/cluster_manager"
+          pythonpath="${pythonpath}:/workspace/hcu-envcheck"
+          pythonpath="${pythonpath}:/workspace/hcu_resiliency_ext"
+          pythonpath="${pythonpath}:/workspace/hygon-ft-k8s"
+          pythonpath="${pythonpath}:/workspace/stack-analyzer"
+
+          docker run --rm \
+            --pull never \
+            --read-only \
+            --network none \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --env HOME=/tmp \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+            --env "PYTHONPATH=${pythonpath}" \
+            --volume "${CI_DEPS_VOLUME}:/ci-deps:ro" \
+            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --workdir /workspace \
+            "${CLUSTER_MANAGER_CI_IMAGE_ID}" \
+            python3 -m pytest \
+              -c /dev/null \
+              --rootdir=/workspace \
+              --import-mode=importlib \
+              -p no:cacheprovider \
+              -q \
+              "${{ inputs.test-path }}"
+
+      - name: Remove test dependency volume
+        if: always()
+        shell: bash
+        run: docker volume rm --force "${CI_DEPS_VOLUME}" >/dev/null 2>&1 || true
