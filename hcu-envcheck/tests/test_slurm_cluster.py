@@ -20,6 +20,7 @@ from hcu_envcheck.baremetal import BaremetalNodeResult
 from hcu_envcheck.cli import build_parser, main
 from hcu_envcheck.pod_probe import collect_python
 from hcu_envcheck.slurm_cluster import (
+    _SOFTWARE_PROBE_SOURCE,
     BaremetalPreflightPolicy,
     apply_conda_collection_plan,
     apply_slurm_state,
@@ -672,6 +673,34 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(args.command, "baremetal-cluster")
         self.assertEqual(args.transport, "auto")
         self.assertEqual(args.software_mode, "host-python")
+
+    def test_software_probe_hides_hcu_runtime_implementation_path(self):
+        module = ast.parse(_SOFTWARE_PROBE_SOURCE, filename="hcu-software-probe")
+        helper_names = {"is_hcu_hip_runtime_library", "public_library_inventory"}
+        helpers = ast.Module(
+            body=[
+                node
+                for node in module.body
+                if isinstance(node, ast.FunctionDef) and node.name in helper_names
+            ],
+            type_ignores=[],
+        )
+        namespace = {"os": os}
+        exec(compile(helpers, "hcu-software-probe-helpers", "exec"), namespace)
+
+        inventory = namespace["public_library_inventory"](
+            [
+                "/opt/dtk/lib/libamdhip64.so.6",
+                "/opt/dtk/lib/librccl.so.1",
+            ]
+        )
+
+        self.assertEqual(inventory["paths"], ["/opt/dtk/lib/librccl.so.1"])
+        self.assertEqual(
+            inventory["hcu_hip_runtime"],
+            {"component": "HCU HIP runtime", "detected": True},
+        )
+        self.assertNotIn("amd", json.dumps(inventory).lower())
 
     def test_remote_probe_is_compressed_to_a_bounded_command_argument(self):
         command = build_remote_probe_command(

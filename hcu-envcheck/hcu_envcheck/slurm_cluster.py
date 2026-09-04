@@ -332,6 +332,31 @@ def first_executable(name, candidates):
     return None
 
 
+def is_hcu_hip_runtime_library(path):
+    return os.path.basename(path).lower().startswith("libamdhip64.so")
+
+
+def public_library_inventory(paths):
+    visible_paths = []
+    resolved = {}
+    hcu_hip_runtime_detected = False
+    for path in paths:
+        realpath = os.path.realpath(path)
+        if is_hcu_hip_runtime_library(path) or is_hcu_hip_runtime_library(realpath):
+            hcu_hip_runtime_detected = True
+            continue
+        visible_paths.append(path)
+        resolved[path] = realpath
+    return {
+        "paths": visible_paths,
+        "resolved": resolved,
+        "hcu_hip_runtime": {
+            "component": "HCU HIP runtime",
+            "detected": hcu_hip_runtime_detected,
+        },
+    }
+
+
 default_package_names = (
     "torch", "torchvision", "torchaudio", "triton", "flash-attn", "deepspeed",
     "transformers", "accelerate", "megatron-core", "mpi4py", "ucx-py", "numpy",
@@ -453,6 +478,7 @@ for root in root_candidates:
     ))
 library_patterns.extend(("/opt/ucx/lib/libucp.so*", "/opt/ucx/lib/libuct.so*"))
 library_paths = sorted({path for pattern in library_patterns for path in glob.glob(pattern)})[:256]
+public_libraries = public_library_inventory(library_paths)
 
 os_release = {}
 for line in (read_file("/etc/os-release") or "").splitlines():
@@ -467,7 +493,7 @@ print(json.dumps({
     "dtk": {"version_file": version_file, "component_versions": component_versions, "tools": tools},
     "python": python_info,
     "torch": torch_info,
-    "libraries": {"paths": library_paths, "resolved": {path: os.path.realpath(path) for path in library_paths}},
+    "libraries": public_libraries,
     "runtime_env": {
         name: os.environ.get(name)
         for name in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH", "DTK_PATH", "ROCM_PATH", "HIP_PATH")

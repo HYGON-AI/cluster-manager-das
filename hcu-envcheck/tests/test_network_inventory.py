@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from hcu_envcheck.pod_probe import (
     _collect_ib_counter_windows,
     _local_link_status,
     _rdma_counter_sampling_configuration,
+    collect_libraries,
     collect_ip_address_evidence,
     collect_ip_link_evidence,
     parse_ip_address_payload,
@@ -24,6 +26,30 @@ from hcu_envcheck.pod_probe import (
 
 
 class NetworkInventoryTests(unittest.TestCase):
+    @patch("hcu_envcheck.pod_probe.os.path.realpath", side_effect=lambda path: path)
+    @patch("hcu_envcheck.pod_probe.glob.glob")
+    def test_library_inventory_hides_hcu_runtime_implementation_path(
+        self,
+        glob_mock,
+        _realpath_mock,
+    ):
+        def fake_glob(pattern):
+            if "libamdhip64" in pattern:
+                return ["/opt/dtk/lib/libamdhip64.so.6"]
+            if "librccl" in pattern:
+                return ["/opt/dtk/lib/librccl.so.1"]
+            return []
+
+        glob_mock.side_effect = fake_glob
+        inventory = collect_libraries()
+
+        self.assertEqual(inventory["paths"], ["/opt/dtk/lib/librccl.so.1"])
+        self.assertEqual(
+            inventory["hcu_hip_runtime"],
+            {"component": "HCU HIP runtime", "detected": True},
+        )
+        self.assertNotIn("amd", json.dumps(inventory).lower())
+
     def test_lspci_names_and_numeric_ids_are_both_preserved(self):
         text = (
             '0000:73:00.0 "Infiniband controller [0207]" '

@@ -1449,8 +1449,33 @@ def collect_python() -> tuple[dict[str, Any], dict[str, Any]]:
     return python_info, torch_info
 
 
+def _is_hcu_hip_runtime_library(path: str) -> bool:
+    return os.path.basename(path).lower().startswith("libamdhip64.so")
+
+
+def _public_library_inventory(paths: list[str]) -> dict[str, Any]:
+    visible_paths: list[str] = []
+    resolved: dict[str, str] = {}
+    hcu_hip_runtime_detected = False
+    for path in paths:
+        realpath = os.path.realpath(path)
+        if _is_hcu_hip_runtime_library(path) or _is_hcu_hip_runtime_library(realpath):
+            hcu_hip_runtime_detected = True
+            continue
+        visible_paths.append(path)
+        resolved[path] = realpath
+    return {
+        "paths": visible_paths,
+        "resolved": resolved,
+        "hcu_hip_runtime": {
+            "component": "HCU HIP runtime",
+            "detected": hcu_hip_runtime_detected,
+        },
+    }
+
+
 def collect_libraries() -> dict[str, Any]:
-    paths = sorted(
+    discovered_paths = sorted(
         {
             path
             for pattern in (
@@ -1465,10 +1490,7 @@ def collect_libraries() -> dict[str, Any]:
             for path in glob.glob(pattern)
         }
     )
-    return {
-        "paths": paths,
-        "resolved": {path: os.path.realpath(path) for path in paths},
-    }
+    return _public_library_inventory(discovered_paths)
 
 
 def main() -> None:
