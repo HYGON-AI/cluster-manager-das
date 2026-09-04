@@ -28,7 +28,7 @@ jobs:
     name: ${{ inputs.test-name }}
     runs-on:
       group: ci-general
-      labels: [self-hosted, ci, bw1100]
+      labels: [self-hosted, ci, nmz2, bw1100]
     timeout-minutes: 30
     env:
       CI_DEPS_VOLUME: >-

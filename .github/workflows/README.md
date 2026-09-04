@@ -26,7 +26,8 @@ GitHub token, and runs without network access.
 ## Runner and image preparation
 
 Authorize this repository for runner group `ci-general`. The runner must have
-the labels `self-hosted`, `ci`, and `bw1100`, plus a working Docker daemon.
+the labels `self-hosted`, `ci`, `nmz2`, and `bw1100`, plus a working Docker
+daemon. This routes the jobs to `ci-nmz2`.
 
 Load the reviewed image archive on every eligible runner before enabling the
 workflows:

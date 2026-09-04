@@ -2,3 +2,4 @@ self-hosted-runner:
   labels:
     - bw1100
     - ci
+    - nmz2
