@@ -1,0 +1,26 @@
+name: PR Test (stack-analyzer)
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "stack-analyzer/**"
+      - ".github/actionlint.yaml"
+      - ".github/workflows/_run-unit-tests.yml"
+      - ".github/workflows/pr-test-stack-analyzer.yml"
+
+concurrency:
+  group: pr-test-stack-analyzer-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    uses: ./.github/workflows/_run-unit-tests.yml
+    with:
+      module-id: stack-analyzer
+      test-name: stack-analyzer unit tests
+      test-path: stack-analyzer/tests

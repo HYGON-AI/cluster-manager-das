@@ -1,0 +1,26 @@
+name: PR Test (hygon-ft-k8s)
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "hygon-ft-k8s/**"
+      - ".github/actionlint.yaml"
+      - ".github/workflows/_run-unit-tests.yml"
+      - ".github/workflows/pr-test-hygon-ft-k8s.yml"
+
+concurrency:
+  group: pr-test-hygon-ft-k8s-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    uses: ./.github/workflows/_run-unit-tests.yml
+    with:
+      module-id: hygon-ft-k8s
+      test-name: hygon-ft-k8s unit tests
+      test-path: hygon-ft-k8s/tests

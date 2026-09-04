@@ -1,0 +1,26 @@
+name: PR Test (hcu-envcheck)
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "hcu-envcheck/**"
+      - ".github/actionlint.yaml"
+      - ".github/workflows/_run-unit-tests.yml"
+      - ".github/workflows/pr-test-hcu-envcheck.yml"
+
+concurrency:
+  group: pr-test-hcu-envcheck-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    uses: ./.github/workflows/_run-unit-tests.yml
+    with:
+      module-id: hcu-envcheck
+      test-name: hcu-envcheck unit tests
+      test-path: hcu-envcheck/tests

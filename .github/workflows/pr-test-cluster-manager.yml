@@ -1,0 +1,26 @@
+name: PR Test (cluster_manager)
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "cluster_manager/**"
+      - ".github/actionlint.yaml"
+      - ".github/workflows/_run-unit-tests.yml"
+      - ".github/workflows/pr-test-cluster-manager.yml"
+
+concurrency:
+  group: pr-test-cluster-manager-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    uses: ./.github/workflows/_run-unit-tests.yml
+    with:
+      module-id: cluster-manager
+      test-name: cluster_manager unit tests
+      test-path: cluster_manager/test/unit
