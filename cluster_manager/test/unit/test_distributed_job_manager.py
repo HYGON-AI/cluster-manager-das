@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -26,6 +26,7 @@ def make_manager(schedule="NONE"):
     manager.cluster_schedule = schedule
     manager.event_bus = MagicMock()
     manager.launcher = MagicMock()
+    manager.launcher.prepare_new_containers = None
     manager.notify = MagicMock()
     manager.ctx = SimpleNamespace(node_pool_proxy=MagicMock(), run_state=RunState.INIT)
     manager.ctx.node_pool_proxy.normal_nodes_file.return_value = "/work/normal"
@@ -129,6 +130,28 @@ def test_start_training_success_starts_monitor_and_updates_state():
     manager.state_machine.on_train_success.assert_called_once_with(
         "start", ["node01", "node02"], ""
     )
+
+
+def test_start_training_prepares_new_containers_before_launch():
+    manager = make_manager()
+    manager.ctx.node_pool_proxy.apply_node_num_resources.return_value = (
+        "node03",
+        "/work/slots-new",
+    )
+    manager.launcher.prepare_new_containers = MagicMock(return_value=(0, []))
+    manager.launcher.start.return_value = (0, ["node03", "node04"])
+    manager.state_machine.on_train_success.return_value = JobCommand.NONE
+    launch_order = MagicMock()
+    launch_order.attach_mock(
+        manager.launcher.prepare_new_containers, "prepare_new_containers"
+    )
+    launch_order.attach_mock(manager.launcher.start, "start")
+
+    assert manager._start_training() is JobCommand.NONE
+    assert launch_order.mock_calls == [
+        call.prepare_new_containers("/work/train.sh", "/work/slots-new"),
+        call.start("/work/train.sh", "/work/slots-new"),
+    ]
 
 
 def test_start_training_releases_nodes_and_retries_after_launcher_failure(monkeypatch):
