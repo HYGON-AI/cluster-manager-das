@@ -26,6 +26,7 @@ def make_manager(schedule="NONE"):
     manager.cluster_schedule = schedule
     manager.event_bus = MagicMock()
     manager.launcher = MagicMock()
+    manager.launcher.prepare_new_containers = None
     manager.notify = MagicMock()
     manager.ctx = SimpleNamespace(node_pool_proxy=MagicMock(), run_state=RunState.INIT)
     manager.ctx.node_pool_proxy.normal_nodes_file.return_value = "/work/normal"
@@ -128,6 +129,25 @@ def test_start_training_success_starts_monitor_and_updates_state():
     manager.log_monitor.start.assert_called_once_with()
     manager.state_machine.on_train_success.assert_called_once_with(
         "start", ["node01", "node02"], ""
+    )
+
+
+def test_start_training_prepares_new_containers_before_launch():
+    manager = make_manager()
+    manager.ctx.node_pool_proxy.apply_node_num_resources.return_value = (
+        "node03",
+        "/work/slots-new",
+    )
+    manager.launcher.prepare_new_containers = MagicMock(return_value=(0, []))
+    manager.launcher.start.return_value = (0, ["node03", "node04"])
+    manager.state_machine.on_train_success.return_value = JobCommand.NONE
+
+    assert manager._start_training() is JobCommand.NONE
+    manager.launcher.prepare_new_containers.assert_called_once_with(
+        "/work/train.sh", "/work/slots-new"
+    )
+    manager.launcher.start.assert_called_once_with(
+        "/work/train.sh", "/work/slots-new"
     )
 
 

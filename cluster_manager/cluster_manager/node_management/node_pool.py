@@ -996,7 +996,6 @@ class NodePool:
 
             if self._last_running_nodes and nodes_num == len(self._last_running_nodes):
                 # ======== 回收模式：优先复用上次运行的节点 ========
-                idx = 0
                 set_last_running = set(self._last_running_nodes)
                 set_backup = set(self._backup_nodes)
                 set_healthy = set(healthy_backup)
@@ -1063,7 +1062,7 @@ class NodePool:
                                     f"使用健康备用节点替换（standby_healthy充足）"
                                 )
                                 self._pick_and_assign_standby(
-                                    standby_nodes, new_running_nodes, node_name, idx
+                                    standby_nodes, new_running_nodes, node_name
                                 )
                         else:
                             # 致命故障节点（在rejected中），使用备用节点替换
@@ -1071,15 +1070,13 @@ class NodePool:
                                 f"上次运行节点 {node_name} 为致命黑名单节点，使用备用节点替换"
                             )
                             self._pick_and_assign_standby(
-                                standby_nodes, new_running_nodes, node_name, idx
+                                standby_nodes, new_running_nodes, node_name
                             )
                     else:
                         # 节点不在备用池中，使用备用节点替换
                         self._pick_and_assign_standby(
-                            standby_nodes, new_running_nodes, node_name, idx
+                            standby_nodes, new_running_nodes, node_name
                         )
-
-                    idx += 1
 
                 logger.info(
                     f"Recycled allocation: {nodes_num} nodes → "
@@ -1134,7 +1131,6 @@ class NodePool:
         standby_nodes: List[str],
         new_running_nodes: List[str],
         original_node: str,
-        idx: int,
     ) -> None:
         """
         从备用替换池中选取一个节点并分配（内部辅助方法）
@@ -1145,7 +1141,6 @@ class NodePool:
         :param standby_nodes: 备用替换池（健康优先排序，会被修改）
         :param new_running_nodes: 新运行节点列表（会被追加）
         :param original_node: 被替换的原始节点名称（用于日志和通知）
-        :param idx: 节点索引（用于计算 rank）
         """
         if not standby_nodes:
             logger.error(f"无可用备用替换节点，无法替换 {original_node}")
@@ -1154,12 +1149,6 @@ class NodePool:
         popped_node = standby_nodes.pop(0)
         self._backup_nodes.remove(popped_node)
         new_running_nodes.append(popped_node)
-
-        start = idx * 8
-        end = start + 8
-        ranks = list(range(start, end))
-
-        send_data_to_server(popped_node, 16881, original_node, ranks)
 
         logger.info(
             f"Node replacement: "
@@ -1214,7 +1203,6 @@ class NodePool:
             new_running_nodes = []
             
             # 遍历目标节点，按顺序分配
-            idx = 0
             for node in target_nodes:
                 if node in healthy_set:
                     # 目标节点为健康备用节点，直接使用
@@ -1252,14 +1240,8 @@ class NodePool:
                     else:
                         healthy_set.discard(popped_node)
 
-                    start = idx * 8
-                    end = start + 8
-                    ranks = list(range(start, end))
-                    send_data_to_server(popped_node, 16881, node, ranks)
                     logger.info(f"节点:{popped_node} 替换目标节点:{node}")
                 
-                idx += 1
-            
             self._running_nodes.extend(new_running_nodes)
             
             # 校验约束（确保节点池状态符合规则）

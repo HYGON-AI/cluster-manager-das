@@ -62,6 +62,16 @@ class DistributedJobManager:
         """唯一入口：检查队列 → 更新 hostfile → 初始化 → 状态恢复 → 主循环"""
         if self.slurm_mgr is not None:
             self._ensure_slurm_job()
+        prepare_containers = getattr(self.launcher, "prepare_containers", None)
+        if callable(prepare_containers):
+            code, failed_nodes = prepare_containers(
+                self.runtime_args.get("exec_path"), self.hostfile
+            )
+            if code != 0:
+                raise RuntimeError(
+                    f"Docker cluster preparation failed (err {code}), "
+                    f"failed_nodes={failed_nodes}"
+                )
         self._init_components()
         self._restore_state()
 
@@ -201,6 +211,31 @@ class DistributedJobManager:
                     time.sleep(global_config.INTERVAL_MONITOR + 60)
                     slots_file = None
             logger.info(f"[Manager][{self.job_name}] nodes ready: {slots_file}")
+
+            # NodePool may replace a failed node with a host that was not in
+            # the original allocation. Docker mode must prepare that node's
+            # container before attempting docker exec.
+            prepare_new_containers = getattr(
+                self.launcher, "prepare_new_containers", None
+            )
+            if callable(prepare_new_containers):
+                try:
+                    prep_code, prep_failed = prepare_new_containers(
+                        self.runtime_args.get("exec_path"), slots_file
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"[Manager][{self.job_name}] new container preparation failed: {e}"
+                    )
+                    prep_code, prep_failed = 1, []
+                if prep_code != 0:
+                    logger.warning(
+                        f"[Manager][{self.job_name}] new container preparation failed "
+                        f"(err {prep_code}), failed_nodes={prep_failed}; retrying"
+                    )
+                    self.ctx.node_pool_proxy.release_runing_nodes()
+                    time.sleep(global_config.INTERVAL_MONITOR + 60)
+                    continue
 
             # 启动训练进程
             success, node_list, error_info = True, None, ""

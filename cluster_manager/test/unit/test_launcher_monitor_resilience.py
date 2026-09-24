@@ -44,7 +44,7 @@ def test_mpirun_start_propagates_timeout(monkeypatch):
         MPIRunLauncher().start("/work/train.sh", "/work/slots.txt")
 
 
-def test_mpirun_stop_targets_hostfile_and_propagates_failure(monkeypatch):
+def test_mpirun_stop_targets_hostfile_and_propagates_failure(tmp_path, monkeypatch):
     result = SimpleNamespace(returncode=1, stderr="pkill failed")
     execute = MagicMock(return_value=result)
     monkeypatch.setattr(
@@ -52,9 +52,24 @@ def test_mpirun_stop_targets_hostfile_and_propagates_failure(monkeypatch):
         execute,
     )
 
-    assert MPIRunLauncher().stop("/work/hosts") is result
-    assert execute.call_args.args[0] == "clush --hostfile /work/hosts -b pkill -9 -f python"
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("node01 slots=8\n", encoding="utf-8")
+    assert MPIRunLauncher().stop(str(hostfile)) is result
+    assert execute.call_args.args[0] == f"clush --hostfile {hostfile} -b pkill -9 -f python"
     assert execute.call_args.kwargs["capture_output"] is False
+
+
+def test_mpirun_stop_empty_hostfile_is_idempotent(tmp_path, monkeypatch):
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("# no nodes\n", encoding="utf-8")
+    execute = MagicMock()
+    monkeypatch.setattr(
+        "cluster_manager.launcher.mpirun_launcher.CmdExecutor.exec_mpirun_cmd",
+        execute,
+    )
+
+    assert MPIRunLauncher().stop(str(hostfile)) == (0, [])
+    execute.assert_not_called()
 
 
 def test_fixed_log_truncation_requires_reopen(tmp_path):

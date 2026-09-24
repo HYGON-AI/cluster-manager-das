@@ -124,6 +124,14 @@ def to_abs_path(path: str) -> str:
 
 def validate_training_args(args) -> str:
     """Validate training arguments for bare-metal or Slurm scheduling."""
+    launch_mode = os.getenv("CLUSTER_LAUNCH_MODE", "mpi").strip().lower()
+    if launch_mode not in ("mpi", "mpi_docker", "mpi-docker", "docker", "docker_exec", "docker-exec"):
+        raise ValueError(
+            "CLUSTER_LAUNCH_MODE must be mpi, mpi_docker, or docker "
+            "(aliases: mpi-docker, docker_exec, docker-exec), "
+            f"got: {launch_mode}"
+        )
+
     schedule = global_config.CLUSTER_SCHEDULE
     if schedule not in ("NONE", "SLURM"):
         raise ValueError(
@@ -155,11 +163,18 @@ def validate_training_args(args) -> str:
 
 def validate_training_files(args, schedule: str) -> None:
     """Validate local inputs without requiring Slurm-created files."""
+    launch_mode = os.getenv("CLUSTER_LAUNCH_MODE", "mpi").strip().lower()
     if args.nodes_num <= 0:
         raise ValueError(f"--nodes_num must be a positive integer, got: {args.nodes_num}")
     if args.slots <= 0:
         raise ValueError(f"--slots must be a positive integer, got: {args.slots}")
-    if not os.path.isfile(args.exec) or not os.access(args.exec, os.R_OK):
+    # In Docker mode the training script may exist only inside the container;
+    # DOCKER_EXEC_PATH is then the authoritative path used by the launcher.
+    exec_available_locally = os.path.isfile(args.exec) and os.access(args.exec, os.R_OK)
+    if not exec_available_locally and not (
+        launch_mode in ("docker", "docker_exec", "docker-exec", "mpi_docker", "mpi-docker")
+        and os.getenv("DOCKER_EXEC_PATH", "").strip()
+    ):
         raise ValueError(f"Training script not found or unreadable: {args.exec}")
 
     if schedule != "NONE":
