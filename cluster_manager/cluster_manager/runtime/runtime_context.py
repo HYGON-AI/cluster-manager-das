@@ -284,6 +284,17 @@ class RuntimeContext:
                     return False
 
                 nodeno = rank // slots_per_node
+                # Out of range means the rank cannot be mapped onto a node in the
+                # current allocation. Reporting failure keeps the caller from
+                # restarting on the very node that just died: add_fault_nodes_no
+                # would silently blacklist nothing.
+                required_nodes = self.runtime_args.get("required_nodes_num", 0)
+                if required_nodes and nodeno >= required_nodes:
+                    logger.error(
+                        f"[RuntimeContext] rank {rank} is outside the "
+                        f"{required_nodes}x{slots_per_node} allocation"
+                    )
+                    return False
                 logger.info(
                     f"[RuntimeContext] rank fault detected "
                     f"rank={rank} nodeno={nodeno}"

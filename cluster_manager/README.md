@@ -3,17 +3,18 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# cluster_manager：Slurm/MPI 训练监控与故障恢复
+# cluster_manager：Slurm/MPI/Docker 训练监控与故障恢复
 
-`cluster_manager` 运行在登录节点或控制节点上，用于管理裸机 hostfile 或 Slurm 分配中的 MPI 分布式训练任务。它维护训练节点池、监控训练日志和节点状态，并在检测到故障后选择备用节点重新拉起训练。
+`cluster_manager` 运行在登录节点或控制节点上，用于管理裸机 hostfile、Slurm 分配或预创建 Docker 容器中的分布式训练任务。它维护训练节点池、监控训练日志和节点状态，并在检测到故障后选择备用节点重新拉起训练。
 
-当前可用于生产的主路径包括 **裸金属 + MPI** 和 **Slurm + MPI**。Kubernetes 训练容错请使用同级项目 [`hygon-ft-k8s`](../hygon-ft-k8s/README.md)。
+当前可用于生产的主路径包括 **裸金属 + MPI**、**Slurm + MPI**，以及在每个节点预先创建训练容器后的 **hostfile + Docker exec**。Kubernetes 训练容错请使用同级项目 [`hygon-ft-k8s`](../hygon-ft-k8s/README.md)。
 
 ## 主要能力
 
 - 校验 Slurm 作业、作业名、申请节点和 hostfile。
 - 维护运行、备用和异常节点池并持久化运行状态。
 - 启动 MPI 训练，监控训练日志、NHC 和硬件信息。
+- 在多节点已有容器中通过 SSH 执行 Docker 训练，监控训练日志、NHC 和硬件信息。
 - 故障后剔除异常节点、选择备用节点并重启训练。
 - 周期性复检异常节点，恢复后重新放回正常节点池。
 - 可选检查 Slurm 队列、发送飞书通知和执行训练前性能筛机。
@@ -48,6 +49,8 @@ cd cluster_manager
 cp examples/start_none.sh start.local.sh        # 裸机 hostfile
 # 或
 cp examples/start_slurm.sh start.slurm.local.sh # Slurm
+# 或
+cp examples/start_docker.sh start.docker.local.sh # 预创建容器 + Docker exec
 ```
 
 编辑复制后的脚本，必须根据当前任务配置以下内容：
@@ -76,6 +79,26 @@ CLUSTER_LAUNCH_MODE=mpi
 LOG_PARSER_TYPE=base
 CLUSTER_SCHEDULE=NONE
 ```
+
+Docker 生产路径配置：
+
+```bash
+CLUSTER_LAUNCH_MODE=docker
+CLUSTER_SCHEDULE=NONE
+CONTAINER_NAME=my-training-container
+DOCKER_EXEC_PATH=/workspace/train/run.sh       # 容器内路径；默认沿用 --exec
+DOCKER_SLOTSFILE_PATH=/workspace/slots.txt     # 容器内可见的 slots 文件路径
+DOCKER_WORKDIR=/workspace/train                # 可选，默认使用训练脚本所在目录
+DOCKER_CONTAINER_SSH_PORT=36000                # 容器间 MPI 的 sshd 监听端口
+```
+
+Docker launcher 会通过 `clush --hostfile` 并发在每个训练节点准备同名容器；容器准备完成后，使用现有宿主机
+SSH 认证连接到 hostfile 第一台训练节点，执行一次 `docker exec -d <container> bash -lc ...` 启动训练。
+登录节点到训练宿主机的连接使用现有的 SSH 认证配置，不额外引入 Docker SSH 参数。新建容器固定只读挂载宿主机的
+`/root/.ssh`（以及 `/opt/hyhal`）；代码不会生成、复制或修改容器内 SSH 密钥，而是要求各训练宿主机预先提供可读且一致的
+`/root/.ssh/authorized_keys` 和客户端私钥。容器准备阶段只检查 `authorized_keys`，然后启动监听
+`DOCKER_CONTAINER_SSH_PORT`（默认 `36000`）的 `sshd`。停止训练时默认只终止容器内与训练脚本同名的进程；如需同时删除容器，显式设置
+`DOCKER_REMOVE_CONTAINER_ON_STOP=true`。
 
 裸机场景只通过 hostfile 使用 `mpirun` 启动，不要求 `JOB_ID`、`JOB_NAME` 和 `SBATCH_SCRIPT`，也不会执行 `squeue`、`sinfo` 或 `scontrol`。使用 Slurm 时设置 `CLUSTER_SCHEDULE=SLURM`，此时三个 Slurm 参数均为必填项。完整示例见 `examples/start_none.sh` 和 `examples/start_slurm.sh`。
 
