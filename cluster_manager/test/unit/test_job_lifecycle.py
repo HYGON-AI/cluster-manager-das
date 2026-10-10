@@ -117,6 +117,84 @@ def test_root_cause_exit_blacklists_host_before_recovery(machine):
     )
 
 
+def test_prte_process_exit_locates_the_node_from_the_rank(machine):
+    """The only node information in a PRTE exit block is the trailing rank.
+
+    ``[prterun-m09r2n09-2091658@1,11]`` names m09r2n09 because that is where
+    mpirun runs; rank 11 is what points at the second node of the allocation.
+    """
+    state_machine, ctx, _ = machine
+    ctx.run_state = RunState.RUNNING
+    payload = {
+        "type": "exit",
+        "data": {
+            "type": "proc",
+            "runtime": "prte",
+            "fault_info": "[prterun-m09r2n09-2091658@1,11]",
+            "exit_code": 143,
+            "signal": 15,
+        },
+    }
+
+    command = state_machine.on_event(Event(EventType.LOG_MONITOR, payload))
+
+    assert command is JobCommand.STOP_TRAINING
+    assert ctx.run_state is RunState.RECOVERING
+    ctx.handle_runtime_fault.assert_called_once_with(
+        "[prterun-m09r2n09-2091658@1,11]", "rank", fault_reason=payload
+    )
+
+
+def test_unmappable_prte_exit_does_not_restart_blindly(machine):
+    """Restarting without blacklisting would land on the same broken node."""
+    state_machine, ctx, notify = machine
+    ctx.run_state = RunState.RUNNING
+    ctx.handle_runtime_fault.return_value = False
+
+    command = state_machine.on_event(
+        Event(
+            EventType.LOG_MONITOR,
+            {
+                "type": "exit",
+                "data": {
+                    "type": "proc",
+                    "runtime": "prte",
+                    "fault_info": "[prterun-m09r2n09-2091658]",
+                    "exit_code": 143,
+                },
+            },
+        )
+    )
+
+    assert command is JobCommand.NONE
+    assert ctx.run_state is RunState.RUNNING
+    notify.send_feishu_alert.assert_called_once()
+
+
+def test_non_prte_process_exit_still_requires_manual_intervention(machine):
+    """A Python traceback carries no rank, so nothing can be blacklisted."""
+    state_machine, ctx, _ = machine
+    ctx.run_state = RunState.RUNNING
+
+    command = state_machine.on_event(
+        Event(
+            EventType.LOG_MONITOR,
+            {
+                "type": "exit",
+                "data": {
+                    "type": "proc",
+                    "fault_info": "Traceback (most recent call last):",
+                    "exit_code": 1,
+                },
+            },
+        )
+    )
+
+    assert command is JobCommand.NONE
+    assert ctx.run_state is RunState.RUNNING
+    ctx.handle_runtime_fault.assert_not_called()
+
+
 def test_unlocatable_exit_requires_manual_intervention(machine):
     state_machine, ctx, notify = machine
     ctx.run_state = RunState.RUNNING

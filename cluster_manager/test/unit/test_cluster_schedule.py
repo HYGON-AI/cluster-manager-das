@@ -277,6 +277,10 @@ def test_slurm_constructs_manager(slurm_mgr, event_bus, create_launcher, notify)
 def test_none_run_skips_slurm_job_ensure():
     manager = DistributedJobManager.__new__(DistributedJobManager)
     manager.slurm_mgr = None
+    # This test deliberately bypasses __init__().  run() now consults the
+    # launcher for optional Docker preparation before component initialization,
+    # so provide the same no-op launcher capability as a non-Docker launcher.
+    manager.launcher = SimpleNamespace()
     manager.running = False
     manager._ensure_slurm_job = MagicMock()
     manager._init_components = MagicMock()

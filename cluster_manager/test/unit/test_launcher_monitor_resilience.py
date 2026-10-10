@@ -3,6 +3,7 @@
 
 import os
 import subprocess
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -44,7 +45,7 @@ def test_mpirun_start_propagates_timeout(monkeypatch):
         MPIRunLauncher().start("/work/train.sh", "/work/slots.txt")
 
 
-def test_mpirun_stop_targets_hostfile_and_propagates_failure(monkeypatch):
+def test_mpirun_stop_targets_hostfile_and_propagates_failure(tmp_path, monkeypatch):
     result = SimpleNamespace(returncode=1, stderr="pkill failed")
     execute = MagicMock(return_value=result)
     monkeypatch.setattr(
@@ -52,9 +53,66 @@ def test_mpirun_stop_targets_hostfile_and_propagates_failure(monkeypatch):
         execute,
     )
 
-    assert MPIRunLauncher().stop("/work/hosts") is result
-    assert execute.call_args.args[0] == "clush --hostfile /work/hosts -b pkill -9 -f python"
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("node01 slots=8\n", encoding="utf-8")
+    assert MPIRunLauncher().stop(str(hostfile)) is result
+    assert execute.call_args.args[0] == f"clush --hostfile {hostfile} -b pkill -9 -f python"
     assert execute.call_args.kwargs["capture_output"] is False
+
+
+def test_mpirun_stop_empty_hostfile_is_idempotent(tmp_path, monkeypatch):
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("# no nodes\n", encoding="utf-8")
+    execute = MagicMock()
+    monkeypatch.setattr(
+        "cluster_manager.launcher.mpirun_launcher.CmdExecutor.exec_mpirun_cmd",
+        execute,
+    )
+
+    assert MPIRunLauncher().stop(str(hostfile)) == (0, [])
+    execute.assert_not_called()
+
+
+def test_mpirun_docker_stop_preserves_remote_and_container_shells(
+    tmp_path, monkeypatch
+):
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("node01 slots=8\n", encoding="utf-8")
+    execute = MagicMock(return_value=(0, []))
+    monkeypatch.setattr(
+        "cluster_manager.launcher.mpirun_launcher.CmdExecutor.exec_mpirun_cmd",
+        execute,
+    )
+    monkeypatch.setenv("MPIRUN_DOCKER_ENABLED", "1")
+    monkeypatch.setenv("DOCKER_CONTAINER_NAME", "train-container")
+    monkeypatch.setenv("DOCKER_REMOVE_CONTAINER_ON_STOP", "1")
+    monkeypatch.setenv("DOCKER_STOP_PATTERN", "train-worker --role=leader")
+
+    assert MPIRunLauncher().stop(str(hostfile)) == (0, [])
+
+    command = execute.call_args.args[0]
+    # The local shell must pass one complete remote command to clush.
+    remote_command = shlex.split(command)[-1]
+    container_command, host_cleanup = remote_command.split("; docker rm -f", 1)
+    container_argv = shlex.split(container_command)
+    assert container_argv[:9] == [
+        "docker",
+        "exec",
+        "-u",
+        "root",
+        "-e",
+        "CM_STOP_PATTERN=train-worker --role=leader",
+        "train-container",
+        "bash",
+        "-lc",
+    ]
+    assert len(container_argv) == 10
+    assert "pkill -TERM" in container_argv[-1]
+    assert "sleep 2" in container_argv[-1]
+    assert "pkill -KILL" in container_argv[-1]
+    assert '"$CM_STOP_PATTERN"' in container_argv[-1]
+    assert "train-worker --role=leader" not in container_argv[-1]
+    assert host_cleanup.startswith(" train-container ")
 
 
 def test_fixed_log_truncation_requires_reopen(tmp_path):
