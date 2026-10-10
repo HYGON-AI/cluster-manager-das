@@ -62,7 +62,7 @@ function New-LinuxTarGz {
                 continue
             }
             $Mode = 420
-            if ($Relative -match '(^|/)(hcu-envcheck\.sh|install\.sh|bin/[^/]+|examples/[^/]+\.sh)$') { $Mode = 493 }
+            if ($Relative -match '(^|/)(install\.sh|bin/[^/]+|examples/[^/]+\.sh|scripts/test\.sh)$') { $Mode = 493 }
             [byte[]]$Header = New-TarHeader $EntryName $Item.Length $Mode '0'
             $TarStream.Write($Header, 0, $Header.Length)
             $InputStream = [IO.File]::OpenRead($Item.FullName)
@@ -147,7 +147,9 @@ try {
             if ($Policy -eq 'optional') { continue }
             throw "Required release input is missing: $RelativePath"
         }
-        Copy-Item -LiteralPath $Source -Destination (Join-Path $Stage $RelativePath) -Recurse -Force
+        $Destination = Join-Path $Stage $RelativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Destination) -Force | Out-Null
+        Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
     }
 
     $CacheFiles = @(Get-ChildItem -LiteralPath $Stage -Recurse -File |
@@ -161,6 +163,16 @@ try {
         Remove-Item -LiteralPath $CacheDirectory.FullName -Recurse -Force
     }
 
+    # Never publish site-specific cluster settings or measured baselines.
+    @(
+        (Join-Path $Stage 'cluster_run\cluster_env.conf')
+        (Join-Path $Stage 'cluster_run\baselines\rccl_baseline.conf')
+        (Join-Path $Stage 'cluster_run\baselines\gemm_baseline.conf')
+    ) | ForEach-Object {
+        if (Test-Path -LiteralPath $_) {
+            Remove-Item -LiteralPath $_ -Force
+        }
+    }
     $VcsCommit = 'UNAVAILABLE'
     $Git = Get-Command git -ErrorAction SilentlyContinue
     if ($Git) {

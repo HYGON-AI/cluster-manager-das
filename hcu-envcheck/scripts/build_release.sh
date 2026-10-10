@@ -79,14 +79,23 @@ while IFS=' ' read -r policy path rest; do
         [ "$policy" = optional ] && continue
         fail "$EX_SOFTWARE" "required release input is missing: $path"
     fi
-    cp -R -- "$source" "$stage/$path" \
+    destination=$stage/$path
+    mkdir -p -- "$(dirname -- "$destination")" \
+        || fail "$EX_CANTCREAT" "cannot create staging directory: $path"
+    cp -R -- "$source" "$destination" \
         || fail "$EX_CANTCREAT" "cannot stage: $path"
 done < "$PROJECT_ROOT/MANIFEST.release"
 
 # Never publish interpreter caches or editor/test artifacts.
 find "$stage" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 find "$stage" -type d -name '__pycache__' -exec rm -rf -- {} +
-chmod 755 -- "$stage/hcu-envcheck.sh" "$stage/install.sh" "$stage"/bin/* "$stage"/examples/*.sh
+# Never publish site-specific cluster settings or measured baselines.
+rm -f -- \
+    "$stage/cluster_run/cluster_env.conf" \
+    "$stage/cluster_run/baselines/rccl_baseline.conf" \
+    "$stage/cluster_run/baselines/gemm_baseline.conf"
+chmod 755 -- "$stage/install.sh" "$stage"/bin/* "$stage/scripts/test.sh"
+find "$stage/examples" -maxdepth 1 -type f -name '*.sh' -exec chmod 755 -- {} +
 find "$stage/hcu_envcheck" -type f -name '*.py' -exec chmod 644 -- {} +
 
 vcs_commit=UNAVAILABLE

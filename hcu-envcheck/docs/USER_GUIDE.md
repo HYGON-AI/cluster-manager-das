@@ -1,1341 +1,326 @@
-<!--
-Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-SPDX-License-Identifier: Apache-2.0
--->
+# hcu-cluster-run 使用指南
 
-# hcu-envcheck 0.4.2 使用手册
+## 1. 前置条件
 
-本手册按照实际使用顺序编写：先选择检查场景，再执行最短命令，最后根据结果进入参数说明或故障排查。
+直接通过 FTP 上传工程时，文件的 Linux 可执行权限可能丢失。首次运行前可执行 `chmod 755 /path/to/hcu-envcheck/bin/hcu-cluster-run`（不要使用 `chmod 777`）。如果上传过程替换了当前所在目录，先 `cd /path/to/hcu-envcheck`；否则 Shell 会报告 `getcwd() failed`，Python 可能在读取当前目录时抛出 `FileNotFoundError`。新版入口会在检测到已失效的工作目录时切换到工程根目录并提示。建议使用绝对路径传入 `-f`、`--env-script` 和 `-o`，避免依赖当前目录。
 
-第一次使用建议依次阅读：
+1. 使用 `sbatch` 获取裸金属节点。工具本身只接收 hostfile，不解析 Slurm Job ID。
+2. 入口节点可通过 SSH 或 clush 访问计算节点。
+3. 如目标环境需要初始化，准备所有目标节点可见的 `env.sh`；目标环境已配置完整时可省略 `--env-script`。
+4. 主动测试时，组 hostfile 和输出目录应位于组首节点可见的共享目录；容器场景下 hostfile 也必须在容器内可见。
 
-1. [选择正确的检查入口](#1-选择正确的检查入口)
-2. [运行前准备](#2-运行前准备)
-3. [裸金属节点快速检查](#3-裸金属节点快速检查)
-4. [理解输出和结论](#7-输出目录报告与退出码)
+`--transport` 不传时默认使用 `ssh`。需要 clush 时显式传入 `--transport clush`；工具兼容不支持 `--outdir/--errdir` 的旧版 ClusterShell，并从带节点前缀的输出中拆分各节点证据。
 
-只检查 Kubernetes 时，可以从“[Kubernetes 检查](#5-kubernetes-检查)”开始。主动 RDMA/RCCL 和 Fabric 验收属于高级功能，参见“[主动通信验收](#9-主动通信验收高级功能)”。
+失败排查：入口日志会标出场景、检测项、hostfile、输出目录、异常类型和缺失路径；节点失败默认按「状态×原因码」折叠为单行（含返回码信息与折叠节点列表，如 `BLOCKED ×3 nodes=r01n[02-04] findings=DTK_VERSION_UNAVAILABLE`），`--log-detail every` 恢复逐节点的返回码、错误类型、原因码计数、远端 `stderr` 摘要与证据文件路径。原始远端日志始终位于报告对应的 `evidence/.../nodes/<节点>/stderr.txt`，传输元数据位于同目录 `result.json`；主动测试失败时查看 `groups/group-NNN/stderr.log` 或 `groups/group-NNN/nodes/<节点>/stderr.log`。需要 Python 调用栈时，在命令前加 `HCU_ENVCHECK_DEBUG=1`。默认只在终端输出有界摘要，不打印完整 `env.sh` 或探测命令。
 
-## 1. 选择正确的检查入口
+## 2. 可选 env.sh 规则
 
-### 1.1 五个入口分别解决什么问题
-
-| 入口 | 适用场景 | 主要执行位置 | 是否创建 Pod | 是否产生主动流量 |
-|---|---|---|---:|---:|
-| `baremetal-cluster` | 裸金属或 Slurm 多节点启动前检查 | 目标计算节点 | 否 | 默认否；启用 `ib_write_bw` 后会 |
-| `k8s-pod` | 检查一个已存在的 Pod/容器 | 指定容器 | 否 | 否 |
-| `k8s-cluster` | 用同一训练镜像检查一批 K8s 节点 | 临时探针 Pod，或明确复用的已有 Pod | 是 | 否 |
-| `active-rdma-slurm` | 两节点 Verbs、rccl-tests 或 PyTorch/RCCL 主动验收 | 空闲且满足独占条件的 Slurm allocation | 否 | 是 |
-| `ib-fabric-slurm` | Native IB 一跳邻接和叶端口计数器检查 | 空闲且满足独占条件的 Slurm allocation | 否 | 有界只读查询 |
-
-选择方法：
-
-- 直接 SSH 到服务器检查：使用 `baremetal-cluster`。
-- 已经有一个训练 Pod，希望确认其实际运行环境：使用 `k8s-pod`。
-- 希望用某个训练镜像检查多台 K8s 节点：使用 `k8s-cluster`。
-- 希望证明 RDMA/RCCL 数据面能够真正传输：使用 `active-rdma-slurm`。
-- 希望检查 Native IB 一跳链路和交换机叶端口计数器：使用 `ib-fabric-slurm`。
-
-### 1.2 静态检查和主动检查必须分开理解
-
-前三个入口是启动前环境检查，主要回答：
-
-- 节点是否可达；
-- HCU 数量、驱动、DTK 和设备状态是否符合预期；
-- 节点是否空闲；
-- RDMA 端口、IB/RoCE 配置和 Verbs userspace 是否具备基本条件；
-- 显式要求的软件包和通信组件是否可用。
-
-它们不能证明已经完成 RCCL collective、全网数据面测试或长时间稳定性测试。
-
-`active-rdma-slurm` 和 `ib-fabric-slurm` 是单独的高级验收入口。它们要求显式开关、空闲确认和 Slurm 安全边界，不会因为静态检查通过而自动执行。
-
-## 2. 运行前准备
-
-### 2.1 控制端基础要求
-
-所有模式都需要：
-
-- Linux 和 POSIX shell；
-- Python 3.10 或更高版本；
-- 对结果目录有写权限。
-
-不同模式还需要：
-
-| 场景 | 控制端命令 | 访问要求 |
-|---|---|---|
-| 裸金属节点 | `ssh` 或 `clush` | 能免交互访问目标节点 |
-| Slurm 节点 | `scontrol`、`sinfo`，Job ID 场景还需要 `squeue` | 当前用户能访问已经分配的计算节点 |
-| K8s | `kubectl` | 当前 context 和 RBAC 权限正确 |
-| Slurm 主动验收 | `scontrol`、`squeue`、`srun` | 当前用户拥有指定 allocation |
-
-目标节点或探针镜像也需要 Python 3.10+。要完成 HCU 检查，通常还需要 `rocminfo` 和 `hy-smi`/`Hy-smi`；RDMA 检查需要相应的 `ibstat`、`ibv_*` 或 perftest 工具。
-
-### 2.2 离线发行包校验
-
-拿到发行包后，先校验外层压缩包：
+脚本只做环境初始化，不写期望版本元数据：
 
 ```bash
-sha256sum -c hcu-envcheck-0.4.2.tar.gz.sha256
+module load dtk/26.04
+source /opt/dtk/env.sh
+export UCX_NET_DEVICES=...
+source /opt/miniconda/etc/profile.d/conda.sh
+conda activate train
 ```
 
-校验成功后解压：
+- `shared-conda`：脚本指向共享环境。
+- `node-local-conda`：脚本可以是共享路径下的统一入口，但内部选择/激活每节点本地环境。
+- `per-node-container`：路径按容器内部路径填写。
+- 不要在脚本中加入 `HCU_EXPECTED_*` 等工具元数据；实际版本、环境变量和路径由报告采集。
+
+## 3. 基础检测
 
 ```bash
-tar -xzf hcu-envcheck-0.4.2.tar.gz
-cd hcu-envcheck-0.4.2
+./bin/hcu-cluster-run shared-conda platform \
+  -f nodes.txt --env-script /share/train/env.sh \
+  --transport ssh --concurrency 32
+
+./bin/hcu-cluster-run node-local-conda resource \
+  -f nodes.txt --env-script /share/tools/node-env.sh \
+  --transport ssh --expected-devices 8
+
+./bin/hcu-cluster-run shared-conda platform,resource \
+  -f nodes.txt --env-script /share/train/env.sh
 ```
 
-再检查包内文件和控制端条件：
+### 3.1 容器场景基础检测
+
+容器场景可以先独立检查全节点容器状态；该命令在宿主机执行，不进入容器，也不需要 `--env-script`：
 
 ```bash
-./bin/hcu-envcheck-verify
-./bin/hcu-envcheck-doctor
-./hcu-envcheck.sh --version
-./hcu-envcheck.sh --help
+./bin/hcu-cluster-run per-node-container container-status \
+  -f nodes.txt --container hcu-worker -i "$IMAGE" --transport ssh
 ```
 
-说明：
-
-- `verify` 根据发行清单检查包内文件是否缺失或损坏。
-- `doctor` 只检查本地 Python、包结构和常用命令是否存在，不连接节点。
-- 某个当前场景不需要的命令显示 `ABSENT`，不一定代表工具无法使用。
-- 发行包不执行 `pip install`、不联网，也不要求管理员权限。
-
-这里的“离线”只表示分发和安装过程离线；真正执行节点检查仍然需要 SSH、Slurm 或 Kubernetes API 访问。
-
-### 2.3 指定控制端 Python
-
-启动器会自动寻找兼容的 Python 3.10～3.14。需要固定控制端解释器时：
+随后在容器内执行基础检测：
 
 ```bash
-export HCU_ENVCHECK_PYTHON=/usr/local/python3.12/bin/python3
-./hcu-envcheck.sh --help
+./bin/hcu-cluster-run per-node-container platform \
+  -f nodes.txt --container hcu-worker -i "$IMAGE" \
+  --env-script /share/train/env.sh --transport ssh
+
+./bin/hcu-cluster-run per-node-container resource \
+  -f nodes.txt --container hcu-worker -i "$IMAGE" \
+  --env-script /share/train/env.sh --expected-devices 8
+
+./bin/hcu-cluster-run per-node-container platform,resource \
+  -f nodes.txt --container hcu-worker -i "$IMAGE" \
+  --env-script /share/train/env.sh
 ```
 
-`HCU_ENVCHECK_PYTHON` 只控制登录节点上的工具解释器。目标计算节点使用的 Python 由 `--remote-python` 指定。
+`platform`、`resource` 和 `platform,resource` 在进入容器执行探针前，会自动在宿主机复用容器状态检查，核验精确容器名、运行状态和跨节点镜像 ID，并按必填的 `-i/--image` 核验容器实际镜像与指定镜像一致。容器异常节点会保留在 `node_status.nodes` 与 `execution_evidence.nodes` 中并跳过容器内探针，其他健康节点继续检测。DCU/HCU 被占用属于 `resource_state` 检测结果，不会被误判为容器状态异常。
 
-### 2.4 可选安装
+`container-status` 是可单独运行的只读检查，要求同时提供 `--container` 和 `-i/--image`；它不 source `env.sh`、不检查设备空闲、不 pull 镜像，也不会创建或重建容器。容器维护仍必须显式使用 `container-create`、`container-recreate` 或 `container-delete`。
 
-不安装也可以直接使用 `./hcu-envcheck.sh`。需要安装到个人目录时：
+`platform` 包括驱动、DTK/软件版本、网络配置和 RDMA 相关静态证据；`resource` 包括内存、显卡/HCU 数量、显存使用率和资源空闲度。每节点通过独立探针完成采集，入口节点负责解析、落盘和一致性聚合。
 
-```bash
-./install.sh
-export PATH="$HOME/.local/bin:$PATH"
-
-hcu-envcheck --version
-hcu-envcheck-doctor
-hcu-envcheck-verify
-```
-
-自定义安装前缀：
-
-```bash
-./install.sh --prefix /opt/hcu-tools
-export PATH="/opt/hcu-tools/bin:$PATH"
-```
-
-相同版本已经存在时安装脚本会拒绝覆盖。确认确实要替换时才使用 `./install.sh --force`。
-
-## 3. 裸金属节点快速检查
-
-### 3.1 推荐方式：修改节点列表后直接执行
-
-项目提供：
+报告主要文件：
 
 ```text
-examples/check-nodes.sh
-examples/baremetal-nodes.txt
+cluster_run_results/                      # -o 未指定时的默认输出根
+└── <场景>_<检测项>_<时间戳>/              # 如 container_platform_resource_20261009_153000
+    ├── cluster-result.json               # 同秒重跑自动追加 _1、_2
+    ├── cluster-summary.md
+    └── evidence/
 ```
 
-先编辑节点列表：
+场景标签：`container`（per-node-container）、`conda`（shared-conda）、`lconda`（node-local-conda）；操作名中的 `,`/`-` 转为 `_`（如 `ib-write-bw`→`ib_write_bw`）。主动测试与 script 同规则（`container_rccl_.../groups/`、`lconda_script_.../`）。
+
+一致性报告不再作为独立命令。执行 `platform,resource` 后自动追加，展示相同配置节点数、通过/失败/不完整节点数，以及差异字段和 finding。
+
+工具按万卡级集群规模设计，但这不是单次检测的目标。报告以本次 hostfile 为范围，展示实测节点数、识别 HCU 数和单节点卡数分布；统一入口不设置 10000 卡目标，也不计算“已检测卡数/10000”的覆盖率。八卡节点可通过 `--expected-devices 8` 检查每节点数量。静态采集不等于万卡训练或通信实测。
+
+`cluster-result.json` 的顶层依次为 `schema_version`、`run`、`node_status`、`hardware_devices`、`system`、`driver_dtk`、`software_components`、`network_rdma`、`resource_state`、`network_health`、`execution_evidence`、`cluster`。各检测类通过 `.nodes` 独立折叠相同值，`members` 始终列出真实节点；设备公共属性用 `device_ids` 折叠，设备身份保留 ID 映射。`network_health.samples_by_node` 保存原始动态采样；`run.probe_command` 保存各节点共同的探测命令；`cluster` 保存集群汇总和一致性差异。`cluster-summary.md` 将设备占用与 WARN/FAIL、静态配置差异和执行证据分开展示；`resource-only` 同样按已采集的静态配置分组，利用率/显存使用量不进入配置签名；缺失证据不视为配置相同。空值代表未采集/未要求，不自动判为失败。
+
+## 4. 主动测试
+
+主动测试按组执行，不与基础检测混用。
+
+`per-node-container` 提供独立容器状态命令，`--container` 和 `-i` 均必填，**不需要 `--env-script`**：
 
 ```bash
-vi examples/baremetal-nodes.txt
+./bin/hcu-cluster-run per-node-container container-status \
+  -f hostfile --container zy-bridge2 -i "$IMAGE" --transport ssh
 ```
 
-推荐每行一个节点：
+它只在宿主机核验精确容器名、运行状态、实际镜像标签及跨节点镜像 ID，不进入容器、不检查显卡空闲、不 pull，也不生成 `preflight.json`。失败时终端按相同原因合并节点输出。`platform/resource` 的容器内检测会先复用此检查，异常节点保留在基础报告中并跳过环境探针，健康节点仍继续；DCU 忙不是容器状态错误，`resource` 仍采集占用信息。容器场景的基础检测、主动测试与 `script` 的 `-i/--image` 均为必填，预检按其核验用户期望镜像。
 
-```text
-node37
-node98
-```
+`per-node-container` 的真实主动测试先执行该容器状态检查（`--dry-run` 除外），再在可用容器中按需 source `env.sh`、采集显卡状态并检查 MPI 用户。预检失败时终端按原因合并节点并返回 `PRECHECK_FAILED`，不生成 `preflight.json`、`active-result.json` 或主动测试运行目录，任务不会启动。已存在容器即使标签相同，镜像 ID 不同也算不一致；运行中容器不要求节点本地保留镜像标签。预检本身不重建容器，但 `env.sh` 中的操作仍会执行。
 
-也支持简单范围：
+容器内使用 MPI 的 RCCL/GEMM 测试由统一入口自动应用 `--allow-run-as-root`，预检与实际执行保持一致，不再提供额外的 root MPI 命令行开关。该内部策略不绕过容器、镜像、实际 SSH 身份或显卡空闲检查，也不会扩大到宿主机 MPI。
 
-```text
-node[37-40]
-```
-
-确认控制端可以免交互登录：
+全节点维护使用同级 `container-create`、`container-recreate`、`container-delete` 操作，检测命令绝不会代替用户执行。重建/删除必须加 `--yes`，执行前确认业务进程、数据和原容器挂载/启动参数。`-i` 是目标镜像名，不是 tar 路径；创建/重建先在所有节点获取目标镜像，本地不存在则尝试 `docker pull`。pull 失败时提示用 `--image-tar <共享镜像.tar>`。镜像获取阶段任一节点失败，不删除旧容器；后续 Docker run 不是多节点原子事务。
 
 ```bash
-ssh node37 hostname
-ssh node98 hostname
+./bin/hcu-cluster-run shared-conda rccl \
+  -f nodes.txt --env-script /share/train/env.sh \
+  --group-size 8 --slots 2 --nproc-per-node 8
+
+./bin/hcu-cluster-run per-node-container gemm \
+  -f nodes.txt --env-script /workspace/env.sh \
+  --container hcu-train --group-size 1
+
+./bin/hcu-cluster-run shared-conda custom \
+  -f nodes.txt --env-script /share/train/env.sh \
+  --group-size 8 --script /share/tests/my_test.py
 ```
 
-然后执行：
+### RCCL 二进制测试（默认路径）
+
+`rccl` 默认 `--profile rccl-tests`，调用已有 `cluster_run/payloads/rccl_perf_test.sh`。容器执行链为：入口 SSH 到组首宿主机 → `docker exec` 指定容器 → source env.sh → mpirun → 通过容器 SSH 端口进入各节点容器 → source env.sh → RCCL 二进制。**没有 torchrun，没有第二层 MPI。** 目标执行载荷是 Bash + MPI + RCCL 二进制，不需要 Torch；现有容器资源预检仍需要目标 Python。
 
 ```bash
-./examples/check-nodes.sh
+# hostfile 若只有 m09r2n10、m09r2n11 两行，则生成 --host m09r2n10:8,m09r2n11:8 -np 16
+./bin/hcu-cluster-run per-node-container rccl \
+  -f hostfile --env-script /share/env.sh --container zy-bridge2 \
+  --group-size 2 --nproc-per-node 8 --container-ssh-port 25901 \
+  --script-arg=--baseline-file --script-arg=/share/rccl_baseline.conf
 ```
 
-脚本会运行 `ib_write_bw`。开始前必须确认节点空闲，并在提示后输入：
+保留 `--allow-run-as-root`、`--mca plm_rsh_args "-p 25901"`、`--bind-to none`，多节点每 rank `*_perf -g 1 -b 4 -e 1G -f 2 -n 20 -w 5`。节点不硬编码；`--group-size` 切分节点，`--slots` 控制并发组数，`--nproc-per-node` 配置每节点 MPI slots（默认 8），组内 `-np` 自动求和。单节点组不启动 MPI，直接 `*_perf -g <卡数>`。可显式 `--launcher mpirun`；选择 torchrun 必须加 `--profile worker`，不能把二进制脚本嵌套到 torchrun 中。
 
-```text
-yes
-```
+通信配置的取值优先级（高 -> 低）：显式脚本参数 > 已加载的 `env.sh` 导出的变量 > `cluster_run/cluster_env.conf` 站点默认（可用 `CLUSTER_ENV_FILE` 换路径；从 `cluster_env.conf.example` 复制填写）> 下表内置兜底：
 
-无人值守执行只有在外部流程已经证明全部目标节点空闲后，才可以使用：
-
-```bash
-CONFIRM_NODES_IDLE=yes ./examples/check-nodes.sh
-```
-
-### 3.2 示例脚本的执行流程
-
-脚本只执行一轮，不需要参考节点：
-
-1. 并发采集节点、CPU、内存、OS、内核、驱动、DTK、HCU、NIC 和 RDMA 静态信息。
-2. 在每个节点执行一次 `ibstat`。
-3. 动态发现 `mlx*` 或 `shca*` HCA，检查端口是否 `Active`、`LinkUp`。
-4. 按节点方向和 rail 执行一次 `ib_write_bw` 测试计划。
-5. 在每个节点 PATH 中直接执行一次 `run_nhc`。
-6. 汇总 Markdown、JSON 和原始 evidence。
-
-该流程：
-
-- 不创建 Kubernetes Pod；
-- 不读取、添加或删除 Kubernetes taint；
-- 不执行 taint 恢复；
-- 不自动安装 `run_nhc`；
-- 不检查 ACS；
-- 不进行多轮重试或多轮一致性判定。
-
-### 3.3 示例脚本常用配置
-
-默认值：
-
-| 环境变量 | 默认值 | 含义 |
-|---|---:|---|
-| `NODES_FILE` | `examples/baremetal-nodes.txt` | 节点列表文件 |
-| `EXPECTED_DEVICES` | `8` | 每节点预期 HCU 数量 |
-| `EXPECTED_RDMA_DEVICES` | `4` | 每节点至少需要的 RDMA HCA 数量 |
-| `IB_MINIMUM_AVERAGE_GBPS` | `100` | 每条带宽测试路径的最低平均 Gbit/s |
-| `CONCURRENCY` | `16` | 静态检查的最大 SSH 并发数 |
-| `OUTPUT_ROOT` | `项目目录/out` | 可重复使用的结果根目录 |
-| `REMOTE_PYTHON` | `python3` | 目标节点探针 Python |
-| `SOFTWARE_MODE` | `host-python` | `host-python`、`conda` 或 `docker` |
-| `PYTHON_PACKAGES` | 空 | 需要检查的 Python 包 |
-
-覆盖示例：
-
-```bash
-EXPECTED_DEVICES=8 \
-EXPECTED_RDMA_DEVICES=4 \
-IB_MINIMUM_AVERAGE_GBPS=100 \
-SSH_USER=example-user \
-OUTPUT_ROOT="$PWD/out2" \
-./examples/check-nodes.sh
-```
-
-默认 `PYTHON_PACKAGES` 为空，因此不会导入 Torch，也不会检查 Python 依赖。需要检查实际训练环境时才显式设置：
-
-```bash
-PYTHON_PACKAGES="torch numpy" ./examples/check-nodes.sh
-```
-
-只要 `REMOTE_PYTHON` 指向的解释器能够直接导入这些包，就不需要额外指定 Python 依赖目录。
-
-### 3.4 结果在哪里
-
-`OUTPUT_ROOT` 可以已经存在。每次运行都会创建：
-
-```text
-<OUTPUT_ROOT>/nodes_check_YYYYMMDD_HHMMSS_ffffff/
-```
-
-命令结束时会打印：
-
-```text
-RUN_DIR
-JSON
-SUMMARY
-```
-
-优先打开 `SUMMARY` 指向的 `cluster-summary.md`。
-
-## 4. 裸金属与 Slurm 完整用法
-
-### 4.1 节点来源必须四选一
-
-`baremetal-cluster` 只允许使用一种节点来源。
-
-#### 方式 A：重复指定节点
-
-```bash
-./hcu-envcheck.sh baremetal-cluster \
-  --node node37 \
-  --node node98 \
-  --transport ssh \
-  --software-mode host-python \
-  --expected-devices 8 \
-  --output-dir ./out
-```
-
-#### 方式 B：节点文件
-
-创建 `hosts.txt`：
-
-```text
-# 每行一个节点
-compute001
-compute002
-
-# 支持逗号列表和简单范围
-compute[003-006,009]
-```
-
-执行：
-
-```bash
-./hcu-envcheck.sh baremetal-cluster \
-  --nodes-file hosts.txt \
-  --transport ssh \
-  --software-mode host-python \
-  --expected-devices 8 \
-  --output-dir ./out
-```
-
-节点文件支持 UTF-8 BOM、空行、`#` 注释、简单范围和 OpenMPI 风格的 `key=value` 附加字段。重复节点按首次出现顺序去重；不安全的用户名、主机名或 Shell 字符会在连接前被拒绝。
-
-#### 方式 C：Slurm Job ID
-
-```bash
-JOB_ID="${SLURM_JOB_ID:?set an allocated Slurm job id}"
-
-./hcu-envcheck.sh baremetal-cluster \
-  --slurm-job-id "$JOB_ID" \
-  --transport auto \
-  --software-mode host-python \
-  --remote-python python3 \
-  --expected-devices 8 \
-  --require-rdma \
-  --minimum-rdma-devices 4 \
-  --expected-rdma-protocol ib \
-  --output-dir ./out
-```
-
-Job 必须已经获得节点分配。Pending 且没有 NodeList 的 Job 无法检查。
-
-#### 方式 D：Slurm nodelist
-
-```bash
-./hcu-envcheck.sh baremetal-cluster \
-  --slurm-nodelist 'compute[001-015]' \
-  --transport auto \
-  --concurrency 15 \
-  --software-mode host-python \
-  --expected-devices 8 \
-  --target-scale-devices 10000 \
-  --output-dir ./out
-```
-
-使用 Slurm Job ID 或 nodelist 时，报告会额外包含 `sinfo` 节点状态和 drain/down 原因。使用 `--node` 或 `--nodes-file` 时不采集 Slurm 状态。
-
-### 4.2 选择传输方式
-
-```text
---transport auto    本地存在 clush 时使用 clush，否则使用 SSH
---transport clush   强制使用 clush
---transport ssh     强制使用并发 SSH
-```
-
-注意：
-
-- `auto` 只在找不到 `clush` 命令时回退到 SSH。
-- 如果 `clush` 命令存在但站点配置不可用，不会在执行失败后自动切换 SSH。
-- SSH 用户、端口、密钥和 config 参数只能与 `--transport ssh` 一起使用。
-- `ib_write_bw` 节点健康检查必须显式使用 `--transport ssh`。
-- SSH 使用非交互模式，不支持运行时密码提示。
-
-SSH 示例：
-
-```bash
-./hcu-envcheck.sh baremetal-cluster \
-  --nodes-file hosts.txt \
-  --transport ssh \
-  --ssh-user example-user \
-  --ssh-port 22 \
-  --identity-file "$HOME/.ssh/id_ed25519" \
-  --ssh-config-file "$HOME/.ssh/config" \
-  --known-hosts-file "$HOME/.ssh/known_hosts" \
-  --strict-host-key-checking yes \
-  --software-mode host-python \
-  --expected-devices 8 \
-  --output-dir ./out
-```
-
-`--strict-host-key-checking accept-new` 只适合接收经过授权的新主机。出现主机密钥变化时必须通过可信渠道核对，不能通过关闭校验绕过。
-
-`--concurrency` 是静态探针的 clush fanout 或 SSH 并发上限，默认 32、最大 128。它不是 `ib_write_bw` 并发数；带宽测试由 `--ib-concurrency` 单独控制。
-
-### 4.3 明确选择训练软件环境
-
-`baremetal-cluster` 必须在下面三种模式中选择一个。
-
-| 模式 | 适合场景 | 必需参数 |
-|---|---|---|
-| `host-python` | 训练直接使用节点上的 Python | `--remote-python` 可选，默认 `python3` |
-| `conda` | 训练使用明确的 Conda 环境 | `--conda-prefix`、`--conda-storage` |
-| `docker` | 训练使用明确镜像 | `--docker-image` |
-
-#### host-python
-
-```bash
---software-mode host-python \
---remote-python /opt/train/bin/python3
-```
-
-#### Conda
-
-```bash
---software-mode conda \
---conda-prefix /shared/conda/envs/train \
---conda-storage shared
-```
-
-`conda` 模式不执行 `conda activate`，而是直接调用 `<prefix>/bin/python`。`--conda-storage` 必须是：
-
-- `shared`：同一路径来自共享存储；
-- `node-local`：每个节点有独立副本。
-
-声明值与逐节点挂载证据不一致时会失败。
-
-#### Docker
-
-```bash
---software-mode docker \
---docker-image registry.example.com/train/dtk:tag \
---container-python python3
-```
-
-每个节点只创建一个明确镜像的短生命周期 `docker run --rm` 探针容器。工具不会枚举或进入任意业务容器。容器用于检查训练软件栈，宿主机 CPU、内存、HCU、驱动和 RDMA 仍然在宿主侧独立检查。
-
-Docker 探针根文件系统只读，并只提供有界 tmpfs。容器清理失败会保留明确状态，不能作为完整放行。
-
-### 4.4 Python 包检查是显式开启的
-
-裸金属入口默认不检查任何 Python 包：
-
-```text
-没有 --require-python-package
-→ 不导入 Torch
-→ 不检查 Python 依赖
-→ 不会产生 TORCH_IMPORT_FAILED
-```
-
-检查 Torch 和 NumPy：
-
-```bash
---require-python-package torch \
---require-python-package numpy
-```
-
-只有指定 `torch` 时，才检查 Torch import、HCU 运行时设备数和分布式后端。
-
-如果节点已经安装依赖，只要所选解释器能够直接导入即可，不需要设置 `PYTHON_DEPS_DIR`。只有依赖不在解释器默认 `sys.path` 时，才应先修正实际训练环境或明确使用正确的 Conda/Docker 环境。
-
-### 4.5 能力 Profile：只要求训练真正依赖的能力
-
-| 参数 | 启用后的判定 |
+| 变量 | 各层均未设置时的兜底值 |
 |---|---|
-| `--require-compiler` | `hipcc` 缺失成为阻断项 |
-| `--require-rdma` | 要求存在 RDMA HCA 和活跃端口 |
-| `--minimum-rdma-devices N` | 每节点至少 N 个 RDMA 设备和 Active/LinkUp 端口 |
-| `--expected-rdma-protocol auto\|ib\|roce` | `auto` 只识别；显式协议会校验证据充分的模式不匹配 |
-| `--rdma-counter-interval SEC` | 对端口计数器做双采样；`0` 关闭，`1`～`60` 开启 |
-| `--rdma-policy-file FILE` | 按显式 RoCE JSON 策略验收主机配置链 |
-| `--require-rccl` | 要求所选软件环境具备 RCCL 或 Torch NCCL/RCCL 后端 |
-| `--require-ucx` | 要求所选软件环境具备 UCX |
-| `--strict-hardware-consistency` | 关键硬件或驱动差异升级为阻断 |
+| `LD_LIBRARY_PATH`、`ROCM_PATH` | 有值时经 MPI `-x` 传递，不编造运行时路径 |
+| `NCCL_SOCKET_IFNAME` | `eth0` |
+| `NCCL_PXN_DISABLE` | `0` |
+| `RCCL_PXN_GPU_BALANCE` | `1` |
+| `RCCL_NET_PLANE` | 仅传递实际配置值，不编造平面配置 |
+| `NCCL_NET_PLUGIN` | `shca` |
+| `NCCL_PLUGIN_P2P` | `ib` |
+| `NCCL_NET_GDR_LEVEL` | `4` |
+| `NCCL_NET_GDR_READ` | `1` |
+| `NCCL_TOPO_FILE` | `/usr/local/built-in-508-topo-input-tj-default.xml` |
+| `UCX_NET_DEVICES` | `ib0`，在二进制运行前设置 |
 
-不要为了“检查得更多”盲目开启所有 Profile。未被训练使用的组件缺失，不应成为训练启动阻断项。
+显式脚本参数优先于环境：例如 `--script-arg=--iface --script-arg=eth1`、`--script-arg=--ucx --script-arg=ib1`、`--script-arg=--topo --script-arg=/share/topo.xml`。`RCCL_IFACE/RCCL_UCX_DEV/RCCL_TOPO_FILE` 是 conf 中的站点配置名（也可作环境变量）；`env.sh` 导出的 `NCCL_SOCKET_IFNAME/UCX_NET_DEVICES/NCCL_TOPO_FILE` 实际运行变量优先于它们。组首选择的通信参数会在各 rank source 后统一应用，避免 rank 初始化覆盖显式参数；DTK/二进制路径仍在每节点加载后解析。
 
-### 4.6 单轮 IB 状态、带宽和 NHC 模块
+可执行文件优先 `--bin-dir`、`RCCL_BIN_DIR/RCCL_TESTS_BIN_DIR`、PATH 和所选运行时根目录，最后保留原安装位置 `/opt/rccl-test/build` 作为兜底。需要严格使用原路径时加 `--script-arg=--bin-dir --script-arg=/opt/rccl-test/build`。这些默认值针对原站点，不保证适用于其他网卡、插件或拓扑；应检查日志中的实际配置。
 
-启用全部三项：
+默认一次运行 `all_reduce/all_gather/broadcast/reduce/reduce_scatter/gather/scatter/alltoall/alltoallv/sendrecv` 十项，上例执行全部十项。保留显式 `--script-arg=--tests --script-arg=broadcast` 等子集诊断，报告标明范围，不冒充完整验收。其他二进制选项用逐项 `--script-arg=VALUE` 传递。
 
-```bash
---enable-node-health-checks
-```
+性能基准必须覆盖当前规模的全部待测项。优先使用显式 `RCCL_BASELINE_B64/RCCL_BASELINE_TEXT` 内容，其次 `--baseline-file`，再读取 `RCCL_BASELINE/RCCL_BASELINE_FILE`；未显式配置时查找工作目录、载荷同目录、工程 `cluster_run/baselines/` 的 `rccl_baseline.conf`。显式文件不存在报错，不偷偷换基准。仍使用原格式 `<np> <test> <busbw> [margin]`：按本组实际卡数精确匹配，不能将 8/16 卡数据套用到 32 卡；十项缺任何一项在启动前报错，不能缩成少数项目或降级成功。基准必须大于零，margin 范围 [0,100)，重复条目报错。
 
-等价于：
+正常启动后，单项程序失败、带宽无法解析或性能低于下限均记 FAIL，并继续后续项目；Ctrl+C/SIGTERM 取消及其清理仍优先。性能判据保持原脚本：out/in-place busbw 的最大峰值 ≥ 基准 × (1-margin%)，默认 margin=1，可由每项第四列覆盖。只有全部待测项性能达标才返回成功；配置错误退出 1，存在失败项退出 2。
 
-```text
---enable-ib-state
---enable-ib-write-bw
---enable-nhc
-```
+每组 `groups/group-NNN/rccl/` 保存原始 `*.log`、完整 `*.command.sh`、`rccl-summary.md` 和 `rccl-summary.tsv`。汇总列出图示 out/in-place algbw/busbw 四列、busbw 基准、容差、下限、偏差、PASS/FAIL 和原因。四列分别取本次消息尺寸范围的峰值，不保证来自同一尺寸行；现有基准只有 busbw，一列基准不能冒充四列阈值。如果日志仅提供 Avg bus bandwidth，则沿用原回退比较，但缺少的四列显示 `-`，不编造数据。顶层 `--dry-run` 不访问计算节点、不加载远端基准，只验证命令构造，不证明十项实际执行或性能达标。
 
-也可以单独启用其中一项。只启用 `--enable-ib-write-bw` 时，工具仍会自动执行 IB 状态检查作为前置条件。
+### Python worker launcher
 
-完整示例：
+- `mpirun-torchrun`：默认模式。入口节点 SSH 到组首节点，组首 source env.sh 后执行 mpirun；MPI 每节点启动一个 torchrun，torchrun 再启动本地测试进程。
+- `ssh-torchrun`：入口节点并行 SSH 到组内每个节点，各节点 source env.sh 后直接启动 torchrun。
+- `mpirun`：入口节点 SSH 到组首节点，组首 source env.sh 后执行 mpirun；测试程序使用 `OMPI_COMM_WORLD_RANK`、`OMPI_COMM_WORLD_SIZE`、`OMPI_COMM_WORLD_LOCAL_RANK`，并兼容 PMI/PMIX 变量。
 
-```bash
-./hcu-envcheck.sh baremetal-cluster \
-  --node node98 \
-  --node node37 \
-  --transport ssh \
-  --software-mode host-python \
-  --remote-python python3 \
-  --expected-devices 8 \
-  --target-scale-devices 16 \
-  --require-rdma \
-  --minimum-rdma-devices 4 \
-  --expected-rdma-protocol ib \
-  --enable-node-health-checks \
-  --confirm-nodes-idle \
-  --nhc-timeout 600 \
-  --ib-tool ib_write_bw \
-  --ib-protocol ib \
-  --ib-port 1 \
-  --ib-control-port 18515 \
-  --ib-message-bytes 1048576 \
-  --ib-iters 1000 \
-  --ib-minimum-average-gbps 100 \
-  --ib-concurrency 1 \
-  --ib-max-tests 64 \
-  --output-dir ./out
-```
+启动命令由入口 Python 构造，在目标 Shell 中执行；torchrun 使用目标 `--test-python -m torch.distributed.run` 启动，而非入口解释器。上述 MPI 仅适用于多节点 RCCL/GEMM worker，单节点组直接本机启动。容器 MPI 使用 `--container-ssh-port`（默认 25901），启动前核验 SSH 所到命名空间和用户与指定容器一致。普通脚本使用 `script/custom`，不套 MPI/torchrun。
 
-#### IB 状态
+RCCL Python smoke test 用 `rccl --profile worker`；GEMM 默认 `--profile worker`，完整基准用 `gemm --profile rocblas`。worker profile 的 `--script` 指定的是每 rank 程序，不得再启动 MPI。不要用脚本文件名隐式选择执行方式。
 
-每个节点只执行一次 `ibstat`：
+入口实际编排/报告需要 Python >= 3.10；`--controller-env-script` 与 `--controller-python` 只配置入口环境。目标 `--env-script` 在每节点加载，不要求任何 rank/size/版本元数据。`--remote-python` 用于基础探针，`--test-python` 用于测试；`--container-workdir` 在目标 source 前生效。项目及报告目录中的组 hostfile 需在各目标节点/容器可见。
 
-- 动态识别名称匹配 `mlx*` 或 `shca*` 的 HCA；
-- 不写死设备名称和数量；
-- 要求端口同时为 `Active` 和 `LinkUp`；
-- 命令缺失、执行失败、超时或证据不完整都会明确区分。
+### 主动测试输出目录与排查
 
-SSH 首次连接产生的：
+运行目录名为 `<场景>_<测试项>_<时间戳>`（同秒重跑自动追加 `_1`、`_2`），例如：
 
 ```text
-Warning: Permanently added 'node-name' ...
+verify_results/
+└── container_rccl_20261009_180118/
+    ├── active-result.json      # 运行总报告：组结果、预检、清理状态、run token
+    ├── preflight.json          # 容器预检：容器状态/镜像一致性/SSH 可达/DCU 空闲采样
+    └── groups/group-NNN/       # 按 --group-size 切分，每组一个目录
+        ├── hostfile            # 该组节点文件，每行 "节点 slots=<--nproc-per-node>"
+        ├── launch.json         # 组首启动命令记录（含 token guard 包装）
+        ├── result.json         # 组级结果：退出码、状态、耗时
+        ├── rccl/               # 十项产物
+        │   ├── rccl-summary.md / .tsv      # 四列带宽、基准、容差、偏差、逐项判定
+        │   ├── <测试项>.command.sh          # 每项完整 mpirun 命令，可单独复跑
+        │   ├── <测试项>.log                 # 每项原始输出（busbw 解析来源）
+        │   ├── rank-body.sh                 # rank 执行体（source env.sh → 二进制）
+        │   └── task-guard.sh                # token guard（取消/清理凭据）
+        ├── nodes/<节点>/stderr.log          # 组首侧 stderr
+        └── remote-evidence/<节点>/.../      # 远端执行证据（stderr.txt、传输元数据）
 ```
 
-是 SSH 提示，不应单独被解释为 `ibstat` 执行失败。真正失败应同时检查远端返回码和 `ibstat` stdout/stderr。
-
-#### IB 带宽
-
-带宽测试特点：
-
-- 使用本次选中的节点集合，不存在“参考节点”参数；
-- 每个不同节点的有向组合、每条对应 rail 测试一次；
-- 两端 HCA 名称可以不同，但数量必须一致；
-- HCA 按自然顺序匹配；
-- 单节点无法进行节点间测试，结果为 `NOT_VERIFIED`；
-- 低于阈值时，报告列出方向、源/目标 HCA、rail、实测带宽和阈值；
-- `--ib-max-tests` 限制测试总数，防止大节点集合形成无界全组合流量；
-- `--ib-concurrency 1` 表示串行执行带宽测试。
-
-由于测试会产生流量，必须同时满足：
-
-```text
---transport ssh
---confirm-nodes-idle
-```
-
-`--confirm-nodes-idle` 只表示操作者已经确认，不等于调度器提供了独占证明。
-
-#### NHC
-
-默认直接执行目标节点 PATH 中的：
-
-```text
-run_nhc
-```
-
-工具不经过登录 shell，也不自动附加 `run_nhc` 可能不支持的参数。可以用 `--nhc-command` 指定其他入口。
-
-判定方式：
-
-- 输出 `[CHECK RESULT]: PASSED`、`[CHECK RESULT]: PASS` 或独立 `PASSED`，且返回码为 0：`PASS`；
-- 输出其他明确 `[CHECK RESULT]`：`FAIL/BLOCKED`；
-- 命令不存在、超时、执行异常、非零返回但没有有效故障结果、结果标记缺失：`NOT_VERIFIED/INCOMPLETE`。
-
-默认假定每个目标节点已经安装 `run_nhc`，并且该命令可从节点 PATH 中找到。无法获得有效 NHC 结果时，工具只报告问题，不自动安装或修复。必要时可以通过 `--nhc-install-source` 提供站点自定义的安装提示；该参数默认无值。
-
-### 4.7 裸金属参数速查
-
-| 参数 | 默认值/要求 | 说明 |
-|---|---|---|
-| `--node` / `--nodes-file` / `--slurm-job-id` / `--slurm-nodelist` | 四选一 | 节点来源 |
-| `--transport` | `auto` | `auto`、`clush` 或 `ssh` |
-| `--concurrency` | `32` | 静态远端检查并发，范围 1～128 |
-| `--connect-timeout` | `10` | SSH 建连超时 |
-| `--command-timeout` | `240` | 单节点静态探针超时 |
-| `--remote-python` | `python3` | 目标节点 Python 3.10+ |
-| `--expected-devices` | 可选 | 每节点预期 HCU 数量 |
-| `--software-mode` | 必需 | `host-python`、`conda`、`docker` |
-| `--require-python-package` | 可重复 | 只检查显式列出的包 |
-| `--enable-node-health-checks` | 关闭 | 启用一次 IB 状态、带宽和 NHC |
-| `--output-dir` | 必需 | 可重复使用的结果根目录 |
-
-查看全部参数：
+`script`、`gemm`、`ib-write-bw`、`custom` 与基础检测使用同一命名规则（如 `lconda_script_...`、`container_platform_resource_...`）。查看最新一次结果：
 
 ```bash
-./hcu-envcheck.sh baremetal-cluster --help
+R=$(ls -td verify_results/container_rccl_* | head -1)
+column -t -s $'\t' "$R/groups/group-000/rccl/rccl-summary.tsv"
 ```
 
-## 5. Kubernetes 检查
+按症状定位：
 
-### 5.1 先检查 context 和权限
-
-```bash
-NAMESPACE=train-preflight
-
-kubectl config current-context
-kubectl auth can-i get nodes
-kubectl auth can-i get pods -n "$NAMESPACE"
-kubectl auth can-i create pods -n "$NAMESPACE"
-kubectl auth can-i delete pods -n "$NAMESPACE"
-kubectl auth can-i create pods/exec -n "$NAMESPACE"
-```
-
-权限要求：
-
-- `k8s-pod` 至少需要读取目标 Pod/Node 并 exec 到指定容器；
-- `k8s-cluster` 还需要创建、等待、读取和删除临时 Pod；
-- 使用 wheel bootstrap 时还需要复制文件到临时 Pod。
-
-不要为了运行检查直接授予 `cluster-admin`，应按最小权限补齐 RBAC。
-
-### 5.2 检查一个已有 Pod
-
-必须明确指定 namespace、Pod 和容器，工具不会枚举或猜测：
-
-```bash
-RUN_DIR="$PWD/out/k8s-pod-$(date +%Y%m%d-%H%M%S)-$$"
-
-./hcu-envcheck.sh k8s-pod \
-  --namespace train-preflight \
-  --pod training-pod \
-  --container trainer \
-  --device-resource-name hygon.com/hcu \
-  --expected-devices 8 \
-  --max-vram-used-percent 5 \
-  --max-hcu-util-percent 5 \
-  --samples 3 \
-  --busy-sample-quorum 2 \
-  --sample-interval 1 \
-  --require-rdma \
-  --minimum-rdma-devices 4 \
-  --expected-rdma-protocol ib \
-  --require-rccl \
-  --require-ucx \
-  --output "$RUN_DIR/preflight-result.json" \
-  --evidence-dir "$RUN_DIR/evidence"
-```
-
-已有 Pod 只读复用，不会被删除。工具会核对实际 Pod UID、所在 Node、镜像、容器状态、HCU request/limit 和容器内环境。
-
-指定非默认集群：
-
-```text
---kubeconfig /path/to/kubeconfig --context my-context
-```
-
-### 5.3 检查一批 K8s 节点
-
-准备 `k8s-nodes.txt`：
-
-```text
-hcu-node-001
-hcu-node-002
-hcu-node-003
-```
-
-节点文件支持空行、`#` 注释、逗号列表和简单范围。
-
-执行：
-
-```bash
-RUN_DIR="$PWD/out/k8s-cluster-$(date +%Y%m%d-%H%M%S)-$$"
-
-./hcu-envcheck.sh k8s-cluster \
-  --nodes-file k8s-nodes.txt \
-  --namespace train-preflight \
-  --image registry.example.com/train/dtk-image:tag \
-  --image-pull-policy IfNotPresent \
-  --device-resource-name hygon.com/hcu \
-  --expected-devices 8 \
-  --target-scale-devices 10000 \
-  --samples 3 \
-  --busy-sample-quorum 2 \
-  --sample-interval 1 \
-  --require-rdma \
-  --minimum-rdma-devices 4 \
-  --expected-rdma-protocol ib \
-  --require-rccl \
-  --require-ucx \
-  --strict-stack-consistency \
-  --probe-memory-request 1Gi \
-  --probe-memory-limit 8Gi \
-  --pod-ready-timeout 180 \
-  --concurrency 16 \
-  --api-qps 20 \
-  --api-burst 40 \
-  --output-dir "$RUN_DIR"
-```
-
-临时 Pod 的主要约束：
-
-- 明确绑定目标 Node；
-- 申请完整的预期 HCU request/limit；
-- 使用特权容器和 host network；
-- `restartPolicy: Never`；
-- 不自动挂载 ServiceAccount Token；
-- 使用唯一 run-id 标签；
-- 结束时核对 run-id 后再删除。
-
-创建特权探针 Pod 必须获得管理员授权，并可能受到 Pod Security、准入策略、ResourceQuota、污点或资源占用限制。
-
-### 5.4 复用指定节点上的已有 Pod
-
-格式：
-
-```text
-NODE=NAMESPACE/POD/CONTAINER
-```
-
-示例：
-
-```bash
-./hcu-envcheck.sh k8s-cluster \
-  --nodes-file k8s-nodes.txt \
-  --namespace train-preflight \
-  --image registry.example.com/train/dtk-image:tag \
-  --reuse-pod hcu-node-002=train-preflight/training-pod/trainer \
-  --expected-devices 8 \
-  --output-dir "$PWD/out/k8s-reuse-$(date +%Y%m%d-%H%M%S)-$$"
-```
-
-指定节点使用已有容器，其余节点仍创建临时 Pod。复用 Pod 不会被删除，工具还会核对它是否真的运行在指定 Node 上。
-
-### 5.5 注入受限路径变量
-
-训练镜像中的命令或库不在默认路径时：
-
-```bash
---probe-env 'PATH=/opt/hyhal/bin:/opt/dtk/bin:/usr/local/bin:/usr/bin' \
---probe-env 'LD_LIBRARY_PATH=/opt/dtk/lib:/opt/hyhal/lib:/opt/ucx/lib' \
---probe-env 'HIP_PATH=/opt/dtk/hip'
-```
-
-只允许路径和设备可见性相关变量。不要把 Token、密码或 Secret 放入 `--probe-env`。
-
-### 5.6 在临时 Pod 中验证已知 wheel
-
-先获得并核对 wheel SHA256：
-
-```bash
-sha256sum packages/hcusmi-1.0.0+a788f784-py3-none-any.whl
-```
-
-然后：
-
-```bash
-./hcu-envcheck.sh k8s-cluster \
-  --node hcu-node-001 \
-  --namespace train-preflight \
-  --image registry.example.com/train/dtk-image:tag \
-  --expected-devices 8 \
-  --bootstrap-wheel packages/hcusmi-1.0.0+a788f784-py3-none-any.whl \
-  --bootstrap-wheel-sha256 "$WHEEL_SHA256" \
-  --output-dir "$PWD/out/k8s-wheel-$(date +%Y%m%d-%H%M%S)-$$"
-```
-
-wheel 只安装到工具创建的短生命周期 Pod，不修改镜像、宿主机或复用的业务 Pod。
-
-### 5.7 临时 Pod 清理状态
-
-| 状态 | 含义 |
+| 症状 | 先查看 |
 |---|---|
-| `DELETED` | 已删除 |
-| `ALREADY_GONE` | 已不存在 |
-| `CLEANUP_REQUIRED` | 删除失败，需要人工核查 |
-| `CLEANUP_REFUSED` | run-id 不一致，工具拒绝删除 |
+| 整组 FAIL，不知道哪一项 | `rccl/rccl-summary.tsv` 的 reason 列（EXECUTION_FAILED / BELOW_BASELINE） |
+| 某项执行失败 | `rccl/<测试项>.log` 尾部，再看 `nodes/<节点>/stderr.log` |
+| 性能不达标 | summary 的 peak 与基准列；`*.command.sh` 中核对实际生效的 `-x` 环境变量 |
+| 预检拦截（PRECHECK_FAILED） | 终端输出（预检不落盘、不创建组目录）及 `active-result.json` 的 issues |
+| 手工复跑某一项 | `bash rccl/<测试项>.command.sh`（完整命令已存证） |
 
-清理未完成会使该节点变为 `INCOMPLETE`。人工处理前必须核对 namespace、Pod 名和 run-id，禁止按名称模糊删除。
+## 5. 场景与逐节点脚本
 
-查看 K8s 全部参数：
-
-```bash
-./hcu-envcheck.sh k8s-pod --help
-./hcu-envcheck.sh k8s-cluster --help
-```
-
-## 6. RDMA、IB 和 RoCE 结果如何理解
-
-### 6.1 工具不按网卡型号猜协议
-
-协议根据每个端口当前配置判断：
-
-- `link_layer=InfiniBand`：当前为 Native IB。
-- `link_layer=Ethernet`，并且存在非零 RoCE v1/v2 GID 和对应 netdev：当前为 RoCE。
-- GID、type 或 ndev 证据不可读：`UNKNOWN`/`ETHERNET_RDMA_EVIDENCE_INCOMPLETE`。
-- Ethernet RDMA 端口没有有效映射 GID：`ETHERNET_RDMA_UNCONFIRMED`。
-- 同一节点或目标集群出现 Native IB/RoCE 混用：协议配置冲突。
-
-Native IB 环境中，GID 类型显示 `IB/RoCE v1` 不代表当前正在使用 RoCE，仍应以 `link_layer` 和完整端点证据为准。
-
-### 6.2 当前端口模式、硬件能力和实际训练路径是三个结论
-
-报告分别描述：
-
-1. 当前端口配置；
-2. 通用接口能否确认硬件支持的其他模式；
-3. 是否已经证明训练实际使用了 RDMA。
-
-通用 Linux 接口无法查询厂商固件双模能力时，硬件支持显示 `UNKNOWN_NO_GENERIC_INTERFACE`。静态检查没有执行训练 collective 时，实际训练数据路径保持 `NOT_VERIFIED_BY_PREFLIGHT`，不会推断为 RDMA。
-
-### 6.3 Native IB 端点
-
-检查内容包括：
-
-- `Active`、`LinkUp`；
-- LID 和 SM LID；
-- 非零 GID；
-- P_Key；
-- 速率；
-- active/max MTU；
-- Subnet。
-
-跨节点按 `(Subnet, P_Key, active/max MTU, rate)` 组合比较，不比较本来就应不同的 LID/GID 值。
-
-### 6.4 RoCE 配置链
-
-只有当前端口为 Ethernet 且存在有效 RoCE GID/netdev 时才检查 RoCE。GID 映射到 bond 或 VLAN 时，会继续追踪到底层物理接口采集：
-
-- MTU 和地址；
-- PFC；
-- ETS；
-- APP；
-- buffer；
-- DCBX；
-- pause/FEC 等可读证据。
-
-命令执行成功只表示证据可读。没有显式 `--rdma-policy-file` 时，主机 QoS 最高只能显示 `COLLECTED_POLICY_UNVALIDATED`，不能写成 PASS。
-
-交换机侧 PFC/ECN、路由、队列、固件、光模块和 BER 需要独立管理面权限；没有 SNMP/gNMI/厂商 API 时保持 `NOT_VERIFIED`。
-
-### 6.5 RDMA 计数器和 Verbs userspace
-
-`--rdma-counter-interval SEC` 对端口计数器做两次采样：
-
-- 错误、掉链或丢包增长：FAIL；
-- 拥塞等待增长：WARN；
-- 缺失、复位、回绕或饱和：UNKNOWN；
-- 历史非零但观察窗口内稳定：不作为新增故障。
-
-Verbs userspace 独立检查：
-
-- `ibv_devices` 是否枚举 HCA；
-- 每个 HCA 的 `ibv_devinfo` 是否能打开设备；
-- provider 配置和相关动态库是否可见。
-
-内核 sysfs 端点正常，不能掩盖 provider 缺失、ABI 不匹配或 userspace 无法打开设备。
-
-## 7. 输出目录、报告与退出码
-
-### 7.1 不同入口的输出目录规则
-
-#### baremetal-cluster
-
-`--output-dir` 是可重复使用的结果根目录：
+- Conda 两场景固定在宿主机 source env.sh。
+- `per-node-container` 固定在指定的 `--container NAME` 内 source env.sh；不再使用冗余的 `--scope`。
+- `script` 操作在每个节点独立运行指定脚本，不分组、不启动 MPI/torchrun，适合 DeepEP 环境诊断等单节点脚本：
 
 ```bash
---output-dir ./out
+./bin/hcu-cluster-run per-node-container script -f hostfile \
+  --container zy-bridge2 \
+  --env-script <prefix>/env/env.sh \
+  --script <prefix>/cluster-manager-das/hcu-envcheck/cluster_run/payloads/check_deepep_env.sh
 ```
 
-即使 `./out` 已经存在，每次也会创建：
+`--script` 必须是各目标节点或容器可见的绝对路径。`.py` 由目标环境中的 `python3` 执行，其余脚本由 `bash` 执行。`--script-arg` 可重复传入参数，输出为 `script-result.json` 和逐节点 stdout/stderr。
 
-```text
-out/nodes_check_YYYYMMDD_HHMMSS_ffffff/
-```
+## 6. 容器维护命令
 
-不会覆盖或混合历史结果。
-
-#### k8s-cluster 和主动验收入口
-
-这些入口的 `--output-dir` 是单次运行目录，必须使用新的、尚不存在的路径：
+### 创建时配置容器间 SSH 免密
 
 ```bash
-RUN_DIR="$PWD/out/k8s-cluster-$(date +%Y%m%d-%H%M%S)-$$"
+# 全部节点创建独立 root 公钥 SSH 服务，端口需空闲；无需 env.sh
+./bin/hcu-cluster-run per-node-container container-create \
+  -f hostfile --container worker -i "$IMAGE" --port 25901 \
+  -v /share:/share
+
+# 重建会删除现有容器；确认业务已退出并显式重传设备/挂载等参数
+./bin/hcu-cluster-run per-node-container container-recreate \
+  -f hostfile --container worker -i "$IMAGE" --port 25901 \
+  -v /share:/share --yes
+
+# 在任意上述容器内，以 root 直接进入另一个节点的对应容器
+ssh m09r2n09 -p 25901
+
+# 后续多节点 MPI 必须使用相同端口；不会因为 --port 而跳过资源检查
+./bin/hcu-cluster-run per-node-container rccl \
+  -f hostfile --container worker --env-script /share/env.sh \
+  --container-ssh-port 25901 --group-size 2
 ```
 
-已有路径会被拒绝，以防覆盖。
+- `--port` 只对 create/recreate 生效，范围 1–65535；不传时不自动配置 SSH。与控制端 SSH 到宿主机的端口、IB/MPI rendezvous 端口无关。`--dry-run` 不创建容器、不检查远端端口，也不能证明免密已建立。
+- 此模式自动使用 `--network=host`，容器 sshd 监听节点的指定端口，不需要 Docker `-p` 映射；拒绝 bridge 网络、额外 publish、覆盖 entrypoint/user/PID namespace 等冲突参数。只影响新建容器，不改宿主机 sshd、防火墙或已有容器配置。
+- 宿主机需要 `ss` 检查端口；镜像须为 **root 用户、root home=/root** 的 Linux 环境，预装 Bash 4+、OpenSSH client/server、PAM sshd 配置和常用 coreutils，并可读取 `/proc`。容器内无需 `ss` 或 Python。缺失时明确失败，离线节点不自动安装软件。PAM 的账号过期/访问策略仍生效，不修改或解锁 root 密码。`--port` 不适用于非 root 镜像。
+- 创建前全节点核验镜像、端口与依赖；端口被占用即失败，只有能证明属于同名、同端口的工具管理容器时才允许重建复用。不能确认归属时选其他端口，不能杀宿主机监听进程。
+- 每容器生成独立用户私钥和 host 私钥，**只交换公钥**；固定 `known_hosts` 并严格验签，只允许 root 公钥登录，不开放密码认证。保留镜像原 Entrypoint/Cmd；sshd bootstrap 每次容器启动执行，`docker restart` 后信任和密钥保留，recreate 则生成新密钥并重新配置本次 hostfile 节点集合。勿将管理状态目录打进镜像。
+- 配置写到容器内 `/var/lib/hcu-cluster-ssh/`，在 `/root/.ssh/config` 前置当前节点的专用配置并备份原配置。不允许将宿主目录挂载覆盖 `/root`、`/etc`、SSH 状态或运行时目录；业务 `/share`、`/public/home/...` 等挂载可正常使用。
+- 只授权**本次 hostfile 内容器的 root 互联**。宿主机的普通用户或入口机不会自动得到容器 root 权限；从这些位置登录需自行管理相应公钥授权并写 `ssh root@node -p PORT`。后续增加节点应在维护窗口整体重新建立同一节点集合的互信，不能只建新节点就假定旧容器已信任它。
+- 32 节点以内验证所有容器间 SSH 路径（含自身）；更大规模验证首节点到所有节点、各节点到首节点及环形路径，避免万卡集群 N² 连接爆炸。每条受测 SSH 的 namespace/UID 与宿主机 `docker exec` 对照，后续主动测试仍检查实际 MPI 组路径。日志标明验证拓扑，不夸大为全网络实测。
+- 创建/分发/验证不是跨节点事务；后阶段失败可能留下部分新容器，终端返回失败原因，不自动删除回滚、不写 preflight.json。查看 `docker logs worker` 和容器内 `/var/lib/hcu-cluster-ssh/sshd.log`。中断维护后也应逐节点确认实际状态。
 
-#### k8s-pod
+参考[容器间免密文档](https://r0ddbu55vzx.feishu.cn/wiki/RLPuwp70wiZShuk4VDvc7dSNn9g)的端口及公钥认证流程；不采用复制整个 `.ssh` 私钥目录或设置 root 密码的做法。
 
-显式指定的 `--output` 和 `--evidence-dir` 也必须使用新的、互不嵌套的目标。省略时工具会自动创建唯一运行目录。
+容器维护仅限 `per-node-container`，在宿主机运行，不需 `env.sh`：
 
-### 7.2 裸金属运行目录结构
-
-```text
-nodes_check_时间戳/
-├── cluster-summary.md
-├── cluster-result.json
-└── evidence/
-    └── <run-id>/
-        ├── run.json
-        ├── controller.stdout
-        ├── controller.stderr
-        └── nodes/
-            └── <node-hash>/
-                ├── result.json
-                ├── stdout.txt
-                └── stderr.txt
+```bash
+./bin/hcu-cluster-run per-node-container container-create   -f hostfile --container worker -i "$IMAGE" -v /share:/share
+./bin/hcu-cluster-run per-node-container container-recreate -f hostfile --container worker -i "$IMAGE" -v /share:/share --yes
+./bin/hcu-cluster-run per-node-container container-delete   -f hostfile --container worker --yes
 ```
 
-如果启用了 IB/NHC 额外检查，还会在 evidence 下保存相应的 cluster-extra 证据。
+`--dry-run` 只验证命令和节点计划，不改动容器。额外 Docker 参数可重复传 `--docker-arg=--network=host`；离线镜像传 `--image-tar /share/image.tar`，即使本地已有同名 tag 也会重新加载。创建/重建在更改容器前核对各节点实际 image ID，ID 不一致即停止；重建不自动继承旧容器的挂载、网络、用户和 CMD。旧版无场景 `-f/-g/-s` 与 `baremetal-cluster` 命令已停止支持；旧源码载荷仍保留供新版调用。
 
-### 7.3 四种主结果
+## 7. 边界
 
-| 退出码 | 状态 | 含义 |
-|---:|---|---|
-| `0` | `READY` | 满足本次启用的 Profile，仍可能包含 WARN |
-| `1` | `BLOCKED` | 存在已经确认的阻断项 |
-| `2` | `INCOMPLETE` | 节点不可达、超时、命令失败或证据不足 |
-| `3` | `TOOL_ERROR` | 参数、节点来源、输出路径或控制器自身错误 |
+不读取集群编排控制面；不依赖 Slurm Job ID、srun 或 Slurm nodelist；检测操作不自动修改驱动、网卡、容器或 Conda 环境；容器维护是显式操作；不设置全局门禁。
 
-启动器在主程序开始前失败时可能返回 69、70 等其他退出码。用户按 `Ctrl-C` 中断时返回 130。这些都不能解释为节点健康结论。
+## 7. 服务器手工验证总入口
 
-### 7.4 推荐的报告阅读顺序
+测试总入口为 `scripts/test.sh`。脚本不再封装公共执行函数，每个用例直接展开一条 `hcu-cluster-run` 命令，便于服务器上复制和修改。它用于确认代码接口能被调用、能生成报告或主动测试启动计划；报告中的环境 `PASS/FAIL/INCOMPLETE` 不作为脚本门禁。
 
-打开 `cluster-summary.md` 后：
+```bash
+bash scripts/test.sh --list
 
-1. 看总体状态。
-2. 找 `BLOCKED` 和 `INCOMPLETE` 节点。
-3. 查看节点原因码。
-4. 确认软件环境是 `CHECKED` 还是 `NOT_CHECKED`。
-5. 看 RDMA 当前端口模式，再分别查看 IB 和 RoCE 端点。
-6. 如果启用了额外节点检查，查看 `Cluster Extra Checks`。
-7. 对异常节点进入 evidence，核对原始 stdout、stderr 和 result.json。
+HOSTFILE=/share/nodes.txt ENV_SCRIPT=/share/train/env.sh \
+  CONTAINER_NAME=hcu-worker IMAGE=image:tag bash scripts/test.sh
+```
 
-必须区分：
+用例含义：
 
-- `PASS`：已有足够证据通过；
-- `NOT_CHECKED`：本次没有要求检查；
-- `NOT_VERIFIED`：执行过，但证据不足；
-- `UNKNOWN`：当前接口无法可靠判断。
-
-后三者都不等于 PASS。
-
-### 7.5 常见原因码
-
-| 原因码 | 含义 | 建议 |
-|---|---|---|
-| `HCU_BUSY` | 多次采样利用率超过阈值 | 确认是否有预期作业占用 |
-| `VRAM_IN_USE` | 多次采样显存超过阈值 | 检查残留或并行作业 |
-| `REMOTE_RESULT_MISSING` | 远端没有返回有效探针结果 | 查看 SSH/clush、远端 Python 和 stderr |
-| `SLURM_NODE_UNAVAILABLE` | 节点处于 drain/down/fail 等状态 | 查看 Slurm reason |
-| `IB_PORT_NOT_ACTIVE` | IB 端口不是 Active/LinkUp | 定位具体 HCA/端口和链路 |
-| `IB_BANDWIDTH_BELOW_THRESHOLD` | 某条测试路径低于阈值 | 查看方向、HCA、rail 和实测值 |
-| `NHC_CHECK_FAILED` | NHC 明确报告故障 | 查看 NHC 原始输出 |
-| `NHC_COMMAND_NOT_FOUND` | 节点没有 `run_nhc` | 按报告中的安装来源部署或修复 |
-| `NHC_RESULT_MARKER_MISSING` | NHC 输出无法解析 | 检查脚本输出协议 |
-| `TORCH_IMPORT_FAILED` | 显式要求 Torch 后导入失败 | 确认解释器/Conda/镜像是否与训练一致 |
-
-### 7.6 万卡规模结论
-
-`--target-scale-devices` 只用于静态适用性评估，不会自动执行对应规模压测。
-
-| 结论 | 含义 |
+| 用例 | 验证内容 |
 |---|---|
-| `NOT_READY` | 已检查样本存在阻断项 |
-| `NOT_VERIFIED` | 证据不完整 |
-| `SAMPLE_READY_FULL_SCALE_UNVERIFIED` | 样本通过，但没有覆盖目标卡数 |
-| `FULL_SCALE_STATIC_PREFLIGHT_PASSED_RUNTIME_UNVERIFIED` | 静态覆盖达到目标，仍未证明训练或通信稳定 |
+| `help` | 唯一入口帮助、版本和参数解析 |
+| `platform` | 驱动、软件版本、网络/RDMA 静态配置 |
+| `resource` | 内存、显卡/HCU、显存和资源空闲状态 |
+| `base` | `platform,resource` 合并检测及节点一致性差异报告 |
+| `rccl` | 分组 `mpirun-torchrun` 与 RCCL/PyTorch 主动通信 |
+| `gemm` | 分组 GEMM 主动计算 |
+| `ib-write-bw` | 实际 server/client 配对带宽，按 HCA/方向测试；支持 ib/roce、阈值和测试数限制，不使用 MPI |
+| `platform` 内置 IB 状态 | 每节点检查 IB/RDMA 设备、端口、链路和状态；不产生带宽流量 |
+| `nhc` | 既有 NHC 检测 |
+| `custom` | 自定义 Shell/Python 主动测试 |
+| `local` | 本地 Shell/Python 回归，不访问计算节点 |
 
-## 8. 常见故障排查
+一次执行三种场景的接口矩阵及本地单测，不接受按用例筛选。基础检测和容器状态检查默认真实执行；其余类别默认 dry-run，需分别设置 `RUN_ACTIVE=yes`（RCCL/GEMM worker）、`RUN_PROFILES=yes`（rccl-tests/rocblas）、`RUN_NETWORK=yes`（IB 带宽）、`RUN_DIAGNOSTICS=yes`（nhc；IB 状态由 platform 覆盖）、`RUN_SCRIPTS=yes`（用户脚本）或 `RUN_CONTEXT=yes`（无 DCU 的 Shell/Python 上下文探针）。这些开关互不替代；容器维护和独立 launcher 构造用例始终为 dry-run。上下文探针仍 source 用户 env.sh，且当次 `contexts/` 输入须在各目标节点/容器内同路径可见。`calls.tsv` 和 `acceptance-result.json` 分别保存调用退出码和逐项验收结果；dry-run 与预检拦截不计为实测通过。详见 [README 总测试入口](../README.md#7-服务器手工验证总入口)。
 
-### 8.1 控制端找不到 Python 3.10+
+常用变量：`HOSTFILE`、`ENV_SCRIPT`、`CONTAINER_NAME`、`IMAGE`、`GROUP_SIZE`、`ACTIVE_SLOTS`、`OUTPUT_DIR`、`CUSTOM_SCRIPT`、`DIAGNOSTIC_SCRIPT`。
 
-```bash
-export HCU_ENVCHECK_PYTHON=/usr/local/python3.12/bin/python3
-./bin/hcu-envcheck-doctor
-```
+## 8. 中断、失败与覆盖含义
 
-目标节点 Python 路径不同，还需要设置：
+Ctrl+C/SIGTERM 后停止新任务，在所有计划节点按本次唯一 token 清理组首、rank、脚本与 IB 两端，逐节点验证零残留；不杀其他业务进程。需要 Linux `/proc`、Bash 4+、setsid、flock、timeout。不能连接节点时返回 `CLEANUP_UNCONFIRMED` 并列出证据，不能承诺断网时已经结束；控制端 SIGKILL/断电只能依赖远端 timeout 兜底。自定义脚本不得清除任务标识并自行 daemonize。
 
-```text
---remote-python /path/to/python3
-```
+主动程序失败或基础检测的传输、环境初始化、探针执行失败，在远端清理已确认时返回 2；取消且清理已确认返回 130；工具错误、预检拦截或清理未确认返回 3。基础检测各节点探针成功退出并取得有效健康结论时，环境 BLOCKED/INCOMPLETE 仍返回 0；远程非零返回码、缺少返回码或缺少节点结果属于执行失败，不能按环境不完整返回 0。任何返回码都不是跨命令门禁。总测试入口区分接口错误、环境异常、dry-run 和预检拦截；PRECHECK_FAILED 表示测试尚未执行，不能计作主动计算覆盖。准确扩展规则见工程 `AGENTS.md`。
 
-### 8.2 SSH 无法登录或要求密码
-
-工具使用非交互 SSH，不会弹出密码输入。先单独验证：
-
-```bash
-ssh node37 hostname
-```
-
-需要指定用户、端口或密钥时，显式使用 `--transport ssh` 和对应参数。
-
-出现：
-
-```text
-REMOTE HOST IDENTIFICATION HAS CHANGED
-```
-
-必须通过可信渠道核对新指纹，再修正 `known_hosts`。
-
-### 8.3 `auto` 选择 clush 后失败
-
-先验证：
-
-```bash
-clush -w node37,node98 hostname
-```
-
-如果站点 clush 配置不可用而 SSH 可用，明确指定：
-
-```text
---transport ssh
-```
-
-### 8.4 `pam_slurm_adopt` 拒绝访问
-
-常见提示：
-
-```text
-Access denied by pam_slurm_adopt: you have no active jobs on this node
-```
-
-处理步骤：
-
-1. 按站点规则申请覆盖目标节点的 Slurm 作业。
-2. 请求完整的每节点 HCU GRES。
-3. 等待作业进入 RUNNING。
-4. 核对 `scontrol show job <JOB_ID>` 的 NodeList 和 AllocTRES。
-5. 使用 `--slurm-job-id <JOB_ID>` 运行检查。
-
-工具不会绕过 PAM，也不会自动申请或取消作业。
-
-### 8.5 预期 8 卡但只看到部分设备
-
-依次检查：
-
-1. Slurm `AllocTRES`/GRES，或 K8s HCU request/limit；
-2. `ROCR_VISIBLE_DEVICES`、`HIP_VISIBLE_DEVICES`、`CUDA_VISIBLE_DEVICES`；
-3. Slurm cgroup/GRES 绑定；
-4. K8s 设备插件和容器设备透传；
-5. `rocminfo` 与 `hy-smi` 原始证据是否一致。
-
-### 8.6 报告中 HCU 是空数组
-
-先区分：
-
-- 远端命令没有采集到设备；
-- 设备可见性被 Slurm/K8s 限制；
-- `rocminfo`/`hy-smi` 缺失或执行失败；
-- Python/Torch 检查没有启用。
-
-HCU 硬件发现不依赖 Torch。默认没有 `--require-python-package torch` 时不导入 Torch，但仍应从宿主硬件命令采集 HCU。应查看对应节点 evidence 中的 `rocminfo`、`hy-smi`、设备文件和 stderr。
-
-### 8.7 `TORCH_IMPORT_FAILED`
-
-该错误只应在显式要求：
-
-```text
---require-python-package torch
-```
-
-后出现。检查：
-
-- `--remote-python` 是否指向实际训练解释器；
-- 是否应该使用 `--software-mode conda`；
-- Docker 模式镜像是否正确；
-- Torch 与 DTK/运行库是否兼容。
-
-如果本次只检查宿主硬件，不要传 `--require-python-package torch`。
-
-### 8.8 NHC 为什么是 INCOMPLETE
-
-重点查看原因码：
-
-- `NHC_COMMAND_NOT_FOUND`：找不到 `run_nhc`；
-- `NHC_CHECK_TIMEOUT`：超时；
-- `NHC_EXECUTION_ERROR`/`NHC_EXECUTION_FAILED`：执行异常；
-- `NHC_RESULT_MARKER_MISSING`：输出没有可解析结果。
-
-先在目标节点直接执行：
-
-```bash
-command -v run_nhc
-run_nhc
-echo $?
-```
-
-确认输出包含明确的 `[CHECK RESULT]`。工具不会自动安装；安装来源会写入报告。
-
-### 8.9 `ib_write_bw` 失败或低于阈值
-
-先从 `Cluster Extra Checks` 找到：
-
-- source 节点；
-- destination 节点；
-- source HCA；
-- destination HCA；
-- rail；
-- 实测 Gbit/s；
-- 阈值。
-
-再检查两端：
-
-```bash
-ibstat
-ibv_devinfo
-```
-
-常见原因包括端口未 Active、HCA rail 对应关系不一致、服务端启动失败、控制端口冲突、GID/协议错误、MTU/链路速率问题或网络拥塞。
-
-### 8.10 K8s Forbidden
-
-使用：
-
-```bash
-kubectl auth can-i get nodes
-kubectl auth can-i get pods -n "$NAMESPACE"
-kubectl auth can-i create pods -n "$NAMESPACE"
-kubectl auth can-i delete pods -n "$NAMESPACE"
-kubectl auth can-i create pods/exec -n "$NAMESPACE"
-```
-
-按最小权限补齐 RBAC。
-
-### 8.11 临时 Pod Pending 或未 Ready
-
-```bash
-kubectl get pod -n "$NAMESPACE" "$POD" -o wide
-kubectl describe pod -n "$NAMESPACE" "$POD"
-kubectl get node "$NODE"
-```
-
-常见原因：
-
-- 完整 HCU 资源不可分配；
-- 节点 unschedulable 或有 taint；
-- 设备插件异常；
-- 镜像拉取失败；
-- 配额不足；
-- Pod Security/准入策略拒绝特权 Pod。
-
-### 8.12 输出目录已经存在
-
-先确认使用的是哪个入口：
-
-- `baremetal-cluster`：允许根目录已存在，会自动创建 `nodes_check_时间戳`。
-- `k8s-cluster`、主动验收入口：要求单次运行目录不存在。
-- `k8s-pod`：显式 output/evidence 目标必须不存在。
-
-不要把 K8s 的单次运行目录规则套用到裸金属 `--output-dir` 根目录。
-
-### 8.13 TOOL_ERROR 和 traceback
-
-先阅读：
-
-```text
-RESULT        TOOL_ERROR
-ERROR         ...
-```
-
-只有定位工具自身异常时才临时开启：
-
-```bash
-HCU_ENVCHECK_DEBUG=1 ./hcu-envcheck.sh <原命令>
-```
-
-调试输出可能包含现场路径或错误细节，不应直接公开。
-
-## 9. 主动通信验收（高级功能）
-
-主动入口只允许在使用者拥有的专用、空闲 Slurm allocation 中运行。它们不会由静态检查自动触发。
-
-### 9.1 Slurm 安全边界
-
-正式验收要求：
-
-- 节点属于指定 Job；
-- 提供对应的 enable 参数；
-- 提供 `--confirm-allocation-idle`；
-- allocation 没有 `.batch` 或其他 workload step；
-- 能证明作业级整节点独占。
-
-优先接受 `scontrol show job -o` 的 `Exclusive=NODE`。旧版 Slurm 没有该字段时，工具会组合检查：
-
-- `OverSubscribe=NO`；
-- 所选节点等于 Job 完整节点集；
-- 节点 `State=ALLOCATED`；
-- `CPUAlloc=CPUTot`；
-- 节点分配 HCU 数等于配置 HCU 数；
-- Job 自身 `NumNodes`、`NumCPUs` 和 `AllocTRES` 与节点容量合计一致；
-- 没有可见的其他活动 Job。
-
-任何查询、字段或解析缺失都 fail-closed。`--unsafe-allow-overlap` 只用于诊断，结果标记为 `OVERLAP_NOT_PROVEN_IDLE`，不能获得正式 PASS。
-
-### 9.2 active-rdma-slurm
-
-支持：
-
-| backend | 检查内容 |
-|---|---|
-| `verbs` | 两节点 `ib_write_bw`/`ib_send_bw`/`ib_read_bw` 可达性和带宽 |
-| `rccl` | 宿主机已安装的 `all_reduce_perf` |
-| `torch-rccl` | 两节点 PyTorch all-reduce 正确性和 RCCL 传输路径 |
-
-Verbs 示例：
-
-```bash
-ACTIVE_JOB_ID="${SLURM_JOB_ID:?run inside a dedicated allocation}"
-
-./hcu-envcheck.sh active-rdma-slurm \
-  --slurm-job-id "$ACTIVE_JOB_ID" \
-  --nodes-file nodes.txt \
-  --backend verbs \
-  --rdma-protocol ib \
-  --verbs-hca shca_0 \
-  --verbs-port 1 \
-  --verbs-tool ib_write_bw \
-  --verbs-message-bytes 1048576 \
-  --verbs-iterations 1000 \
-  --minimum-verbs-gbps 200 \
-  --enable-active-checks \
-  --confirm-allocation-idle \
-  --output-dir "$PWD/out/active-verbs-$(date +%Y%m%d-%H%M%S)-$$"
-```
-
-PyTorch/RCCL 示例：
-
-```bash
-./hcu-envcheck.sh active-rdma-slurm \
-  --slurm-job-id "$ACTIVE_JOB_ID" \
-  --nodes-file nodes.txt \
-  --backend torch-rccl \
-  --container-name "$ACTIVE_CONTAINER" \
-  --python-binary python3 \
-  --master-port 29500 \
-  --enable-active-checks \
-  --confirm-allocation-idle \
-  --output-dir "$PWD/out/active-torch-$(date +%Y%m%d-%H%M%S)-$$"
-```
-
-RCCL 功能、GDR 和性能是三个独立维度：
-
-- 功能 PASS 要求结果完整、所有 Rank 正确、无 `#wrong`/OOB，并且实际选择 RDMA；
-- `--require-rccl-gdr` 要求每个 Rank 有明确 GDR Enabled 证据；
-- 没有设置性能阈值时，功能可以 PASS，但性能保持 `NOT_VERIFIED`。
-
-### 9.3 ib-fabric-slurm
-
-示例：
-
-```bash
-./hcu-envcheck.sh ib-fabric-slurm \
-  --slurm-job-id "$ACTIVE_JOB_ID" \
-  --nodes-file nodes.txt \
-  --hca shca_0 \
-  --hca shca_1 \
-  --hca shca_2 \
-  --hca shca_3 \
-  --ib-port 1 \
-  --expected-link-width 4X \
-  --minimum-link-speed-gbps 400 \
-  --counter-interval 5 \
-  --query-qps 2 \
-  --max-workers 16 \
-  --overall-timeout 900 \
-  --enable-fabric-check \
-  --confirm-allocation-idle \
-  --output-dir "$PWD/out/ib-fabric-$(date +%Y%m%d-%H%M%S)-$$"
-```
-
-该入口：
-
-- 只适用于 Native IB；
-- 通过有界一跳 MAD 查询定位叶交换机端口；
-- 双采样标准和扩展端口计数器；
-- 不执行全 Fabric 扫描；
-- 不执行任何 reset；
-- 不替代交换机管理面 PFC/ECN、路由、固件和光模块检查。
-
-`--minimum-link-speed-gbps` 是所有 lane 的聚合速率下限。例如 `4X 106.25 Gbps` 的聚合速率是 `425 Gbps`，因此聚合阈值 `400` 可以通过。
-
-查看全部高级参数：
-
-```bash
-./hcu-envcheck.sh active-rdma-slurm --help
-./hcu-envcheck.sh ib-fabric-slurm --help
-```
-
-## 10. 工具边界和安全说明
-
-### 10.1 静态检查会做什么
-
-- 读取 HCU、驱动、DTK、CPU、内存、网络和 RDMA 信息；
-- 只读采样显存和 HCU 利用率；
-- 根据明确 Profile 判断环境是否满足训练要求；
-- 生成 Markdown、JSON 和原始 evidence；
-- K8s 集群模式会创建和清理带唯一 run-id 的临时 Pod。
-
-### 10.2 静态检查不会做什么
-
-- 不重置 HCU；
-- 不结束进程或清理显存；
-- 不修改驱动、固件、网卡模式或 ACS；
-- 不自动安装 Python 包、NHC 或系统软件；
-- 不恢复、添加或删除 Kubernetes taint；
-- 不运行客户模型；
-- 不编译扩展；
-- 不执行 RCCL collective；
-- 不在未显式启用时产生网络带宽测试流量；
-- 不把样本结论描述成全规模训练验证。
-
-### 10.3 证据和敏感信息
-
-证据目录默认限制为当前用户访问。证据仍可能包含：
-
-- 主机名；
-- 内核和驱动版本；
-- 设备标识；
-- 内部路径；
-- 命令错误文本。
-
-应按内部诊断数据管理，不要直接上传公共平台。工具不采集完整环境变量，也不保存完整 Pod JSON；`--probe-env` 只接受受限变量。
-
-## 11. 命令帮助和问题反馈
-
-查看帮助：
-
-```bash
-./hcu-envcheck.sh --help
-./hcu-envcheck.sh baremetal-cluster --help
-./hcu-envcheck.sh k8s-pod --help
-./hcu-envcheck.sh k8s-cluster --help
-./hcu-envcheck.sh active-rdma-slurm --help
-./hcu-envcheck.sh ib-fabric-slurm --help
-./install.sh --help
-```
-
-反馈现场问题时至少保留：
-
-- 工具版本；
-- 完整执行命令，删除敏感密钥路径；
-- 命令退出码；
-- `cluster-summary.md`；
-- `cluster-result.json`；
-- 异常节点的 evidence 目录。
-
-不要只截取一行错误文本。节点问题、远端执行问题和工具参数问题可能产生相似表象，完整证据可以避免误判。
+RCCL 二进制验收用例在 `scripts/test.sh` 中默认每节点 8 卡（`RCCL_NPROC_PER_NODE` 可覆盖），不与 Python worker 的 `NPROC_PER_NODE`（默认 1）混用。真实执行需有该规模十项完整基准；测试脚本使用短小数据量只验证功能，性能不达标是有效检测结果，不代表代码异常。

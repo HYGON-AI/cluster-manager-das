@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -257,7 +259,7 @@ def _extract_remote_rc(stdout: str, sentinel: str) -> tuple[str, int | None]:
 @dataclass(frozen=True)
 class BaremetalExecutionConfig:
     output_root: Path
-    transport: str = "auto"
+    transport: str = "ssh"
     concurrency: int = 32
     connect_timeout_seconds: float = 10.0
     command_timeout_seconds: float = 30.0
@@ -271,6 +273,7 @@ class BaremetalExecutionConfig:
     ssh_executable: str | None = None
     max_stdout_bytes: int = DEFAULT_NODE_STDOUT_LIMIT_BYTES
     max_stderr_bytes: int = DEFAULT_NODE_STDERR_LIMIT_BYTES
+    cancel_event: threading.Event | None = field(default=None, compare=False, repr=False)
 
     def validate(self) -> None:
         if self.transport not in {"auto", "clush", "ssh"}:
@@ -361,6 +364,8 @@ class BaremetalRunResult:
 
     @property
     def status(self) -> str:
+        if any(result.error_kind == "CANCELLED" for result in self.nodes.values()):
+            return "CANCELLED"
         succeeded = sum(result.success for result in self.nodes.values())
         if succeeded == len(self.nodes) and self.nodes:
             return "SUCCEEDED"
@@ -424,6 +429,9 @@ class BaremetalClusterExecutor:
         self._runner = runner
         self._popen = popen
         self._which = which
+        self._cancel_event = config.cancel_event if config.cancel_event is not None else threading.Event()
+        self._process_lock = threading.Lock()
+        self._processes: set[Any] = set()
 
     @classmethod
     def from_nodes_file(
@@ -473,6 +481,33 @@ class BaremetalClusterExecutor:
                 f"{expected}_executable must name the {expected} client, got {executable!r}"
             )
 
+    @staticmethod
+    def _clush_supports_file_output(executable: str) -> bool:
+        """Check for the clush options used by the per-node evidence path.
+
+        Several ClusterShell releases provide ``clush`` but do not implement
+        the ``--outdir``/``--errdir`` options.  Treating those versions as a
+        normal clush transport makes the command fail before it reaches any
+        compute node, leaving every node as a misleading ``REMOTE_RESULT_MISSING``.
+        """
+
+        try:
+            completed = subprocess.run(
+                [executable, "--help"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        help_text = completed.stdout or ""
+        return "--outdir" in help_text and "--errdir" in help_text
+
     def execute(
         self,
         command_name: str,
@@ -492,6 +527,21 @@ class BaremetalClusterExecutor:
             raise BaremetalConfigurationError("command_name cannot be empty")
 
         transport, executable = self.selected_transport()
+        transport_warnings: list[str] = []
+        clush_file_output = True
+        # Older ClusterShell versions do not provide --outdir/--errdir.  They
+        # are still usable: clush labels each output line with its node, which
+        # is parsed by the compatibility path below.
+        if (
+            transport == "clush"
+            and self._runner is subprocess.run
+            and self._popen is subprocess.Popen
+        ):
+            clush_file_output = self._clush_supports_file_output(executable)
+            if not clush_file_output:
+                transport_warnings.append(
+                    "clush lacks --outdir/--errdir; using labeled-output compatibility mode"
+                )
         started_at = _utc_now()
         token = uuid.uuid4().hex
         run_label = run_id or f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{token[:8]}"
@@ -508,6 +558,7 @@ class BaremetalClusterExecutor:
                 command_list,
                 sentinel,
                 run_dir,
+                file_output=clush_file_output,
                 result_handler=result_handler,
                 release_output=release_output,
             )
@@ -521,6 +572,7 @@ class BaremetalClusterExecutor:
                 result_handler=result_handler,
                 release_output=release_output,
             )
+        warnings = transport_warnings + warnings
 
         finished_at = _utc_now()
         run_result = BaremetalRunResult(
@@ -572,16 +624,62 @@ class BaremetalClusterExecutor:
             argv.extend(["-o", f"UserKnownHostsFile={self.config.known_hosts_file}"])
         return argv
 
+    def cancel_local(self) -> None:
+        """Unblock local waits; remote cleanup requires RemoteTaskSession.stop.
+
+        Safe to request during scheduling: a task checks the event before
+        spawning, and newly registered children poll it at least every 100 ms.
+        """
+        self._cancel_event.set()
+
+    @staticmethod
+    def _terminate_local_process(process: Any) -> None:
+        """Reap only our transport's fresh process group, never application names."""
+        def send(sig: int) -> None:
+            try:
+                if os.name == "posix" and getattr(process, "pid", None):
+                    os.killpg(process.pid, sig)
+                elif sig == signal.SIGTERM:
+                    process.terminate()
+                else:
+                    process.kill()
+            except (OSError, ProcessLookupError):
+                pass
+
+        send(signal.SIGTERM)
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+        # A parent can exit on TERM while its children ignore it. Kill our
+        # isolated group too, then reap the local leader.
+        send(getattr(signal, "SIGKILL", signal.SIGTERM))
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired as exc:
+            raise OSError("local transport could not be reaped after cancellation") from exc
+
     def _run_bounded_process(self, argv: list[str], timeout: float) -> dict[str, Any]:
         """Drain transport pipes continuously so controller output cannot exhaust RAM."""
 
-        process = self._popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        with self._process_lock:
+            if self._cancel_event.is_set():
+                return {"returncode": 130, "stdout": "", "stderr": "cancelled before local launch",
+                        "stdout_total_bytes": 0, "stderr_total_bytes": 0,
+                        "stdout_truncated": False, "stderr_truncated": False,
+                        "timed_out": False, "cancelled": True}
+            process = self._popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **({"start_new_session": True} if os.name == "posix" else {}),
+            )
+            self._processes.add(process)
         if process.stdout is None or process.stderr is None:
+            self._terminate_local_process(process)
+            with self._process_lock:
+                self._processes.discard(process)
             raise OSError("SSH process did not expose stdout/stderr pipes")
         stdout_capture = _BoundedTextCapture(self.config.max_stdout_bytes)
         stderr_capture = _BoundedTextCapture(self.config.max_stderr_bytes)
@@ -592,21 +690,36 @@ class BaremetalClusterExecutor:
         for thread in threads:
             thread.start()
         timed_out = False
+        cancelled = False
+        deadline = time.monotonic() + timeout
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+            while True:
+                if self._cancel_event.is_set():
+                    cancelled = True
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    process.wait(timeout=min(0.1, remaining))
+                    cancelled = self._cancel_event.is_set()
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            if cancelled or timed_out:
+                self._terminate_local_process(process)
+        except BaseException:
+            self._cancel_event.set()
+            self._terminate_local_process(process)
+            raise
         finally:
+            with self._process_lock:
+                self._processes.discard(process)
             for thread in threads:
-                thread.join(timeout=10)
+                thread.join(timeout=1)
         return {
-            "returncode": int(process.returncode if process.returncode is not None else 124),
+            "returncode": 130 if cancelled else int(process.returncode if process.returncode is not None else 124),
             "stdout": stdout_capture.render(),
             "stderr": stderr_capture.render(),
             "stdout_total_bytes": stdout_capture.total_bytes,
@@ -614,6 +727,7 @@ class BaremetalClusterExecutor:
             "stdout_truncated": stdout_capture.truncated,
             "stderr_truncated": stderr_capture.truncated,
             "timed_out": timed_out,
+            "cancelled": cancelled,
         }
     def _execute_ssh(
         self,
@@ -635,7 +749,7 @@ class BaremetalClusterExecutor:
             started = time.monotonic()
             timeout = self.config.connect_timeout_seconds + self.config.command_timeout_seconds + 1.0
             try:
-                if self._runner is subprocess.run:
+                if self._runner is subprocess.run or self._cancel_event.is_set():
                     captured = self._run_bounded_process(argv, timeout)
                     captured_stdout = captured["stdout"]
                     captured_stderr = captured["stderr"]
@@ -683,7 +797,10 @@ class BaremetalClusterExecutor:
                     )
                     completed_returncode = completed.returncode
                 stdout, remote_rc = _extract_remote_rc(captured_stdout, sentinel)
-                if remote_rc is None:
+                if self._cancel_event.is_set():
+                    returncode = 130
+                    error_kind = "CANCELLED"
+                elif remote_rc is None:
                     returncode = completed_returncode if completed_returncode != 0 else 255
                     if completed_returncode == 255:
                         error_kind = "SSH_TRANSPORT_FAILED"
@@ -746,10 +863,17 @@ class BaremetalClusterExecutor:
             return result
 
         results: dict[str, BaremetalNodeResult] = {}
-        with ThreadPoolExecutor(max_workers=min(self.config.concurrency, len(self.nodes))) as pool:
+        pool = ThreadPoolExecutor(max_workers=min(self.config.concurrency, len(self.nodes)))
+        futures = {}
+        pending_cancelled = False
+        try:
             futures = {pool.submit(run_one, node): node for node in self.nodes}
             for future in as_completed(futures):
                 node = futures[future]
+                if self._cancel_event.is_set() and not pending_cancelled:
+                    pending_cancelled = True
+                    for pending in futures:
+                        pending.cancel()
                 try:
                     result = future.result()
                     if result_handler is not None:
@@ -763,14 +887,21 @@ class BaremetalClusterExecutor:
                         transport="ssh",
                         command_name=command_name,
                         command=command,
-                        returncode=70,
+                        returncode=130 if self._cancel_event.is_set() else 70,
                         stdout="",
-                        stderr=f"unexpected executor error: {exc}",
+                        stderr="cancelled before execution" if self._cancel_event.is_set() else f"unexpected executor error: {exc}",
                         duration_seconds=0.0,
-                        error_kind="EXECUTOR_INTERNAL_ERROR",
+                        error_kind="CANCELLED" if self._cancel_event.is_set() else "EXECUTOR_INTERNAL_ERROR",
                     )
                     self._persist_node_result(run_dir, result)
                     results[node] = result
+        except BaseException:
+            self.cancel_local()
+            for future in futures:
+                future.cancel()
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=self._cancel_event.is_set())
         return results, []
 
     def _execute_clush(
@@ -781,6 +912,7 @@ class BaremetalClusterExecutor:
         sentinel: str,
         run_dir: Path,
         *,
+        file_output: bool,
         result_handler: Callable[[BaremetalNodeResult], None] | None,
         release_output: bool,
     ) -> tuple[dict[str, BaremetalNodeResult], list[str]]:
@@ -797,21 +929,24 @@ class BaremetalClusterExecutor:
         argv = [
             executable,
             "-S",
+            "-n",
             "-f",
             str(self.config.concurrency),
             "-t",
             str(max(1, math.ceil(self.config.connect_timeout_seconds))),
             "-u",
             str(max(1, math.ceil(self.config.command_timeout_seconds))),
-            "--outdir",
-            str(stdout_dir),
-            "--errdir",
-            str(stderr_dir),
-            "-w",
-            ",".join(self.nodes),
-            "--",
-            remote_command,
         ]
+        if file_output:
+            argv.extend(
+                [
+                    "--outdir",
+                    str(stdout_dir),
+                    "--errdir",
+                    str(stderr_dir),
+                ]
+            )
+        argv.extend(["-w", ",".join(self.nodes), "--", remote_command])
         waves = math.ceil(len(self.nodes) / self.config.concurrency)
         controller_timeout = waves * (
             self.config.connect_timeout_seconds + self.config.command_timeout_seconds
@@ -820,13 +955,15 @@ class BaremetalClusterExecutor:
         controller_stdout = ""
         controller_stderr = ""
         controller_timed_out = False
+        controller_cancelled = False
         controller_launch_error: str | None = None
         try:
-            if self._runner is subprocess.run:
+            if self._runner is subprocess.run or self._cancel_event.is_set():
                 captured = self._run_bounded_process(argv, controller_timeout)
                 controller_stdout = captured["stdout"]
                 controller_stderr = captured["stderr"]
                 controller_timed_out = captured["timed_out"]
+                controller_cancelled = captured.get("cancelled", False)
             else:
                 completed = self._runner(
                     argv,
@@ -857,23 +994,41 @@ class BaremetalClusterExecutor:
         )
         _write_text(run_dir / "controller.stdout", controller_stdout)
         _write_text(run_dir / "controller.stderr", controller_stderr)
+        labeled_stdout = (
+            {} if file_output else self._split_clush_labeled_output(controller_stdout)
+        )
+        labeled_stderr = (
+            {} if file_output else self._split_clush_labeled_output(controller_stderr)
+        )
         duration = time.monotonic() - started
         results: dict[str, BaremetalNodeResult] = {}
         for node in self.nodes:
-            stdout, stdout_total, stdout_truncated = self._read_clush_output(
-                stdout_dir, node, self.config.max_stdout_bytes
-            )
-            stderr, stderr_total, stderr_truncated = self._read_clush_output(
-                stderr_dir, node, self.config.max_stderr_bytes
-            )
+            if file_output:
+                stdout, stdout_total, stdout_truncated = self._read_clush_output(
+                    stdout_dir, node, self.config.max_stdout_bytes
+                )
+                stderr, stderr_total, stderr_truncated = self._read_clush_output(
+                    stderr_dir, node, self.config.max_stderr_bytes
+                )
+            else:
+                stdout, stdout_total, stdout_truncated = _bounded_text(
+                    labeled_stdout.get(node, ""), self.config.max_stdout_bytes
+                )
+                stderr, stderr_total, stderr_truncated = _bounded_text(
+                    labeled_stderr.get(node, ""), self.config.max_stderr_bytes
+                )
             stdout, remote_rc = _extract_remote_rc(stdout, sentinel)
             node_controller_error = self._clush_controller_error(controller_stderr, node)
-            if node_controller_error:
+            if node_controller_error and node_controller_error.strip() not in stderr:
                 stderr = stderr + ("" if not stderr or stderr.endswith("\n") else "\n")
                 stderr += node_controller_error
             shared_controller_error = controller_stderr if controller_launch_error else ""
             combined_error = f"{stderr}\n{shared_controller_error}".lower()
-            if remote_rc is not None:
+            if controller_cancelled or self._cancel_event.is_set():
+                returncode = 130
+                timed_out = False
+                error_kind = "CANCELLED"
+            elif remote_rc is not None:
                 returncode = remote_rc
                 timed_out = False
                 error_kind = None if remote_rc == 0 else "REMOTE_COMMAND_FAILED"
@@ -922,6 +1077,18 @@ class BaremetalClusterExecutor:
         elif controller_timed_out:
             warnings.append("clush controller exceeded its safety timeout")
         return results, warnings
+
+    def _split_clush_labeled_output(self, value: str) -> dict[str, str]:
+        """Split classic ``node: output`` clush streams into per-node text."""
+
+        output: dict[str, list[str]] = {node: [] for node in self.nodes}
+        prefixes = [(f"{node}: ", node) for node in sorted(self.nodes, key=len, reverse=True)]
+        for line in value.splitlines(keepends=True):
+            for prefix, node in prefixes:
+                if line.startswith(prefix):
+                    output[node].append(line[len(prefix) :])
+                    break
+        return {node: "".join(lines) for node, lines in output.items()}
 
     @staticmethod
     def _read_clush_output(

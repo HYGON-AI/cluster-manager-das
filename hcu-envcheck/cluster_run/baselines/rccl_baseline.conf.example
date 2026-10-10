@@ -1,0 +1,28 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+#
+# rccl_baseline.conf.example —— RCCL 集合通信 busbw 基准表模板
+#
+# 使用: 复制为同目录 rccl_baseline.conf, 用本集群实测值填写。
+# 实测基准属于集群内部数据, 已被 .gitignore 排除, 不要提交。
+#
+# 行格式: <np> <测试项> <busbw基准值> [margin]
+#   np     = 总卡数 = 节点数 × 每节点slots（与 rccl_perf_test.sh 的 NP 一致）
+#   测试项 = all_reduce all_gather broadcast reduce reduce_scatter
+#            gather scatter alltoall alltoallv sendrecv
+#   busbw  = 达标下限 (GB/s)，实测 >= 基准×(1-margin%) 判 PASS
+#   margin = 可选第 4 列，按项放宽容差（不写用全局 --margin，默认 1）
+#
+# 新增卡数规模: 先实测拿到数据, 再按同格式补一段（如 32/64 卡）。
+# 无对应 np 条目时 rccl_perf_test.sh 会直接报错, 不会拿别的规模凑数。
+# 默认一次执行全部十项；该规模必须有十项基准，缺项直接报错、不静默跳过。
+# 基准必须为正数；margin 范围为 [0, 100)，同一 np/test 不可重复。
+# 汇总四列分别为 out/in-place algbw/busbw 的独立峰值；性能判据仍为
+# max(out-of-place busbw, in-place busbw) 峰值，与本表 busbw 比较，
+# 不能把本表一列阈值当作四列阈值。图示/其他规模数据不能直接作为本站点基准。
+#
+# 示例（数值为占位, 按实测替换）:
+#8  all_reduce      120.00
+#8  alltoall        108.00
+#16 all_reduce      130.00
+#16 alltoall        44.00  5     # 第 4 列: 该项容差放宽到 5%（可选）

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pure-text parser and validator for ``rccl-tests`` output.
 
-This module deliberately has no dependency on launchers, Slurm, containers, or
+This module deliberately has no dependency on launchers, containers, or
 the active RDMA runner.  Callers only provide the captured stdout/stderr and the
 expectations that belong to the launch being diagnosed.
 """

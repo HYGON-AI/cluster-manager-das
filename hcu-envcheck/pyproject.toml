@@ -18,7 +18,10 @@ classifiers = [
 ]
 
 [project.scripts]
-hcu-envcheck = "hcu_envcheck.__main__:entrypoint"
+hcu-cluster-run = "cluster_run.__main__:entrypoint"
 
 [tool.setuptools.packages.find]
-include = ["hcu_envcheck*"]
+include = ["hcu_envcheck*", "cluster_run*"]
+
+[tool.setuptools.package-data]
+cluster_run = ["payloads/*.sh", "baselines/*.example", "cluster_env.conf.example", "common.sh"]

@@ -12,3 +12,8 @@ venv/
 .env
 .env.*
 !.env.example
+
+# cluster_run: site-specific config and baselines stay local
+cluster_run/cluster_env.conf
+cluster_run/baselines/rccl_baseline.conf
+cluster_run/baselines/gemm_baseline.conf

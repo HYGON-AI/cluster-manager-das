@@ -17,7 +17,7 @@ MAX_POLICY_BYTES = 1024 * 1024
 def load_roce_policy(path: Path) -> dict[str, Any]:
     """Return a JSON-compatible RoCE policy after strict local validation.
 
-    Validation happens on the controller before any SSH, Slurm or Kubernetes
+    Validation happens on the controller before any SSH
     action.  The raw JSON-compatible values are retained so the policy can be
     embedded in reports; ``normalize_roce_policy`` remains the single source
     of truth for accepted keys and value ranges.

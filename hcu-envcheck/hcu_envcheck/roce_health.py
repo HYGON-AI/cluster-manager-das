@@ -635,7 +635,7 @@ def evaluate_roce_health(
     """Evaluate one node's static RoCE configuration chain.
 
     The function is deterministic and performs no I/O, making it suitable for
-    the bare-metal, Docker and Kubernetes collectors alike.  ``policy`` is a
+    the bare-metal and Docker collectors alike.  ``policy`` is a
     JSON-compatible dictionary; see :func:`normalize_roce_policy` for accepted
     keys.
     """

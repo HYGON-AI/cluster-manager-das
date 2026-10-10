@@ -1,0 +1,108 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+#
+# cluster_env.conf.example —— 集群约定配置模板（单一来源）
+#
+# 使用: 复制为同目录 cluster_env.conf 并按本集群实际情况填写。
+#   cp cluster_env.conf.example cluster_env.conf
+# cluster_env.conf 含集群内部信息（镜像仓库地址、容器名等），已被 .gitignore
+# 排除，不要提交。
+#
+# 加载优先级（低 -> 高）：
+#   1. 本文件默认值
+#   2. 环境变量（导出后覆盖，便于 CI/临时改）
+#   3. 命令行参数（最高）
+#
+# 约定：值为空表示"不设默认"，由脚本自行兜底。
+
+# ============ 工具目录 ============
+# 各脚本默认取自身所在目录；此处显式设置可指向另一份（如集群侧镜像目录）
+: "${TOOLS_DIR:=}"
+# 集群侧工具目录（宿主机/容器内可见的公共路径，供手工复现命令使用）
+: "${TOOLS_DIR_REMOTE:=}"
+
+# ============ 节点 ============
+# 节点间 SSH 免密需预先配好，工具直接 `ssh <节点名>`（不拼 -p/-l）；用户/端口
+# 如需定制走 ~/.ssh/config，不在本文件配置。
+# 默认节点列表（-f 未指定时使用；为空则强制要求 -f）
+: "${DEFAULTS_NODES_FILE:=}"
+
+# ============ 容器与镜像 ============
+# 常用容器名与镜像（仅作默认提示；--container/-i 仍显式传入）
+: "${DEFAULTS_CONTAINER:=}"
+: "${DEFAULTS_IMAGE:=}"
+# 容器间 mpirun 互连端口（cluster_group_run.sh --container-ssh-port 与
+# rccl_perf_test.sh --port 同源，改这里两边一起生效）
+: "${DEFAULTS_CONTAINER_SSH_PORT:=25901}"
+# 每节点槽位（NP = 组内节点数 × slots）
+: "${DEFAULTS_SLOTS:=8}"
+# 单机最大卡数（校验上限用的"事实"；16 卡机型改这里）
+: "${DEFAULTS_MAX_SLOTS:=8}"
+# HCU 容器预设运行参数（--no-preset 关闭）
+: "${DEFAULTS_DCU_PRESET_ARGS:=--shm-size=400G --device=/dev/kfd --device=/dev/mkfd --device=/dev/dri --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --ipc=host --network=host --group-add video --privileged -v /opt/hyhal:/opt/hyhal:ro}"
+
+# ============ 卡空闲检查阈值 ============
+: "${DEFAULTS_VRAM_MAX:=5}"
+: "${DEFAULTS_UTIL_MAX:=5}"
+# 需要"运行前查计算卡是否空闲"的载荷脚本清单（逗号分隔的脚本文件名）。
+# 总入口只在 -s 载荷命中这个清单时才执行占用检查阶段（并导出 CLUSTER_IDLE_CHECKED=1）；
+# 其余任务（环境自检、采集信息、容器维护、只读命令等）一律跳过。
+# 写新载荷若要用卡，把文件名加进来即可，不用改脚本。
+: "${DEFAULTS_IDLE_CHECK_SCRIPTS:=rccl_perf_test.sh,gemm_perf_test.sh}"
+
+# ============ RCCL 测试 ============
+# 本节由 cluster_run/payloads/rccl_perf_test.sh 读取（CLUSTER_ENV_FILE 可换路径）。
+# 优先级（高 -> 低）: 显式命令行参数 > env.sh 已导出的实际运行变量
+#   （NCCL_SOCKET_IFNAME / NCCL_TOPO_FILE / UCX_NET_DEVICES 及下列 NCCL_*/RCCL_* 原生名）
+#   > 本文件站点默认 > 脚本内置兜底。值为空表示"不设默认"，由脚本兜底。
+# 基准文件（脚本目录找不到时回退到这里）
+: "${RCCL_BASELINE_FILE:=}"
+# rccl-test 可执行目录
+: "${RCCL_BIN_DIR:=/opt/rccl-test/build}"
+# 拓扑文件（按集群实际路径填写；env.sh 的 NCCL_TOPO_FILE 优先）
+: "${RCCL_TOPO_FILE:=}"
+# 网卡：NCCL_SOCKET_IFNAME / UCX_NET_DEVICES（env.sh 同名变量优先）
+: "${RCCL_IFACE:=eth0}"
+: "${RCCL_UCX_DEV:=ib0}"
+# 通信栈站点默认（env.sh 同名变量优先；取值来自站点手工验收命令）
+: "${NCCL_PXN_DISABLE:=0}"
+: "${RCCL_PXN_GPU_BALANCE:=1}"
+: "${NCCL_NET_PLUGIN:=shca}"
+: "${NCCL_PLUGIN_P2P:=ib}"
+: "${NCCL_NET_GDR_LEVEL:=4}"
+: "${NCCL_NET_GDR_READ:=1}"
+# 站点附加库路径（冒号分隔，追加到 LD_LIBRARY_PATH 最前）。RCCL 网络插件
+# 等不在默认路径的站点库写这里；省略 --env-script 时也能加载。
+: "${RCCL_EXTRA_LD_PATH:=}"
+# 用例参数 -b/-e/-f/-n/-w
+: "${RCCL_ARG_B:=4}"
+: "${RCCL_ARG_E:=1G}"
+: "${RCCL_ARG_F:=2}"
+: "${RCCL_ARG_N:=20}"
+: "${RCCL_ARG_W:=5}"
+# 允许低于基准的百分比（全局默认；单项可在基准文件第 4 列覆盖）
+: "${RCCL_MARGIN:=1}"
+
+# ============ GEMM 测试 ============
+: "${GEMM_BASELINE_FILE:=}"
+: "${GEMM_BIN_DIR:=}"
+# 形状文件：每行 <m> <n> <k>，与基准文件的 item 名对应
+: "${GEMM_SHAPES_FILE:=}"
+
+# ============ 镜像分发（cluster_image_sync.sh，未随本目录发布则忽略） ============
+: "${SYNC_SSH_PORT:=}"
+: "${SYNC_SSH_USER:=}"
+: "${SYNC_NODE_PREFIX:=}"
+: "${SYNC_CONTAINER_NAME:=}"
+: "${SYNC_JOBS:=8}"
+: "${SYNC_NODE_TIMEOUT:=900}"
+: "${SYNC_PULL_TIMEOUT:=900}"
+
+# ============ 并发限流 ============
+# cluster_group_run.sh 的 --jobs 默认值：0 = 不限（各组/各节点互不共享计算资源）。
+# 但 --recreate 建容器、或节点数很大时，registry 带宽与 sshd MaxStartups 会被打满，
+# 此时脚本会自动限流（见 cluster_group_run.sh 的 --jobs auto 处理）。
+: "${DEFAULTS_JOBS:=0}"
+# --jobs auto 时的自动限流值（节点数超过 AUTO_JOBS_THRESHOLD 时启用）
+: "${DEFAULTS_AUTO_JOBS:=16}"
+: "${DEFAULTS_AUTO_JOBS_THRESHOLD:=32}"

@@ -60,6 +60,16 @@ class NodeFileTests(unittest.TestCase):
 
 
 class BaremetalExecutorTests(unittest.TestCase):
+    def test_default_transport_is_ssh(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = BaremetalExecutionConfig(output_root=Path(temp))
+            executor = BaremetalClusterExecutor(
+                ["node01"],
+                config,
+                which=lambda name: f"/usr/bin/{name}" if name in {"clush", "ssh"} else None,
+            )
+            self.assertEqual(executor.selected_transport(), ("ssh", "/usr/bin/ssh"))
+
     def test_concurrency_has_a_hard_controller_safety_cap(self):
         with tempfile.TemporaryDirectory() as temp:
             with self.assertRaises(BaremetalConfigurationError):
@@ -69,7 +79,7 @@ class BaremetalExecutorTests(unittest.TestCase):
 
     def test_auto_prefers_clush(self):
         with tempfile.TemporaryDirectory() as temp:
-            config = BaremetalExecutionConfig(output_root=Path(temp))
+            config = BaremetalExecutionConfig(output_root=Path(temp), transport="auto")
             executor = BaremetalClusterExecutor(
                 ["node01"],
                 config,
@@ -79,7 +89,7 @@ class BaremetalExecutorTests(unittest.TestCase):
 
     def test_auto_falls_back_to_ssh_when_clush_is_absent(self):
         with tempfile.TemporaryDirectory() as temp:
-            config = BaremetalExecutionConfig(output_root=Path(temp))
+            config = BaremetalExecutionConfig(output_root=Path(temp), transport="auto")
             executor = BaremetalClusterExecutor(
                 ["node01"],
                 config,
@@ -204,6 +214,40 @@ class BaremetalExecutorTests(unittest.TestCase):
             self.assertEqual(result.nodes["node02"].returncode, 3)
             self.assertEqual(result.nodes["node02"].error_kind, "REMOTE_COMMAND_FAILED")
             self.assertEqual(Path(invoked[0][0]).name, "clush")
+
+    def test_clush_without_file_output_parses_labeled_node_streams(self):
+        invoked = []
+
+        with tempfile.TemporaryDirectory() as temp:
+            config = BaremetalExecutionConfig(
+                output_root=Path(temp),
+                transport="clush",
+                clush_executable="/usr/bin/clush",
+            )
+            executor = BaremetalClusterExecutor(["node01", "node02"], config)
+            executor._clush_supports_file_output = lambda _executable: False
+
+            def bounded(argv, _timeout):
+                invoked.append(argv)
+                sentinel = sentinel_from_argv(argv)
+                return {
+                    "stdout": (
+                        f"node01: first\nnode02: second\n"
+                        f"node01: {sentinel}=0\nnode02: {sentinel}=3\n"
+                    ),
+                    "stderr": "node02: remote failure\n",
+                    "timed_out": False,
+                }
+
+            executor._run_bounded_process = bounded
+            result = executor.execute("inventory", ["hostname"], run_id="clush-compat")
+
+            self.assertNotIn("--outdir", invoked[0])
+            self.assertTrue(result.nodes["node01"].success)
+            self.assertEqual(result.nodes["node01"].stdout, "first\n")
+            self.assertEqual(result.nodes["node02"].returncode, 3)
+            self.assertIn("remote failure", result.nodes["node02"].stderr)
+            self.assertIn("compatibility mode", result.controller_warnings[0])
 
     def test_missing_remote_sentinel_is_not_reported_as_success(self):
         def runner(argv, **kwargs):

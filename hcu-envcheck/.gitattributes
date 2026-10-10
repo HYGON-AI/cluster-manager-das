@@ -1,2 +1,2 @@
 *.sh text eol=lf
-bin/hcu-envcheck* text eol=lf
+bin/hcu-cluster-run text eol=lf

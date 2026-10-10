@@ -10,12 +10,13 @@ import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 from typing import Any, Callable, Sequence
 
-from .active_rdma import SlurmActiveCheckRunner
+from .verbs import parse_verbs_average_gbps, parse_verbs_endpoint_metadata
 from .baremetal import BaremetalClusterExecutor, BaremetalExecutionConfig, BaremetalNodeResult
 from .models import Finding
 from .output import atomic_write_text_exclusive
@@ -23,6 +24,7 @@ from .output import atomic_write_text_exclusive
 
 RunText = Callable[..., subprocess.CompletedProcess[str]]
 Which = Callable[[str], str | None]
+RemoteCommandWrapper = Callable[[Sequence[str], float], Sequence[str]]
 
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
 _SAFE_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -80,7 +82,10 @@ def _result_finding(severity: str, reason_code: str, message: str) -> dict[str, 
 
 
 def _command_summary(result: BaremetalNodeResult) -> dict[str, Any]:
-    return result.to_command_result().summary()
+    summary = result.to_command_result().summary()
+    if result.returncode in {124, 137}:
+        summary["timed_out"] = True
+    return summary
 
 
 @dataclass(frozen=True)
@@ -108,7 +113,8 @@ class NHCCheckConfig:
         if self.removed is not None:
             _safe_token(self.removed, "NHC removed")
         if self.extra_args:
-            _safe_command(self.extra_args, "NHC extra args")
+            # Extra arguments normally start with an option, not an executable.
+            _safe_command([*self.command, *self.extra_args], "NHC command + extra args")
         if self.timeout_seconds <= 0 or self.timeout_seconds > 3600:
             raise ValueError("nhc timeout must be in (0, 3600]")
         _safe_env(self.environment)
@@ -464,8 +470,8 @@ def evaluate_ib_write_bw_output(
     minimum_gbps: float | None = None,
 ) -> dict[str, Any]:
     combined = f"{stdout}\n{stderr}"
-    average = SlurmActiveCheckRunner._parse_verbs_average_gbps(combined)
-    metadata = SlurmActiveCheckRunner._parse_verbs_endpoint_metadata(combined)
+    average = parse_verbs_average_gbps(combined)
+    metadata = parse_verbs_endpoint_metadata(combined)
     if timed_out:
         status, reason, message = "NOT_VERIFIED", "IB_WRITE_BW_TIMEOUT", "ib_write_bw test timed out"
     elif returncode != 0:
@@ -489,7 +495,9 @@ def evaluate_ib_write_bw_output(
 
 def _set_record_status(record: dict[str, Any], status: str) -> None:
     current = record.get("status")
-    if status == "FAIL":
+    if status == "CANCELLED":
+        record["status"] = "CANCELLED"
+    elif status == "FAIL":
         record["status"] = "BLOCKED"
     elif status == "NOT_VERIFIED" and current == "READY":
         record["status"] = "INCOMPLETE"
@@ -510,6 +518,8 @@ def _aggregate_status(items: Sequence[dict[str, Any]]) -> str:
     statuses = [item.get("status") for item in items]
     if not statuses:
         return "NOT_VERIFIED"
+    if "CANCELLED" in statuses:
+        return "CANCELLED"
     if any(status == "FAIL" for status in statuses):
         return "FAIL"
     if any(status == "NOT_VERIFIED" for status in statuses):
@@ -523,22 +533,10 @@ def _execution_with_timeout(
     output_root: Path,
     timeout_seconds: float,
 ) -> BaremetalExecutionConfig:
-    return BaremetalExecutionConfig(
+    return replace(
+        execution_config,
         output_root=output_root,
-        transport=execution_config.transport,
-        concurrency=execution_config.concurrency,
-        connect_timeout_seconds=execution_config.connect_timeout_seconds,
         command_timeout_seconds=timeout_seconds,
-        ssh_user=execution_config.ssh_user,
-        ssh_port=execution_config.ssh_port,
-        identity_file=execution_config.identity_file,
-        ssh_config_file=execution_config.ssh_config_file,
-        known_hosts_file=execution_config.known_hosts_file,
-        strict_host_key_checking=execution_config.strict_host_key_checking,
-        clush_executable=execution_config.clush_executable,
-        ssh_executable=execution_config.ssh_executable,
-        max_stdout_bytes=execution_config.max_stdout_bytes,
-        max_stderr_bytes=execution_config.max_stderr_bytes,
     )
 
 
@@ -555,6 +553,7 @@ def _run_simple_node_checks(
     evaluator: Callable[[int, str, str, bool], dict[str, Any]],
     runner: RunText,
     which: Which,
+    command_wrapper: RemoteCommandWrapper | None = None,
 ) -> dict[str, Any]:
     started_at = _utc_now()
     executor = BaremetalClusterExecutor(
@@ -576,9 +575,10 @@ def _run_simple_node_checks(
                 result.returncode,
                 result.stdout,
                 result.stderr,
-                result.timed_out,
+                result.timed_out or result.returncode in {124, 137},
             ),
             "command": _command_summary(result),
+            "evidence_dir": result.result_dir,
         }
         node_results[result.node] = check
         record = records_by_node.get(result.node)
@@ -587,7 +587,7 @@ def _run_simple_node_checks(
 
     raw = executor.execute(
         command_name,
-        list(command),
+        list(command_wrapper(command, timeout_seconds) if command_wrapper else command),
         result_handler=consume,
         release_output=True,
     )
@@ -617,6 +617,7 @@ def _run_ib_state_checks(
     runner: RunText,
     which: Which,
     implicit_for_bandwidth: bool = False,
+    command_wrapper: RemoteCommandWrapper | None = None,
 ) -> dict[str, Any]:
     if not config.enabled:
         return {"enabled": False, "status": "NOT_REQUESTED", "nodes": []}
@@ -632,6 +633,7 @@ def _run_ib_state_checks(
         evaluator=evaluate_ib_state_output,
         runner=runner,
         which=which,
+        command_wrapper=command_wrapper,
     )
     result["implicit_for_bandwidth"] = implicit_for_bandwidth
     return result
@@ -655,6 +657,7 @@ def _run_nhc_checks(
     output_root: Path,
     runner: RunText,
     which: Which,
+    command_wrapper: RemoteCommandWrapper | None = None,
 ) -> dict[str, Any]:
     if not config.enabled:
         return {"enabled": False, "status": "NOT_REQUESTED", "nodes": []}
@@ -666,6 +669,8 @@ def _run_nhc_checks(
     )
     executor = BaremetalClusterExecutor(nodes, nhc_execution, runner=runner, which=which)
     command = _build_nhc_command(config)
+    if command_wrapper:
+        command = list(command_wrapper(command, config.timeout_seconds))
     node_results: dict[str, dict[str, Any]] = {}
 
     def consume(result: BaremetalNodeResult) -> None:
@@ -673,13 +678,14 @@ def _run_nhc_checks(
             result.returncode,
             result.stdout,
             result.stderr,
-            result.timed_out,
+            result.timed_out or result.returncode in {124, 137},
             installation_source=config.installation_source,
         )
         check = {
             "name": "run_nhc",
             **evaluation,
             "command": _command_summary(result),
+            "evidence_dir": result.result_dir,
         }
         node_results[result.node] = check
         record = records_by_node.get(result.node)
@@ -766,32 +772,52 @@ def _run_remote_command(
     config: BaremetalExecutionConfig,
     timeout_seconds: float,
     runner: RunText,
+    command_wrapper: RemoteCommandWrapper | None = None,
+    cancel_event: Event | None = None,
 ) -> dict[str, Any]:
+    if cancel_event is not None and cancel_event.is_set():
+        return {"argv": [], "returncode": 130, "stdout": "", "stderr": "task cancelled",
+                "duration_seconds": 0.0, "timed_out": False, "cancelled": True}
+    if command_wrapper:
+        command = command_wrapper(command, timeout_seconds)
     token = f"{time.monotonic_ns():x}"
     sentinel = f"__HCU_ENVCHECK_IB_RC_{token}__"
     argv = _ssh_base(config) + [_ssh_destination(node, config), _remote_shell(command, sentinel)]
     started = time.monotonic()
     try:
-        completed = runner(
-            argv,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=config.connect_timeout_seconds + timeout_seconds + 1.0,
-            check=False,
-        )
+        captured = None
+        deadline = config.connect_timeout_seconds + timeout_seconds + 1.0
+        if runner is subprocess.run:
+            # Share bounded output/cancellation with the standard transport.
+            # Pairing itself stays explicit SSH, independent of MPI or clush.
+            executor = BaremetalClusterExecutor([node], config)
+            captured = executor._run_bounded_process(argv, deadline)
+            completed = subprocess.CompletedProcess(
+                argv, captured["returncode"], captured["stdout"], captured["stderr"])
+        else:
+            completed = runner(
+                argv,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=deadline,
+                check=False,
+            )
         stdout, remote_rc = _extract_sentinel(completed.stdout or "", sentinel)
-        returncode = remote_rc if remote_rc is not None else completed.returncode
+        # A missing sentinel is not evidence of a successful remote command.
+        # Preserve local SSH failure even if an earlier result marker was printed.
+        returncode = completed.returncode or (remote_rc if remote_rc is not None else 255)
         return {
             "argv": argv,
             "returncode": returncode,
             "stdout": stdout,
             "stderr": completed.stderr or "",
             "duration_seconds": time.monotonic() - started,
-            "timed_out": False,
+            "timed_out": returncode in {124, 137} or bool(captured and captured.get("timed_out")),
+            "cancelled": bool(cancel_event is not None and cancel_event.is_set()),
         }
     except subprocess.TimeoutExpired as exc:
         return {
@@ -834,6 +860,9 @@ def _run_ib_spec(
     execution_config: BaremetalExecutionConfig,
     runner: RunText,
     control_port: int,
+    command_wrapper: RemoteCommandWrapper | None = None,
+    cancel_event: Event | None = None,
+    evidence_dir: Path | None = None,
 ) -> dict[str, Any]:
     server_result: dict[str, Any] | None = None
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -847,9 +876,14 @@ def _run_ib_spec(
             config=execution_config,
             timeout_seconds=config.timeout_seconds,
             runner=runner,
+            command_wrapper=command_wrapper,
+            cancel_event=cancel_event,
         )
         if config.startup_grace_seconds:
-            time.sleep(config.startup_grace_seconds)
+            if cancel_event is not None:
+                cancel_event.wait(config.startup_grace_seconds)
+            else:
+                time.sleep(config.startup_grace_seconds)
         client_raw = _run_remote_command(
             node=spec.source,
             command=config.perftest_argv(
@@ -860,6 +894,8 @@ def _run_ib_spec(
             config=execution_config,
             timeout_seconds=config.timeout_seconds,
             runner=runner,
+            command_wrapper=command_wrapper,
+            cancel_event=cancel_event,
         )
         try:
             server_result = server_future.result(timeout=config.timeout_seconds + 5.0)
@@ -884,6 +920,20 @@ def _run_ib_spec(
         timed_out,
         minimum_gbps=config.minimum_average_gbps,
     )
+    if cancel_event is not None and cancel_event.is_set():
+        evaluation.update(status="CANCELLED", reason_code="TASK_CANCELLED",
+                          message="IB server/client task was cancelled")
+    commands = []
+    for role, raw in (("server", server_raw), ("client", client_raw)):
+        summary = _command_result_summary(raw, name=f"{config.tool}-{role}")
+        if evidence_dir is not None:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            for stream in ("stdout", "stderr"):
+                path = evidence_dir / f"{role}.{stream}.log"
+                atomic_write_text_exclusive(path, raw.get(stream) or "")
+                summary[f"{stream}_path"] = str(path)
+            _write_json(evidence_dir / f"{role}.json", summary)
+        commands.append(summary)
     return {
         "round": 1,
         "source": spec.source,
@@ -893,10 +943,7 @@ def _run_ib_spec(
         "rail_index": spec.rail_index,
         "control_port": control_port,
         **evaluation,
-        "commands": [
-            _command_result_summary(server_raw, name="ib_write_bw-server"),
-            _command_result_summary(client_raw, name="ib_write_bw-client"),
-        ],
+        "commands": commands,
     }
 
 
@@ -941,11 +988,19 @@ def _run_ib_checks(
     ib_state: dict[str, Any],
     output_root: Path,
     runner: RunText,
+    command_wrapper: RemoteCommandWrapper | None = None,
+    cancel_event: Event | None = None,
 ) -> dict[str, Any]:
     if not config.enabled:
         return {"enabled": False, "status": "NOT_REQUESTED", "pairs": []}
     config.validate()
     started_at = _utc_now()
+    if cancel_event is not None and cancel_event.is_set():
+        return _ib_prerequisite_failure(
+            nodes=nodes, records_by_node=records_by_node, status="CANCELLED",
+            reason_code="TASK_CANCELLED", message="IB task cancelled before bandwidth execution",
+            started_at=started_at,
+        )
     state_by_node = {
         str(item.get("node")): item
         for item in ib_state.get("nodes", [])
@@ -994,6 +1049,17 @@ def _run_ib_checks(
             started_at=started_at,
         )
     try:
+        counts = {len(value) for value in hcas_by_node.values()}
+        planned_count = len(nodes) * (len(nodes) - 1) * next(iter(counts), 0)
+        # Bound the existing all-directions plan BEFORE constructing it. A
+        # mistaken ungrouped 1,250-node call must not allocate millions of specs.
+        if len(counts) == 1 and planned_count > config.max_tests:
+            return _ib_prerequisite_failure(
+                nodes=nodes, records_by_node=records_by_node, status="NOT_VERIFIED",
+                reason_code="IB_WRITE_BW_TEST_LIMIT_EXCEEDED",
+                message=f"planned {planned_count} tests exceeds configured limit {config.max_tests}",
+                started_at=started_at,
+            )
         plan = build_ib_test_plan(nodes, hcas_by_node)
     except ValueError as exc:
         return _ib_prerequisite_failure(
@@ -1038,6 +1104,9 @@ def _run_ib_checks(
                 execution_config=execution_config,
                 runner=runner,
                 control_port=config.control_port + index,
+                command_wrapper=command_wrapper,
+                cancel_event=cancel_event,
+                evidence_dir=ib_dir / f"pair-{index:04d}",
             ): spec
             for index, spec in enumerate(plan)
         }
@@ -1126,6 +1195,7 @@ def _run_ib_checks(
             "passed_pairs": sum(item["status"] == "PASS" for item in pair_results),
             "failed_pairs": sum(item["status"] == "FAIL" for item in pair_results),
             "not_verified_pairs": sum(item["status"] == "NOT_VERIFIED" for item in pair_results),
+            "cancelled_pairs": sum(item["status"] == "CANCELLED" for item in pair_results),
             "minimum_average_gbps_observed": min(averages) if averages else None,
         },
         "pairs": pair_results,
@@ -1141,8 +1211,12 @@ def run_cluster_extra_checks(
     output_root: Path,
     runner: RunText = subprocess.run,
     which: Which | None = None,
+    command_wrapper: RemoteCommandWrapper | None = None,
+    cancel_event: Event | None = None,
 ) -> dict[str, Any]:
     config.validate()
+    if cancel_event is not None:
+        execution_config = replace(execution_config, cancel_event=cancel_event)
     records_by_node = {record["node"]: record for record in records}
     output_root.mkdir(parents=True, exist_ok=True)
     resolved_which = which or shutil.which
@@ -1165,6 +1239,7 @@ def run_cluster_extra_checks(
         runner=runner,
         which=resolved_which,
         implicit_for_bandwidth=implicit_ib_state,
+        command_wrapper=command_wrapper,
     )
     nhc = _run_nhc_checks(
         nodes=nodes,
@@ -1174,6 +1249,7 @@ def run_cluster_extra_checks(
         output_root=output_root,
         runner=runner,
         which=resolved_which,
+        command_wrapper=command_wrapper,
     )
     ib = _run_ib_checks(
         nodes=nodes,
@@ -1183,6 +1259,8 @@ def run_cluster_extra_checks(
         ib_state=ib_state,
         output_root=output_root,
         runner=runner,
+        command_wrapper=command_wrapper,
+        cancel_event=cancel_event,
     )
     enabled_results = [
         item
