@@ -7,9 +7,94 @@ import re
 from pathlib import Path
 from typing import Any, Sequence
 
-from .k8s import KubernetesPodExecutor
 from .models import CommandResult, Finding
 from .rdma import evaluate_rdma_network
+
+
+# Shared by consistency and classified reports. Health/usage/evidence fields
+# deliberately do not participate in the static configuration comparison.
+STATIC_ENVIRONMENT_FIELDS = {
+    "hardware_devices": frozenset({
+        "cpu_logical_count", "cpu_affinity_count", "cpu_models", "vbios_versions", "hsw_firmware_versions",
+    }),
+    "system": frozenset({
+        "container_os", "software_target_os", "kernel", "mem_total", "cgroup_memory_max", "cgroup_cpu_max",
+    }),
+    "driver_dtk": frozenset({
+        "driver_version", "dtk_version", "hy_smi_version", "smi_library_version", "hipcc_version",
+        "dtk_source", "dtk_component_versions", "driver_tool_sources",
+    }),
+    "software_components": frozenset({
+        "torch_version", "torch_hip_version", "python_version", "python_packages", "core_python_packages",
+        "torch_distributed_available", "torch_nccl_backend_available", "torch_nccl_version",
+        "rccl_paths", "ucx_version", "mpi_version", "runtime_env", "python_executable",
+        "software_tool_sources", "library_components",
+    }),
+    "network_rdma": frozenset({
+        "nic_hardware_profile", "rdma_hardware_profile", "rdma_current_protocol", "rdma_device_count",
+        "physical_nic_count", "nic_drivers", "rdma_hardware_protocol_capability",
+        "rdma_fabric_profile", "rdma_protocol_profile",
+    }),
+}
+STATIC_DEVICE_FIELDS = frozenset({"model", "architecture", "rocminfo_total_mib", "hy_smi_total_mib"})
+
+
+def canonical_static_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: canonical_static_value(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return sorted((canonical_static_value(item) for item in value), key=lambda item: json.dumps(item, sort_keys=True))
+    return value
+
+
+def static_environment_view(environment: dict[str, Any]) -> dict[str, Any]:
+    """Select static values without replacing missing evidence by defaults."""
+    view = {field: environment[field] for fields in STATIC_ENVIRONMENT_FIELDS.values()
+            for field in fields if field in environment}
+    if environment.get("dev_shm") is not None:
+        view["dev_shm"] = {"total_bytes": environment["dev_shm"].get("total_bytes")}
+    for key in ("cgroup_memory_max", "cgroup_cpu_max"):
+        if isinstance(view.get(key), dict):
+            view[key] = view[key].get("value")
+    if isinstance(view.get("runtime_env"), dict):
+        # Launcher-injected process identity is execution evidence, not config.
+        view["runtime_env"] = {key: value for key, value in view["runtime_env"].items()
+                               if key not in {"RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"}
+                               and not key.startswith(("OMPI_COMM_WORLD_", "PMI_", "PMIX_"))}
+    return view
+
+
+def static_configuration_sections(record: dict[str, Any], *, scope: str = "platform-and-resource") -> dict[str, Any]:
+    """The classified report and Markdown use this same static projection.
+
+    Full category `nodes` still folds exact evidence, including check outcomes;
+    configuration groups exclude those outcomes and device identities.
+    """
+    environment = static_environment_view(record.get("environment") or {})
+    sections = {
+        category: {field: environment[field] for field in fields if field in environment}
+        for category, fields in STATIC_ENVIRONMENT_FIELDS.items()
+    }
+    if "dev_shm" in environment:
+        sections["system"]["dev_shm"] = environment["dev_shm"]
+    if scope == "resource-only":
+        sections = {category: value for category, value in sections.items() if category in {"hardware_devices", "system"}}
+        sections["hardware_devices"] = {field: value for field, value in sections["hardware_devices"].items()
+                                        if field in {"cpu_logical_count", "cpu_models", "cpu_affinity_count"}}
+        sections["system"] = {field: value for field, value in sections["system"].items()
+                              if field in {"mem_total", "cgroup_memory_max", "cgroup_cpu_max", "dev_shm"}}
+    if scope != "platform-only":
+        profiles: dict[str, dict[str, Any]] = {}
+        for device in record.get("devices") or []:
+            if not isinstance(device, dict):
+                continue
+            profile = {field: device.get(field) for field in STATIC_DEVICE_FIELDS}
+            key = json.dumps(profile, sort_keys=True)
+            group = profiles.setdefault(key, {**profile, "count": 0})
+            group["count"] += 1
+        sections["hardware_devices"].update({"device_count": record.get("device_count"),
+                                               "device_profiles": [profiles[key] for key in sorted(profiles)]})
+    return canonical_static_value(sections)
 
 
 def _first_line(value: str | None) -> str | None:
@@ -217,7 +302,9 @@ def evaluate_environment(
     )
 
     library_paths = selected_software.get("libraries", {}).get("paths", [])
-    rccl_paths = [path for path in library_paths if "librccl.so" in path or "libnccl.so" in path]
+    selected_rccl = selected_software.get("libraries", {}).get("selected_components", {}).get("rccl")
+    rccl_paths = (selected_rccl.get("paths", []) if selected_rccl is not None else
+                  [path for path in library_paths if "librccl.so" in path or "libnccl.so" in path])
     torch_info = selected_software.get("torch", {})
     python_packages = selected_software.get("python", {}).get("packages", {})
     available_python_packages = {
@@ -442,6 +529,18 @@ def evaluate_environment(
         "cpu_models": payload.get("system", {}).get("cpu_models", []),
         "mem_total": payload.get("system", {}).get("meminfo", {}).get("MemTotal"),
         "dtk_version": dtk_version,
+        "dtk_source": {"selected_root": dtk.get("selected_root"), "version_file": version_file or None},
+        "dtk_component_versions": dtk.get("component_versions", {}),
+        "driver_tool_sources": {
+            name: {key: tool[key] for key in ("path", "realpath", "source") if key in tool}
+            for name, tool in host_tools.items() if name == "hy-smi"
+        },
+        "software_tool_sources": {
+            name: {key: tool[key] for key in ("path", "realpath", "source") if key in tool}
+            for name, tool in tools.items() if name in {"hipcc", "ucx_info", "mpirun"}
+        },
+        "library_components": selected_software.get("libraries", {}).get("selected_components", {}),
+        "library_evidence": selected_software.get("libraries", {}),
         "driver_version": driver_version,
         "hy_smi_version": hy_smi_version,
         "smi_library_version": smi_library_version,
@@ -480,6 +579,7 @@ def evaluate_environment(
         "torch_version": torch_info.get("version"),
         "torch_hip_version": torch_info.get("hip_version"),
         "python_version": selected_software.get("python", {}).get("version"),
+        "python_executable": selected_software.get("python", {}).get("executable"),
         "python_packages": python_packages,
         "required_python_packages": list(required_packages),
         "torch_device_count": torch_info.get("device_count"),
@@ -503,85 +603,3 @@ def evaluate_environment(
         if name in packages
     }
     return findings, summary, checks
-
-
-def collect_environment(
-    executor: KubernetesPodExecutor,
-    *,
-    expected_device_count: int | None,
-    require_compiler: bool,
-    require_rdma: bool,
-    minimum_rdma_devices: int,
-    require_rccl: bool,
-    require_ucx: bool,
-    network_host_scope_verified: bool,
-    expected_rdma_protocol: str = "auto",
-    rdma_policy: dict[str, Any] | None = None,
-    rdma_counter_interval_seconds: int = 5,
-) -> tuple[dict[str, Any], CommandResult, list[Finding]]:
-    if rdma_counter_interval_seconds != 0 and not 1 <= rdma_counter_interval_seconds <= 60:
-        raise ValueError(
-            "rdma_counter_interval_seconds must be 0 or between 1 and 60"
-        )
-    script_path = Path(__file__).with_name("pod_probe.py")
-    script = script_path.read_text(encoding="utf-8")
-    result = executor.exec_stdin(
-        "environment_inventory",
-        [
-            "env",
-            "PYTHONDONTWRITEBYTECODE=1",
-            f"HCU_ENVCHECK_RDMA_COUNTER_INTERVAL_SECONDS={rdma_counter_interval_seconds}",
-            "python3",
-            "-",
-        ],
-        script,
-        timeout=90,
-    )
-    if result.returncode != 0:
-        reason_code = (
-            "ENVIRONMENT_PROBE_OOM"
-            if result.returncode in {137, -9} or "exit code 137" in result.stderr.lower()
-            else "ENVIRONMENT_INVENTORY_FAILED"
-        )
-        finding = Finding(
-            "UNKNOWN",
-            reason_code,
-            f"container environment inventory rc={result.returncode}: {result.stderr[:512]}",
-        )
-        return {}, result, [finding]
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        finding = Finding(
-            "UNKNOWN",
-            "ENVIRONMENT_INVENTORY_PARSE_FAILED",
-            f"cannot parse environment inventory JSON: {exc}",
-        )
-        return {}, result, [finding]
-    findings, summary, checks = evaluate_environment(
-        payload,
-        expected_device_count=expected_device_count,
-        require_compiler=require_compiler,
-        require_rdma=require_rdma,
-        minimum_rdma_devices=minimum_rdma_devices,
-        require_rccl=require_rccl,
-        require_ucx=require_ucx,
-        network_host_scope_verified=network_host_scope_verified,
-        expected_rdma_protocol=expected_rdma_protocol,
-        rdma_policy=rdma_policy,
-    )
-    payload["summary"] = summary
-    payload["checks"] = checks
-    payload["coverage"] = {
-        "host_hardware": (
-            "CHECKED_FROM_HOSTNETWORK_PRIVILEGED_POD_AND_K8S_API"
-            if network_host_scope_verified
-            else "UNVERIFIED_POD_SCOPE"
-        ),
-        "container_environment": "CHECKED",
-        "switch_management": "NOT_CHECKED_NO_SWITCH_CREDENTIALS",
-        "torch_device_execution": "RUNTIME_VISIBILITY_ONLY_NO_TENSOR_NO_COLLECTIVE",
-        "rdma_port_configuration": summary.get("rdma_protocol_status"),
-        "rdma_runtime_transport": "NOT_VERIFIED_BY_PREFLIGHT",
-    }
-    return payload, result, findings

@@ -7,6 +7,24 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+# Output run directories are named "<scenario-label>_<operation>_<timestamp>"
+# so that a single glance identifies what produced them.
+SCENARIO_DIRECTORY_LABELS = {
+    "per-node-container": "container",
+    "shared-conda": "conda",
+    "node-local-conda": "lconda",
+}
+
+
+def run_directory_label(scenario: str, operation: str) -> str:
+    label = SCENARIO_DIRECTORY_LABELS.get(scenario)
+    if label is None:
+        raise ValueError(f"unknown scenario for run directory label: {scenario}")
+    operation = operation.replace(",", "_").replace("-", "_")
+    if not operation:
+        raise ValueError("operation must not be empty")
+    return f"{label}_{operation}"
+
 
 def claim_output_directory(path: Path) -> Path:
     """Atomically reserve a run directory and refuse every pre-existing path."""
@@ -20,12 +38,17 @@ def claim_output_directory(path: Path) -> Path:
     return path
 
 
-def claim_nodes_check_run_directory(
+def claim_labeled_run_directory(
     output_root: Path,
+    label: str,
     *,
     timestamp: datetime | None = None,
 ) -> Path:
-    """Create one private timestamped bare-metal run directory under a reusable root."""
+    """Create ``<label>_<YYYYmmdd_HHMMSS>`` under a reusable root.
+
+    Same-second reruns append ``_1``, ``_2`` ... instead of failing, and an
+    existing directory is never overwritten.
+    """
     try:
         output_root.mkdir(parents=True, exist_ok=True)
     except FileExistsError as exc:
@@ -35,8 +58,14 @@ def claim_nodes_check_run_directory(
     if not output_root.is_dir():
         raise ValueError(f"output root is not a directory: {output_root}")
     moment = timestamp or datetime.now().astimezone()
-    stamp = moment.strftime("%Y%m%d_%H%M%S_%f")
-    return claim_output_directory(output_root / f"nodes_check_{stamp}")
+    base = f"{label}_{moment.strftime('%Y%m%d_%H%M%S')}"
+    for suffix in ("", *(f"_{index}" for index in range(1, 100))):
+        try:
+            return claim_output_directory(output_root / f"{base}{suffix}")
+        except ValueError:
+            # Same-second rerun: the next suffix gets a fresh directory.
+            continue
+    raise ValueError(f"too many run directories for this second under {output_root}")
 
 
 def require_new_output_path(path: Path, *, label: str) -> None:

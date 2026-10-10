@@ -1,0 +1,15 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+#
+# gemm_baseline.conf.example —— GEMM TFLOPS 基准表模板
+#
+# 使用: 复制为同目录 gemm_baseline.conf, 用本集群实测值填写。
+# 没有基准文件时 gemm_perf_test.sh 自动进入采集模式（只测量不判定），
+# 把其打印的 "# 基准行:" 整理进本文件即可启用判定。
+#
+# 行格式: <m>x<n>x<k> <dtype> <tflops> [margin]
+#   margin = 可选第 4 列，按形状放宽容差（不写用全局默认 3%）
+#
+# 示例（数值为占位, 按实测替换）:
+#8192x8192x8192 f16_r 105.0
+#4096x4096x4096 f16_r 60.0  5

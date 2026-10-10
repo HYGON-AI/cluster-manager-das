@@ -4,7 +4,6 @@ import unittest
 
 from hcu_envcheck.ib_counters import DEFAULT_IB_COUNTER_RULES
 from hcu_envcheck.environment import evaluate_environment
-from hcu_envcheck.k8s_cluster import build_probe_manifest, parse_probe_env, parse_reuse_pods
 from hcu_envcheck.parsers import parse_hy_smi_samples, parse_rocminfo
 from hcu_envcheck.preflight import evaluate_metrics
 
@@ -59,71 +58,8 @@ def healthy_ib_counter_window():
 
 
 class ParserTests(unittest.TestCase):
-    def test_parse_reuse_pod(self):
-        self.assertEqual(
-            parse_reuse_pods(["node36=ai-video/ai-video/ai-video"]),
-            {"node36": ("ai-video", "ai-video", "ai-video")},
-        )
 
-    def test_probe_manifest_targets_one_node_and_requests_all_devices(self):
-        manifest = build_probe_manifest(
-            namespace="ai-video",
-            pod_name="hcu-envcheck-run-node35",
-            container_name="probe",
-            node="node35",
-            image="registry/image:tag",
-            image_pull_policy="IfNotPresent",
-            device_resource_name="hygon.com/hcu",
-            device_count=8,
-            run_id="abc123",
-            node_taints=[
-                {
-                    "key": "node-role.hygon.io/system",
-                    "value": "true",
-                    "effect": "NoSchedule",
-                },
-                {
-                    "key": "hygon.com/hcu",
-                    "value": "training",
-                    "effect": "NoSchedule",
-                },
-                {
-                    "key": "node.kubernetes.io/memory-pressure",
-                    "effect": "NoSchedule",
-                },
-            ],
-            active_deadline_seconds=600,
-            probe_env={"HIP_PATH": "/opt/dtk/hip"},
-        )
-        spec = manifest["spec"]
-        self.assertEqual(spec["nodeSelector"]["kubernetes.io/hostname"], "node35")
-        container = spec["containers"][0]
-        self.assertEqual(container["resources"]["limits"]["hygon.com/hcu"], "8")
-        self.assertEqual(container["resources"]["requests"]["hygon.com/hcu"], "8")
-        self.assertEqual(container["resources"]["requests"]["memory"], "1Gi")
-        self.assertEqual(container["resources"]["limits"]["memory"], "8Gi")
-        self.assertTrue(container["securityContext"]["privileged"])
-        self.assertEqual(container["env"], [{"name": "HIP_PATH", "value": "/opt/dtk/hip"}])
-        self.assertFalse(spec["automountServiceAccountToken"])
-        self.assertTrue(spec["hostNetwork"])
-        self.assertEqual(
-            spec["tolerations"],
-            [
-                {
-                    "key": "hygon.com/hcu",
-                    "operator": "Exists",
-                    "effect": "NoSchedule",
-                }
-            ],
-        )
 
-    def test_probe_env_allowlist(self):
-        self.assertEqual(
-            parse_probe_env(["HIP_PATH=/opt/dtk/hip", "ROCM_PATH=/opt/dtk"]),
-            {"HIP_PATH": "/opt/dtk/hip", "ROCM_PATH": "/opt/dtk"},
-        )
-        with self.assertRaises(ValueError):
-            parse_probe_env(["PASSWORD=secret"])
 
     def test_parse_hy_smi_json(self):
         cards = parse_hy_smi_samples(

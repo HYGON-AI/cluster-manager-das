@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Controller bootstrap only. --env-script is NEVER sourced on this node.
+set -u
+
+resolve_script_dir() {
+    local target=$1 target_dir link
+    while [[ -h "$target" ]]; do
+        target_dir=$(CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd) || return 1
+        link=$(readlink "$target") || return 1
+        case "$link" in
+            /*) target=$link ;;
+            *) target=$target_dir/$link ;;
+        esac
+    done
+    CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd
+}
+
+SCRIPT_DIR=$(resolve_script_dir "${BASH_SOURCE[0]}") || {
+    printf 'hcu-cluster-run: cannot resolve launcher path: %s\n' "$0" >&2
+    exit 70
+}
+ROOT=$(CDPATH= cd -P -- "$SCRIPT_DIR/.." 2>/dev/null && pwd) || exit 70
+if ! pwd -P >/dev/null 2>&1; then
+    printf 'hcu-cluster-run: current directory no longer exists; switching to package root: %s; relative paths now use this directory\n' "$ROOT" >&2
+    CDPATH= cd -P -- "$ROOT" || exit 70
+fi
+
+# Consume controller options, retaining exact argument boundaries for Python.
+# Values of repeatable payload options are opaque, including --help.
+hcu_controller_env=''
+hcu_controller_python=''
+hcu_forward=()
+while (( $# )); do
+    case "$1" in
+        --controller-env-script|--controller-python)
+            if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
+                printf 'hcu-cluster-run: %s requires a value\n' "$1" >&2
+                exit 3
+            fi
+            if [[ "$1" == --controller-env-script ]]; then
+                hcu_controller_env=$2
+            else
+                hcu_controller_python=$2
+            fi
+            shift 2 ;;
+        --controller-env-script=*) hcu_controller_env=${1#*=}; [[ -n "$hcu_controller_env" ]] || exit 3; shift ;;
+        --controller-python=*) hcu_controller_python=${1#*=}; [[ -n "$hcu_controller_python" ]] || exit 3; shift ;;
+        --) hcu_forward+=("$@"); break ;;
+        --script-arg|--nhc-arg|--docker-arg|--container-command)
+            hcu_forward+=("$1"); shift
+            if (( $# )); then hcu_forward+=("$1"); shift; fi ;;
+        *) hcu_forward+=("$1"); shift ;;
+    esac
+done
+
+if (( ${#hcu_forward[@]} == 0 )) ||
+   { (( ${#hcu_forward[@]} == 1 )) && [[ "${hcu_forward[0]}" == --help || "${hcu_forward[0]}" == -h ]]; }; then
+    cat <<'HELP'
+Usage: hcu-cluster-run <scenario> <operation> -f <hostfile> [options]
+
+Scenarios: shared-conda | node-local-conda | per-node-container
+Checks:    platform | resource | platform,resource | nhc
+Tests:     rccl | gemm | ib-write-bw | custom | script
+Container: container-status | container-create | container-recreate | container-delete
+
+  --env-script /path/env.sh       Optional target-node/container environment setup
+  --controller-env-script /path/controller-env.sh
+                                 Source on entry node before selecting Python
+  --controller-python /path/python3
+                                 Entry-node Python (overrides HCU_ENVCHECK_PYTHON)
+  --container NAME               Existing container for per-node-container
+  --transport ssh|clush          Default: ssh
+  --log-detail milestone|every|quiet
+                                 Foreground log granularity (default: milestone
+                                 folds same-cause nodes; every = per node/group)
+  --group-size N --slots N       Nodes per test group / concurrent groups
+  --profile worker|rccl-tests|rocblas
+                                 rccl: rccl-tests by default; gemm: worker
+                                 Explicit worker selects Python/torchrun
+  --nproc-per-node N             Default: rccl-tests 8; worker 1
+                                 RCCL runs all 10 collectives and compares baselines
+  --container-ssh-port N          Container peer MPI SSH port (default: 25901)
+  --port N                       Create/recreate: host-network root public-key SSH
+                                 Use the same N with --container-ssh-port for MPI
+  --script /path/test.sh          Target-visible Shell or Python payload
+  --output-dir PATH              Reports on the entry node
+  --help-full                    Full Python CLI help (requires controller Python)
+  --version                      Print release version without Python
+
+Controller orchestration/reporting needs Python >=3.10 and its standard library.
+Optional target module/DTK/Conda setup belongs in --env-script, not the controller setup.
+After FTP upload: bash /path/bin/hcu-cluster-run ... or chmod u+x /path/bin/hcu-cluster-run
+After replacing the current directory: cd /path/to/hcu-envcheck before using relative paths.
+HELP
+    exit 0
+fi
+if (( ${#hcu_forward[@]} == 1 )) && [[ "${hcu_forward[0]}" == --version ]]; then
+    IFS= read -r hcu_version < "$ROOT/VERSION" || [[ -n "${hcu_version-}" ]] || exit 70
+    printf 'hcu-cluster-run %s\n' "${hcu_version%$'\r'}"
+    exit 0
+fi
+if (( ${#hcu_forward[@]} == 1 )) && [[ "${hcu_forward[0]}" == --help-full ]]; then
+    hcu_forward=(--help)
+fi
+
+if [[ -n "$hcu_controller_env" ]]; then
+    if [[ "$hcu_controller_env" != /* || ! -f "$hcu_controller_env" || ! -r "$hcu_controller_env" ]]; then
+        printf 'hcu-cluster-run: --controller-env-script requires a readable absolute entry-node path: %s\n' "$hcu_controller_env" >&2
+        exit 3
+    fi
+    # module/Conda scripts often read unset optional variables. Fail a genuine
+    # setup command error, but do not impose nounset on third-party setup code.
+    set +u
+    set -Ee
+    trap 'hcu_bootstrap_rc=$?; printf "hcu-cluster-run: controller environment setup failed (rc=%s): %s\n" "$hcu_bootstrap_rc" "$hcu_controller_env" >&2; exit "$hcu_bootstrap_rc"' ERR
+    source "$hcu_controller_env"
+    trap - ERR
+    set +Ee
+    set -u
+fi
+
+hcu_python=${hcu_controller_python:-${HCU_ENVCHECK_PYTHON:-}}
+if [[ -z "$hcu_python" ]]; then
+    for hcu_candidate in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python; do
+        if command -v "$hcu_candidate" >/dev/null 2>&1 &&
+           "$hcu_candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+            hcu_python=$hcu_candidate
+            break
+        fi
+    done
+fi
+if [[ -z "$hcu_python" ]] || ! "$hcu_python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    printf 'hcu-cluster-run: entry node requires Python >=3.10 (stdlib only); use --controller-env-script /absolute/controller-env.sh or --controller-python /absolute/python3 (selected: %s)\n' "${hcu_python:-none}" >&2
+    exit 69
+fi
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$hcu_python" -m cluster_run "${hcu_forward[@]}"

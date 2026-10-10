@@ -4,11 +4,24 @@ import copy
 import unittest
 
 from hcu_envcheck.ib_counters import DEFAULT_IB_COUNTER_RULES
-from hcu_envcheck.k8s_cluster import _rdma_protocol_consistency_findings
 from hcu_envcheck.pod_probe import parse_ibv_devinfo_ports
 from hcu_envcheck.preflight import validate_environment_profile
 from hcu_envcheck.rdma import classify_rdma_port, evaluate_rdma_network
-from hcu_envcheck.slurm_cluster import _consistency_findings
+from hcu_envcheck.baremetal_cluster import _consistency_findings
+
+
+def _rdma_protocol_consistency_findings(records):
+    """Apply the retained bare-metal consistency evaluator to legacy fixtures."""
+    normalized = []
+    for record in records:
+        summary = record.get("summary") or {}
+        environment = summary.get("environment", record.get("environment") or {})
+        normalized.append({
+            "node": record.get("node"),
+            "reachable": record.get("reachable", True),
+            "environment": environment,
+        })
+    return _consistency_findings(normalized, strict=False)
 
 
 def ib_port(**overrides):
@@ -622,26 +635,13 @@ hca_id: shca_0
         )
         self.assertIsNotNone(complete["rdma_fabric_profile"])
         self.assertIsNone(incomplete["rdma_fabric_profile"])
-        k8s_records = [
-            {"node": "node01", "summary": {"environment": complete}},
-            {"node": "node02", "summary": {"environment": incomplete}},
-        ]
-        k8s_findings = _rdma_protocol_consistency_findings(k8s_records)
-        self.assertIn(
-            "RDMA_FABRIC_PROFILE_EVIDENCE_MISSING",
-            {item["reason_code"] for item in k8s_findings},
-        )
-        self.assertNotIn(
-            "RDMA_FABRIC_PROFILE_INCONSISTENT",
-            {item["reason_code"] for item in k8s_findings},
-        )
-        slurm_records = [
+        baremetal_records = [
             {"node": "node01", "reachable": True, "environment": complete},
             {"node": "node02", "reachable": True, "environment": incomplete},
         ]
-        slurm_findings = _consistency_findings(slurm_records, strict=False)
+        baremetal_findings = _consistency_findings(baremetal_records, strict=False)
         fabric_findings = [
-            item for item in slurm_findings if item["field"] == "rdma_fabric_profile"
+            item for item in baremetal_findings if item["field"] == "rdma_fabric_profile"
         ]
         self.assertTrue(fabric_findings)
         self.assertTrue(all(item["severity"] == "UNKNOWN" for item in fabric_findings))
@@ -652,21 +652,13 @@ hca_id: shca_0
 
     def test_unknown_protocol_is_missing_evidence_not_cluster_mixed(self):
         known_profile = {"protocol": "NATIVE_INFINIBAND", "port_profiles": []}
-        k8s_records = [
-            {"node": "node01", "summary": {"environment": {"rdma_current_protocol": "NATIVE_INFINIBAND", "rdma_fabric_profile": known_profile}}},
-            {"node": "node02", "summary": {"environment": {"rdma_current_protocol": "UNKNOWN", "rdma_fabric_profile": None}}},
+        baremetal_records = [
+            {"node": "node01", "reachable": True, "environment": {"rdma_current_protocol": "NATIVE_INFINIBAND", "rdma_fabric_profile": known_profile}},
+            {"node": "node02", "reachable": True, "environment": {"rdma_current_protocol": "UNKNOWN", "rdma_fabric_profile": None}},
         ]
-        findings = _rdma_protocol_consistency_findings(k8s_records)
-        reasons = {item["reason_code"] for item in findings}
-        self.assertIn("RDMA_PROTOCOL_EVIDENCE_MISSING", reasons)
-        self.assertNotIn("RDMA_PROTOCOL_CLUSTER_MIXED", reasons)
-        slurm_records = [
-            {"node": "node01", "reachable": True, "environment": k8s_records[0]["summary"]["environment"]},
-            {"node": "node02", "reachable": True, "environment": k8s_records[1]["summary"]["environment"]},
-        ]
-        slurm_findings = _consistency_findings(slurm_records, strict=False)
+        baremetal_findings = _consistency_findings(baremetal_records, strict=False)
         protocol_findings = [
-            item for item in slurm_findings if item["field"] == "rdma_current_protocol"
+            item for item in baremetal_findings if item["field"] == "rdma_current_protocol"
         ]
         self.assertTrue(protocol_findings)
         self.assertTrue(all(item["severity"] == "UNKNOWN" for item in protocol_findings))
@@ -1207,38 +1199,9 @@ hca_id: shca_0
         self.assertIn("RDMA_FABRIC_PROFILE_EVIDENCE_MISSING", reasons)
         self.assertNotIn("RDMA_FABRIC_PROFILE_INCONSISTENT", reasons)
 
-    def test_k8s_cluster_mixed_protocol_is_a_failure_without_strict_stack(self):
-        records = [
-            {
-                "node": "node01",
-                "summary": {"environment": {"rdma_current_protocol": "NATIVE_INFINIBAND"}},
-            },
-            {
-                "node": "node02",
-                "summary": {"environment": {"rdma_current_protocol": "ROCE"}},
-            },
-        ]
-        findings = _rdma_protocol_consistency_findings(records)
-        self.assertIn(
-            "RDMA_PROTOCOL_CLUSTER_MIXED",
-            {item["reason_code"] for item in findings if item["severity"] == "FAIL"},
-        )
 
-    def test_k8s_fabric_profile_difference_is_a_failure(self):
-        records = [
-            {
-                "node": "node01",
-                "summary": {"environment": {"rdma_current_protocol": "NATIVE_INFINIBAND", "rdma_fabric_profile": {"protocol": "NATIVE_INFINIBAND", "subnet_prefixes": ["a"], "pkeys": ["0xffff"], "active_mtus": ["4096"]}}},
-            },
-            {
-                "node": "node02",
-                "summary": {"environment": {"rdma_current_protocol": "NATIVE_INFINIBAND", "rdma_fabric_profile": {"protocol": "NATIVE_INFINIBAND", "subnet_prefixes": ["b"], "pkeys": ["0xffff"], "active_mtus": ["4096"]}}},
-            },
-        ]
-        findings = _rdma_protocol_consistency_findings(records)
-        self.assertIn("RDMA_FABRIC_PROFILE_INCONSISTENT", {item["reason_code"] for item in findings})
 
-    def test_slurm_fabric_profile_difference_is_a_failure_without_strict(self):
+    def test_baremetal_fabric_profile_difference_is_a_failure_without_strict(self):
         records = [
             {"node": "node01", "reachable": True, "environment": {"rdma_current_protocol": "NATIVE_INFINIBAND", "rdma_fabric_profile": {"protocol": "NATIVE_INFINIBAND", "pkeys": ["0xffff"]}}},
             {"node": "node02", "reachable": True, "environment": {"rdma_current_protocol": "NATIVE_INFINIBAND", "rdma_fabric_profile": {"protocol": "NATIVE_INFINIBAND", "pkeys": ["0x7fff"]}}},
@@ -1248,7 +1211,7 @@ hca_id: shca_0
         self.assertEqual(fabric[0]["severity"], "FAIL")
         self.assertEqual(fabric[0]["reason_code"], "RDMA_FABRIC_PROFILE_INCONSISTENT")
 
-    def test_slurm_cluster_mixed_protocol_is_a_failure_without_strict_hardware(self):
+    def test_baremetal_cluster_mixed_protocol_is_a_failure_without_strict_hardware(self):
         records = [
             {
                 "node": "node01",

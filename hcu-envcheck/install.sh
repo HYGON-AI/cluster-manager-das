@@ -63,11 +63,19 @@ done
 [ -r "$SOURCE_ROOT/VERSION" ] || fail "$EX_SOFTWARE" "VERSION is missing"
 [ -r "$SOURCE_ROOT/RELEASE-MANIFEST.sha256" ] \
     || fail "$EX_DATAERR" "RELEASE-MANIFEST.sha256 is missing; install from a built release archive"
-[ -x "$SOURCE_ROOT/bin/hcu-envcheck-verify" ] \
-    || fail "$EX_SOFTWARE" "bin/hcu-envcheck-verify is missing or not executable"
+[ -x "$SOURCE_ROOT/bin/hcu-cluster-run" ] \
+    || fail "$EX_SOFTWARE" "bin/hcu-cluster-run is missing or not executable"
 
-if ! "$SOURCE_ROOT/bin/hcu-envcheck-verify" >/dev/null; then
-    fail "$EX_DATAERR" "release checksum verification failed"
+# Verify the release inline; a standalone verification command is no
+# longer installed as part of the single-entry-point layout.
+if command -v sha256sum >/dev/null 2>&1; then
+    (CDPATH= cd -P -- "$SOURCE_ROOT" && sha256sum -c RELEASE-MANIFEST.sha256 >/dev/null) \
+        || fail "$EX_DATAERR" "release checksum verification failed"
+elif command -v shasum >/dev/null 2>&1; then
+    (CDPATH= cd -P -- "$SOURCE_ROOT" && shasum -a 256 -c RELEASE-MANIFEST.sha256 >/dev/null) \
+        || fail "$EX_DATAERR" "release checksum verification failed"
+else
+    fail "$EX_SOFTWARE" "sha256sum or shasum is required"
 fi
 
 version=$(tr -d '\r\n' < "$SOURCE_ROOT/VERSION")
@@ -88,7 +96,7 @@ install_complete=0
 
 cleanup() {
     if [ "$transaction_active" -eq 1 ] && [ "$install_complete" -eq 0 ]; then
-        for command_name in hcu-envcheck hcu-envcheck-doctor hcu-envcheck-verify; do
+        for command_name in hcu-cluster-run; do
             link_path=$bin_dir/$command_name
             old_link=$transaction/$command_name.old
             absent_marker=$transaction/$command_name.absent
@@ -108,7 +116,7 @@ cleanup() {
     fi
     [ ! -e "$stage" ] || rm -rf -- "$stage"
     [ ! -e "$transaction" ] || rm -rf -- "$transaction"
-    for command_name in hcu-envcheck hcu-envcheck-doctor hcu-envcheck-verify; do
+    for command_name in hcu-cluster-run; do
         rm -f -- "$bin_dir/.${command_name}.new.$$" 2>/dev/null || true
     done
     if [ "$lock_owned" -eq 1 ] && [ -d "$lock" ]; then
@@ -145,18 +153,17 @@ done < "$SOURCE_ROOT/RELEASE-MANIFEST.sha256"
 cp -- "$SOURCE_ROOT/RELEASE-MANIFEST.sha256" "$stage/RELEASE-MANIFEST.sha256" \
     || fail "$EX_CANTCREAT" "cannot stage checksum manifest"
 
-for command_name in hcu-envcheck hcu-envcheck-doctor hcu-envcheck-verify; do
+for command_name in hcu-cluster-run; do
     [ -f "$stage/bin/$command_name" ] || fail "$EX_DATAERR" "release command is missing: $command_name"
     chmod 755 -- "$stage/bin/$command_name" || fail "$EX_CANTCREAT" "cannot chmod: $command_name"
 done
-[ ! -f "$stage/hcu-envcheck.sh" ] || chmod 755 -- "$stage/hcu-envcheck.sh"
 [ ! -f "$stage/install.sh" ] || chmod 755 -- "$stage/install.sh"
 for example in "$stage"/examples/*.sh; do [ ! -f "$example" ] || chmod 755 -- "$example"; done
 
 if [ -e "$target" ] || [ -L "$target" ]; then
     [ "$force" -eq 1 ] || fail "$EX_CANTCREAT" "already installed: $target (use --force to replace)"
 fi
-for command_name in hcu-envcheck hcu-envcheck-doctor hcu-envcheck-verify; do
+for command_name in hcu-cluster-run; do
     link_path=$bin_dir/$command_name
     if [ -e "$link_path" ] || [ -L "$link_path" ]; then
         [ "$force" -eq 1 ] || fail "$EX_CANTCREAT" "command already exists: $link_path (use --force)"
@@ -167,7 +174,7 @@ done
 
 # Prepare all command links before touching the active target. Renaming each
 # prepared symlink into place later is atomic on the prefix filesystem.
-for command_name in hcu-envcheck hcu-envcheck-doctor hcu-envcheck-verify; do
+for command_name in hcu-cluster-run; do
     temp_link=$bin_dir/.${command_name}.new.$$
     ln -s -- "../lib/hcu-envcheck-$version/bin/$command_name" "$temp_link" \
         || fail "$EX_CANTCREAT" "cannot prepare command link: $temp_link"
@@ -175,7 +182,7 @@ done
 
 mkdir -- "$transaction" || fail "$EX_CANTCREAT" "cannot create install transaction directory"
 transaction_active=1
-for command_name in hcu-envcheck hcu-envcheck-doctor hcu-envcheck-verify; do
+for command_name in hcu-cluster-run; do
     link_path=$bin_dir/$command_name
     if [ -e "$link_path" ] || [ -L "$link_path" ]; then
         mv -- "$link_path" "$transaction/$command_name.old" \
@@ -193,7 +200,7 @@ else
         || fail "$EX_CANTCREAT" "cannot record absent installation target"
 fi
 mv -- "$stage" "$target" || fail "$EX_CANTCREAT" "cannot activate installation: $target"
-for command_name in hcu-envcheck hcu-envcheck-doctor hcu-envcheck-verify; do
+for command_name in hcu-cluster-run; do
     temp_link=$bin_dir/.${command_name}.new.$$
     mv -- "$temp_link" "$bin_dir/$command_name" \
         || fail "$EX_CANTCREAT" "cannot activate command link: $bin_dir/$command_name"
@@ -208,6 +215,6 @@ trap - EXIT HUP INT TERM
 rm -f -- "$lock/pid" 2>/dev/null || true
 rmdir -- "$lock" 2>/dev/null || true
 
-printf 'Installed hcu-envcheck %s\n' "$version"
-printf 'Commands: %s/{hcu-envcheck,hcu-envcheck-doctor,hcu-envcheck-verify}\n' "$bin_dir"
+printf 'Installed hcu-cluster-run package %s\n' "$version"
+printf 'Commands: %s/hcu-cluster-run\n' "$bin_dir"
 case :$PATH: in *:"$bin_dir":*) ;; *) printf 'Add this directory to PATH: %s\n' "$bin_dir" ;; esac

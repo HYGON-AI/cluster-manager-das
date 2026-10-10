@@ -15,6 +15,10 @@ blacklist.json.tmp
 slurm_job_id
 train_daily_token.json
 
+# hcu-envcheck run reports copied back from cluster nodes
+cluster-result.json
+cluster-summary.md
+
 # Python packaging output
 build/
 dist/

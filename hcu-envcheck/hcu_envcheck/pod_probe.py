@@ -62,6 +62,121 @@ def sys_value(path: pathlib.Path) -> str | None:
     return value if value not in {"", None} else None
 
 
+_DTK_ROOT_VARS = ("DTK_PATH", "DTK_HOME", "DTK_ROOT", "ROCM_PATH", "ROCM_HOME", "HIP_PATH")
+_COMPONENT_ROOT_VARS = _DTK_ROOT_VARS + (
+    "RCCL_HOME", "RCCL_PATH", "UCX_HOME", "UCX_PATH", "MPI_HOME", "MPI_ROOT",
+    "HPCX_HOME", "HYHAL_PATH", "CONDA_PREFIX",
+)
+
+
+def collect_runtime_env() -> dict[str, str]:
+    """Record configuration, not the full environment (which may contain secrets)."""
+    names = set(_COMPONENT_ROOT_VARS) | {
+        "PATH", "LD_LIBRARY_PATH", "PYTHONPATH", "LD_PRELOAD", "CONDA_DEFAULT_ENV",
+        "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
+    }
+    return {
+        name: value for name, value in sorted(os.environ.items())
+        if name in names or name.startswith(("NCCL_", "RCCL_", "UCX_", "OMPI_MCA_"))
+    }
+
+
+def environment_roots(variables: tuple[str, ...] = _COMPONENT_ROOT_VARS) -> list[dict[str, str]]:
+    roots: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for name in variables:
+        value = os.environ.get(name)
+        if value:
+            path = os.path.realpath(value)
+            if path not in seen:
+                roots.append({"path": path, "source": name})
+                seen.add(path)
+    return roots
+
+
+def resolve_tool(name: str) -> dict[str, str] | None:
+    """PATH is authoritative; roots are used only when PATH has no executable."""
+    names = (name, "Hy-smi") if name == "hy-smi" else (name,)
+    for candidate in names:
+        path = shutil.which(candidate)
+        if path:
+            return {"path": path, "realpath": os.path.realpath(path), "source": "PATH"}
+    for root in environment_roots():
+        for directory in ("bin", "hip/bin", "ucx/bin", "mpi/bin", ".hyhal/bin"):
+            for candidate in names:
+                path = os.path.join(root["path"], directory, candidate)
+                if os.path.isfile(path) and os.access(path, os.X_OK):
+                    return {"path": path, "realpath": os.path.realpath(path), "source": root["source"]}
+    return None
+
+
+def collect_dtk(tools: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve the selected installation, never assume /opt/dtk/.dtk_version."""
+    tools = collect_tools() if tools is None else tools
+    roots = environment_roots(_DTK_ROOT_VARS)
+    if not roots:
+        # Resolve symlinked PATH tools, including <prefix>/hip/bin/hipcc.
+        tool = tools.get("hipcc") or tools.get("rocminfo") or {}
+        if tool.get("path"):
+            root = pathlib.Path(os.path.realpath(tool["path"])).parent.parent
+            if root.name == "hip":
+                root = root.parent
+            roots.append({"path": str(root), "source": "PATH:" + ("hipcc" if tools.get("hipcc") else "rocminfo")})
+        elif os.environ.get("CONDA_PREFIX"):
+            roots = environment_roots(("CONDA_PREFIX",))
+    # The first explicitly selected prefix must not fall through to a different
+    # installation merely because its version file is missing.
+    selected = roots[0] if roots else None
+    version_file = None
+    components: dict[str, str] = {}
+    if selected:
+        prefix = pathlib.Path(selected["path"])
+        prefixes = [prefix]
+        if prefix.name == "hip":
+            prefixes.append(prefix.parent)
+        for root in prefixes:
+            version_file = first_existing([str(root / ".dtk_version"), str(root / ".info/version")])
+            if version_file:
+                version_file["source"] = selected["source"]
+                break
+        for root in prefixes:
+            for name in ("rocm_version", "version-dev", "version-libs", "version-utils"):
+                path = str(root / ".info" / name)
+                value = read(path)
+                if value:
+                    components[path] = value
+    return {"version_file": version_file, "component_versions": components,
+            "root_candidates": roots, "selected_root": selected, "tools": tools}
+
+
+def library_search_directories() -> list[dict[str, str]]:
+    """Ordered, bounded search of the activated environment, then system libs."""
+    directories: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(path: str, source: str) -> None:
+        path = os.path.realpath(path)
+        if path not in seen:
+            seen.add(path)
+            directories.append({"path": path, "source": source})
+
+    if "LD_LIBRARY_PATH" in os.environ:
+        for path in os.environ["LD_LIBRARY_PATH"].split(os.pathsep)[:64]:
+            # Empty/relative entries have loader semantics relative to cwd.
+            add(path or os.curdir, "LD_LIBRARY_PATH")
+    roots = environment_roots()
+    for name in ("hipcc", "ucx_info", "mpirun"):
+        path = shutil.which(name)
+        if path:
+            roots.append({"path": str(pathlib.Path(os.path.realpath(path)).parent.parent), "source": "PATH:" + name})
+    for root in roots:
+        for relative in ("lib", "lib64", "hip/lib", ".hyhal/lib", "ucx/lib"):
+            add(os.path.join(root["path"], relative), root["source"])
+    for path in ("/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib", "/lib64", "/lib/x86_64-linux-gnu", "/lib"):
+        add(path, "SYSTEM_LIBRARY_DIRECTORY")
+    return directories[:192]
+
+
 def collect_tools() -> dict[str, Any]:
     tool_specs = {
         "hipcc": ["--version"],
@@ -80,11 +195,11 @@ def collect_tools() -> dict[str, Any]:
     }
     tools: dict[str, Any] = {}
     for name, version_args in tool_specs.items():
-        candidates = (name, "Hy-smi") if name == "hy-smi" else (name,)
-        path = next((shutil.which(item) for item in candidates if shutil.which(item)), None)
-        if not path:
+        resolved = resolve_tool(name)
+        if not resolved:
             continue
-        item: dict[str, Any] = {"path": path}
+        path = resolved["path"]
+        item: dict[str, Any] = dict(resolved)
         if version_args is not None:
             item["version"] = run([path] + version_args, limit=2048)
         tools[name] = item
@@ -902,12 +1017,6 @@ def _collect_rdma_userspace_libraries() -> dict[str, Any]:
         "/lib64",
         "/lib/x86_64-linux-gnu",
         "/lib",
-        "/opt/dtk/lib",
-        "/opt/dtk/lib64",
-        "/opt/rocm/lib",
-        "/opt/rocm/lib64",
-        "/opt/hyhal/lib",
-        "/opt/ucx/lib",
     ]
     standard_directories.extend(sorted(glob.glob("/usr/lib/*-linux-gnu"))[:8])
     explicit_directories: list[str] = []
@@ -934,10 +1043,13 @@ def _collect_rdma_userspace_libraries() -> dict[str, Any]:
             break
 
     sources: list[tuple[str, str]] = []
-    for directory in standard_directories:
-        sources.append((directory, "STANDARD"))
     for directory in explicit_directories:
         sources.append((directory, "LD_LIBRARY_PATH"))
+    for item in library_search_directories():
+        if item["source"] != "LD_LIBRARY_PATH":
+            sources.append((item["path"], item["source"]))
+    for directory in standard_directories:
+        sources.append((directory, "STANDARD"))
     expanded_sources: list[tuple[str, str]] = []
     seen_directories: set[str] = set()
     for directory, source in sources:
@@ -1378,7 +1490,7 @@ def collect_python() -> tuple[dict[str, Any], dict[str, Any]]:
     ]
     required_setting = os.environ.get("HCU_ENVCHECK_REQUIRED_PYTHON_PACKAGES")
     if required_setting is None:
-        # Preserve the historic K8s behavior. Bare-metal always supplies an
+        # Preserve the historic container behavior. Bare-metal always supplies an
         # explicit list, including an empty list when no package was requested.
         required_package_names = ["torch"]
     else:
@@ -1475,68 +1587,60 @@ def _public_library_inventory(paths: list[str]) -> dict[str, Any]:
 
 
 def collect_libraries() -> dict[str, Any]:
-    discovered_paths = sorted(
-        {
-            path
-            for pattern in (
-                "/opt/dtk/lib/librccl.so*",
-                "/opt/dtk/lib/libnccl.so*",
-                "/opt/dtk/lib/libamdhip64.so*",
-                "/opt/dtk/.hyhal/lib/libhsa-runtime64.so*",
-                "/opt/ucx/lib/libucp.so*",
-                "/opt/ucx/lib/libuct.so*",
-                "/opt/ucx/lib/libucs.so*",
-            )
-            for path in glob.glob(pattern)
-        }
-    )
-    return _public_library_inventory(discovered_paths)
+    patterns = {
+        "rccl": ("librccl.so*", "libnccl.so*"),
+        "hcu_hip_runtime": ("libamdhip64.so*",),
+        "hsa_runtime": ("libhsa-runtime64.so*",),
+        "ucp": ("libucp.so*",), "uct": ("libuct.so*",), "ucs": ("libucs.so*",),
+    }
+    paths: list[str] = []
+    sources: dict[str, list[dict[str, Any]]] = {}
+    directories = library_search_directories()
+    for directory in directories:
+        for component, names in patterns.items():
+            matches = sorted({path for name in names for path in glob.glob(os.path.join(directory["path"], name))})[:64]
+            if not matches:
+                continue
+            paths.extend(matches)
+            versions = sorted({os.path.basename(os.path.realpath(path)).partition(".so")[2].lstrip(".") for path in matches})
+            candidate: dict[str, Any] = {"directory": directory["path"], "source": directory["source"],
+                                         "versions": versions}
+            # Keep the public HIP component naming contract; record source and
+            # ABI suffix without exposing its vendor implementation filename.
+            if component != "hcu_hip_runtime":
+                candidate["paths"] = matches
+                candidate["resolved"] = {path: os.path.realpath(path) for path in matches}
+            sources.setdefault(component, []).append(candidate)
+    inventory = _public_library_inventory(list(dict.fromkeys(paths)))
+    inventory.update({
+        "search_directories": directories, "component_candidates": sources,
+        "selected_components": {name: candidates[0] for name, candidates in sources.items()},
+        "resolution": "ENVIRONMENT_SEARCH_ORDER; candidates, not proof of a process-loaded library",
+    })
+    return inventory
 
 
-def main() -> None:
+def main(categories: tuple[str, ...] = ("platform", "resource")) -> None:
+    if "platform" not in categories:
+        # Resource probes need system memory and device metrics, but importing
+        # Torch and probing the network/DTK software stack belongs to platform.
+        print(json.dumps({
+            "schema_version": "1.0", "system": collect_system(),
+            "dtk": {"tools": {}}, "driver": {}, "network": {},
+            "libraries": {}, "python": {}, "torch": {}, "runtime_env": {},
+        }, ensure_ascii=False, separators=(",", ":")))
+        return
     python_info, torch_info = collect_python()
     payload = {
         "schema_version": "1.0",
         "system": collect_system(),
-        "dtk": {
-            "version_file": first_existing(
-                [
-                    "/opt/dtk/.dtk_version",
-                    "/opt/dtk/.info/version",
-                    "/opt/rocm/.info/version",
-                ]
-            ),
-            "component_versions": {
-                path: read(path)
-                for path in (
-                    "/opt/dtk/.info/rocm_version",
-                    "/opt/dtk/.info/version-dev",
-                    "/opt/dtk/.info/version-libs",
-                    "/opt/dtk/.info/version-utils",
-                )
-                if read(path)
-            },
-            "tools": collect_tools(),
-        },
+        "dtk": collect_dtk(),
         "driver": collect_driver(),
         "network": collect_network(),
         "libraries": collect_libraries(),
         "python": python_info,
         "torch": torch_info,
-        "runtime_env": {
-            name: os.environ.get(name)
-            for name in (
-                "PATH",
-                "LD_LIBRARY_PATH",
-                "PYTHONPATH",
-                "ROCM_PATH",
-                "HIP_PATH",
-                "ROCR_VISIBLE_DEVICES",
-                "HIP_VISIBLE_DEVICES",
-                "CUDA_VISIBLE_DEVICES",
-            )
-            if os.environ.get(name) is not None
-        },
+        "runtime_env": collect_runtime_env(),
     }
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
