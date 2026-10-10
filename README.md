@@ -18,6 +18,7 @@ SPDX-License-Identifier: Apache-2.0
 | 为 PyTorchJob 或 Volcano Job 增加运行期容错 | [`hygon-ft-k8s`](hygon-ft-k8s/README.md) | Kubernetes | 会创建集群资源，可能 taint 节点和删除 Pod |
 | 训练 hang 后采集所有 rank 的 Python 堆栈并给出隔离建议 | [`stack-analyzer`](stack-analyzer/README.md) | Kubernetes、Docker、Ansible、单机 | 默认只采集和分析，不自动驱逐节点 |
 | 将 `nvidia-resiliency-ext` profiling 模块重定向到 HCU 适配实现 | [`hcu_resiliency_ext`](hcu_resiliency_ext/Readme.md) | 第三方容错库适配 | 会修改 Python 模块导入行为 |
+| 集合通信超时诊断 | [`trace_analyzer`](trace_analyzer/README.md) | pytorch版本>2.5 | 离线分析多 rank 的 PyTorch Flight Recorde 转储文件 |
 
 跨子项目的推荐执行顺序、场景衔接和恢复边界见：
 
@@ -64,6 +65,13 @@ Slurm/MPI 单任务控制面，负责节点池、日志/NHC/Slurm 监控、状�
 - [README](hcu_resiliency_ext/Readme.md)
 - [安装说明](hcu_resiliency_ext/docs/INSTALLATION_CN.md)
 
+### trace_analyzer
+
+trace_analyzer 用于离线分析多 rank 的 PyTorch Flight Recorder 转储文件，帮助定位分布式训练中的集合通信卡住、rank 进度不一致和疑似故障
+rank。
+- [README](trace_analyzer/README.md)
+
+
 ## 目录结构
 
 ```text
@@ -73,7 +81,8 @@ hcu_cluster_manager/
 ├── cluster_manager/            # Slurm/MPI 训练容错
 ├── hygon-ft-k8s/               # Kubernetes 训练容错
 ├── stack-analyzer/             # hang 堆栈诊断
-└── hcu_resiliency_ext/         # 第三方容错库适配
+├── hcu_resiliency_ext/         # 第三方容错库适配
+└── trace_analyzer/             # 集合通信超时诊断
 ```
 
 ## 根目录文件边界
