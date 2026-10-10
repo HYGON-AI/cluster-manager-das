@@ -34,19 +34,6 @@ jobs:
       CI_DEPS_VOLUME: >-
         cluster-manager-pr-deps-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.module-id }}
     steps:
-      - name: Authorize PR source
-        shell: bash
-        env:
-          BASE_REPOSITORY: ${{ github.repository }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${HEAD_REPOSITORY}" != "${BASE_REPOSITORY}" ]]; then
-            echo "ERROR: fork pull requests cannot execute code on the shared CI runner." >&2
-            exit 1
-          fi
-
       - name: Checkout PR source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -108,22 +95,28 @@ jobs:
             --pull never \
             --read-only \
             --network none \
-            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --cap-drop ALL \
+            --cap-add SETUID \
+            --cap-add SETGID \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --cpus 2 \
+            --memory 2g \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=512m \
+            --tmpfs /workspace:rw,exec,nosuid,nodev,size=512m \
             --env HOME=/tmp \
             --env PYTHONDONTWRITEBYTECODE=1 \
             --env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
             --env "PYTHONPATH=${pythonpath}" \
             --volume "${CI_DEPS_VOLUME}:/ci-deps:ro" \
-            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --volume "${GITHUB_WORKSPACE}:/ci-source:ro" \
             --workdir /workspace \
             "${CLUSTER_MANAGER_CI_IMAGE_ID}" \
-            python3 -m pytest \
-              -c /dev/null \
-              --rootdir=/workspace \
-              --import-mode=importlib \
-              -p no:cacheprovider \
-              -q \
-              "${{ inputs.test-path }}"
+            bash -c 'set -euo pipefail
+              cp -a --no-preserve=ownership /ci-source/. /workspace/
+              exec python3 -m pytest -c /dev/null --rootdir=/workspace \
+                --import-mode=importlib -p no:cacheprovider -q "$1"
+            ' ci-tests "${{ inputs.test-path }}"
 
       - name: Remove test dependency volume
         if: always()
