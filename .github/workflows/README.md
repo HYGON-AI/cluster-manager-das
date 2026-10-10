@@ -19,9 +19,22 @@ change to the shared `_run-unit-tests.yml` implementation or
 changes do not start any test workflow.
 
 The PR gate uses `pull_request_target`, so the triggering workflow text always
-comes from the target branch. Only same-repository pull requests may reach the
-shared runner. The checked-out PR source is mounted read-only, receives no
-GitHub token, and runs without network access.
+comes from the target branch. Same-repository and fork PRs both run automatically
+without an approval job. Checkout uses the PR head repository and immutable head
+SHA from the event; changes to workflow files in the PR cannot change the trusted
+controller for that run.
+The checked-out PR source is mounted read-only at `/ci-source` and copied into
+a writable, temporary `/workspace` inside the container. Tests can create
+fixtures beside the source without modifying the runner checkout. `/tmp` and
+`/workspace` allow executable test fixtures but disallow devices and setuid
+executables. The container receives no GitHub token or network access. All
+Linux capabilities are dropped except SETUID/SETGID, needed by cross-UID
+process-control tests; privilege escalation is disabled.
+The test container is limited to 2 CPUs, 2 GiB RAM, and 256 processes.
+
+Existing failed runs retain the old target-branch workflow. After this change
+reaches `main`, emit a fresh qualifying PR event (for example, a new commit or
+closing and reopening the PR) to test an existing fork PR.
 
 ## Runner and image preparation
 
