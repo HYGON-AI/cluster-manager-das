@@ -114,8 +114,14 @@ jobs:
             "${CLUSTER_MANAGER_CI_IMAGE_ID}" \
             bash -c 'set -euo pipefail
               cp -a --no-preserve=ownership /ci-source/. /workspace/
+              test_path="$1"
+              # The base-branch caller may still name the old directory during a rename PR.
+              if [[ "$test_path" == cluster_manager/test/unit && ! -d "$test_path" && -d hcu-training-reliability/test/unit ]]; then
+                test_path=hcu-training-reliability/test/unit
+                export PYTHONPATH="${PYTHONPATH}:/workspace/hcu-training-reliability"
+              fi
               exec python3 -m pytest -c /dev/null --rootdir=/workspace \
-                --import-mode=importlib -p no:cacheprovider -q "$1"
+                --import-mode=importlib -p no:cacheprovider -q "$test_path"
             ' ci-tests "${{ inputs.test-path }}"
 
       - name: Remove test dependency volume
