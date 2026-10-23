@@ -1311,8 +1311,6 @@ def test_topology_validator():
     all_results = None
     if dist_initialized and TORCH_AVAILABLE:
         # 使用 gather_object 收集所有 rank 的结果
-        import torch.distributed as dist
-        
         # 所有 rank 只发送精简数据，减少数据冗余
         result_to_send = {
             "rank": rank,

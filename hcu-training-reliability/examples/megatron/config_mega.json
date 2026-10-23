@@ -1,5 +1,5 @@
 {
-  "base_dir": "/public/home/user/workspace/hcu_cluster_manager/cluster_manager/workspace",
+  "base_dir": "/public/home/user/workspace/cluster-manager-das/hcu-training-reliability/workspace",
   "slots": 8,
   "launch_model" :"mpirun",
   "Program":"ft_megatron",

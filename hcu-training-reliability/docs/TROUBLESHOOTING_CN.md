@@ -3,7 +3,7 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# cluster_manager 常见故障排查
+# hcu-training-reliability 常见故障排查
 
 ## 启动参数校验失败
 

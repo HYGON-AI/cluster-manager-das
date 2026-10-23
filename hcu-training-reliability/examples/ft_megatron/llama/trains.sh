@@ -241,11 +241,11 @@ echo "NNODES=$NUM_NODES, MASTER_ADDR=$MASTER_ADDR, MASTER_PORT=$MASTER_PORT"
 echo '========================================'
 
 # Run the training command
-ft_launcher ${DISTRIBUTED_ARGS[@]} \
+ft_launcher "${DISTRIBUTED_ARGS[@]}" \
     "$PRETRAIN_SCRIPT_PATH" \
-    ${MODEL_ARGS[@]} \
-    ${TRAINING_ARGS[@]} \
-    ${DTYPE_ARGS[@]} \
-    ${MODEL_PARALLEL_ARGS[@]} \
-    ${DATA_ARGS_LIST[@]} \
-    ${EVAL_AND_LOGGING_ARGS[@]}
+    "${MODEL_ARGS[@]}" \
+    "${TRAINING_ARGS[@]}" \
+    "${DTYPE_ARGS[@]}" \
+    "${MODEL_PARALLEL_ARGS[@]}" \
+    "${DATA_ARGS_LIST[@]}" \
+    "${EVAL_AND_LOGGING_ARGS[@]}"

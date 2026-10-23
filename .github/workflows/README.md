@@ -7,7 +7,7 @@ There is no nightly workflow and no custom PR planner.
 
 | Workflow | Changed path | Test directory |
 | --- | --- | --- |
-| `PR Test (cluster_manager)` | `cluster_manager/**` | `cluster_manager/test/unit` |
+| `PR Test (hcu-training-reliability)` | `hcu-training-reliability/**` | `hcu-training-reliability/test/unit` |
 | `PR Test (hcu_resiliency_ext)` | `hcu_resiliency_ext/**`, `.gitmodules` | `hcu_resiliency_ext/tests` |
 | `PR Test (hcu-envcheck)` | `hcu-envcheck/**` | `hcu-envcheck/tests` |
 | `PR Test (hygon-ft-k8s)` | `hygon-ft-k8s/**` | `hygon-ft-k8s/tests` |

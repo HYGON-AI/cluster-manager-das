@@ -14,7 +14,7 @@ SPDX-License-Identifier: Apache-2.0
     hcu-envcheck
          ↓
 选择训练平台
-    ├── Slurm/MPI：cluster_manager
+    ├── Slurm/MPI/Docker：hcu-training-reliability
     └── Kubernetes：hygon-ft-k8s
          ↓
 训练 hang 时采集和分析堆栈
@@ -61,12 +61,12 @@ hcu-envcheck/out/nodes_check_YYYYMMDD_HHMMSS_ffffff/
 #### Slurm/MPI
 
 ```bash
-cd cluster_manager
+cd hcu-training-reliability
 python -m pip install -e .
 hcu-cluster-inspect --help
 ```
 
-`cluster_manager` 在登录节点或控制节点运行，主要负责：
+`hcu-training-reliability` 在登录节点或控制节点运行，主要负责：
 
 - 校验已有 Slurm 作业和训练规模。
 - 从 hostfile 初始化运行、备用、正常和异常节点池。
@@ -74,7 +74,7 @@ hcu-cluster-inspect --help
 - 发现故障后停止当前训练、隔离异常节点、选择备用节点并重新启动。
 - 持久化节点池、运行状态、迭代信息和故障快照。
 
-正式启动需要准备已有 Slurm Job ID、hostfile、sbatch 脚本、训练启动脚本和训练参数文件。不要直接把仓库根目录的 `start.sh` 当作通用启动器，具体限制见 [cluster_manager README](../cluster_manager/README.md)。
+正式启动需要准备已有 Slurm Job ID、hostfile、sbatch 脚本、训练启动脚本和训练参数文件。不要直接把项目目录中的 `start.sh` 当作通用启动器，具体限制见 [hcu-training-reliability README](../hcu-training-reliability/README.md)。
 
 #### Kubernetes
 

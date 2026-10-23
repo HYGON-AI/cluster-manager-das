@@ -153,7 +153,7 @@ Operator 会通过标准输入向该命令传递故障 JSON。
 
 | 文件 | 职责 |
 |---|---|
-| `cluster_manager/cluster_manager/monitor/log_event_sink.py` | 将日志事件转换为 K8s 报告并原子写 marker |
+| `hcu-training-reliability/cluster_manager/monitor/log_event_sink.py` | 将日志事件转换为 K8s 报告并原子写 marker |
 | `runtime/ft-launcher` | 管理训练/监控进程，上报 marker 并等待确认 |
 | `hygon_ft/webhook/server.py` | 注入日志和上报环境变量 |
 | `hygon_ft/operator/controller.py` | 提供 `/report`、创建和处理 FaultEvent |

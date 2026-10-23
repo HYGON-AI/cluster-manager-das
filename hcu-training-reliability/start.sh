@@ -38,7 +38,7 @@ source /path/to/conda.sh
 conda activate conda_env_name
 
 
-nohup python /path/to/hcu_cluster_manager/cluster_manager/main.py \
+nohup python /path/to/cluster-manager-das/hcu-training-reliability/cluster_manager/main.py \
   --nodes_num "${NODES_NUM}" \
   --slots "${SLOTS}" \
   --exec "${RUN_PATH}" \

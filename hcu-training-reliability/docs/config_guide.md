@@ -3,7 +3,7 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# cluster_manager 配置与参数参考
+# hcu-training-reliability 配置与参数参考
 
 当前配置由命令行参数、环境变量和 `MEGATRON_SCRIPT_PATH` 三部分组成。
 

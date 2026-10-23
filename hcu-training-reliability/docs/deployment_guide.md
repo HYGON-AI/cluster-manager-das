@@ -3,7 +3,7 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# cluster_manager 部署与启动指南
+# hcu-training-reliability 部署与启动指南
 
 本文说明当前支持的裸机 hostfile + MPI 和 Slurm allocation + MPI 两种部署方式。Kubernetes 训练容错请使用同仓库的 `hygon-ft-k8s`。
 
@@ -24,7 +24,7 @@ SPDX-License-Identifier: Apache-2.0
 项目不要求先安装 Python 包。确保运行环境已经具备 `setup.py` 中声明的依赖后，可以从仓库根目录直接验证源码入口：
 
 ```bash
-python3 cluster_manager/cluster_manager/main.py --help
+python3 hcu-training-reliability/cluster_manager/main.py --help
 ```
 
 仓库提供的 `examples/start_none.sh`、`examples/start_slurm.sh` 和 `start.sh` 都直接调用源码，现场使用时只需把其中的源码绝对路径改为实际仓库位置。
@@ -32,7 +32,7 @@ python3 cluster_manager/cluster_manager/main.py --help
 如需在环境中使用 `hcu-cluster-inspect` 命令，也可以选择 editable 安装：
 
 ```bash
-cd cluster_manager
+cd hcu-training-reliability
 python3 -m pip install -e .
 hcu-cluster-inspect --help
 ```
@@ -127,7 +127,7 @@ Slurm 场景额外要求 `--job_id`、`--job_name` 和 `--sbatch_script`。启�
 
 ## 6. 使用 `start.sh` 模板
 
-根目录下的 `cluster_manager/start.sh` 是现场配置模板，不是开箱即用脚本。使用前必须替换：
+项目目录下的 `hcu-training-reliability/start.sh` 是现场配置模板，不是开箱即用脚本。使用前必须替换：
 
 - `LOG_DIR`、`TRIAN_PATH`、`RUN_PATH` 和 `HOSTFILE`。
 - 节点数和每节点进程数。

@@ -13,7 +13,7 @@ def parse_mpi_command_result(log_content: str) -> List[str]:
     # 第一步：字节流/字符串 统一转为 字符串（核心修改：适配字节流入参）
     if isinstance(log_content, bytes):
         try:
-            # 优先 UTF-8 解码（匹配用户日志中的中文编码），无法解码的字符用 � 替换
+            # 优先 UTF-8 解码（匹配用户日志中的中文编码），无法解码的字节使用 Unicode 替换字符代替
             raw_text = log_content.decode("utf-8", errors="replace")
         except Exception as e:
             logger.warning(f"UTF-8 解码失败，使用 latin-1 兜底：{str(e)}")

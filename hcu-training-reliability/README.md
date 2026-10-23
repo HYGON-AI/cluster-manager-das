@@ -3,9 +3,9 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# cluster_manager：Slurm/MPI/Docker 训练监控与故障恢复
+# hcu-training-reliability：长稳训练监控与故障恢复
 
-`cluster_manager` 运行在登录节点或控制节点上，用于管理裸机 hostfile、Slurm 分配或预创建 Docker 容器中的分布式训练任务。它维护训练节点池、监控训练日志和节点状态，并在检测到故障后选择备用节点重新拉起训练。
+`hcu-training-reliability` 运行在登录节点或控制节点上，为裸机 hostfile、Slurm 分配或预创建 Docker 容器中的分布式训练提供长稳运行保障。它维护训练节点池，持续监控训练日志和节点状态，并在检测到故障后选择备用节点重新拉起训练。
 
 当前可用于生产的主路径包括 **裸金属 + MPI**、**Slurm + MPI**，以及在每个节点预先创建训练容器后的 **hostfile + Docker exec**。Kubernetes 训练容错请使用同级项目 [`hygon-ft-k8s`](../hygon-ft-k8s/README.md)。
 
@@ -31,13 +31,13 @@ SPDX-License-Identifier: Apache-2.0
 
 ## 源码启动
 
-`cluster_manager` 不要求先安装 Python 包，可以直接从源码运行。运行环境需要具备 `setup.py` 中声明的 Python 依赖。
+`hcu-training-reliability` 不要求先安装 Python 包，可以直接从源码运行。运行环境需要具备 `setup.py` 中声明的 Python 依赖。
 
 从仓库根目录验证源码入口：
 
 ```bash
-cd /path/to/hcu_cluster_manager
-python cluster_manager/cluster_manager/main.py --help
+cd /path/to/cluster-manager-das
+python hcu-training-reliability/cluster_manager/main.py --help
 ```
 
 项目提供裸机和 Slurm 两份源码启动示例。建议复制对应示例作为现场启动脚本；`start.sh` 保留为完整环境模板，其中包含占位路径，不能直接运行。
@@ -45,7 +45,7 @@ python cluster_manager/cluster_manager/main.py --help
 进入子项目目录，选择并复制启动示例：
 
 ```bash
-cd cluster_manager
+cd hcu-training-reliability
 cp examples/start_none.sh start.local.sh        # 裸机 hostfile
 # 或
 cp examples/start_slurm.sh start.slurm.local.sh # Slurm
@@ -149,7 +149,7 @@ tail -f /path/to/cluster_manager.log
 ## 项目结构
 
 ```text
-cluster_manager/
+hcu-training-reliability/
 ├── cluster_manager/        # Python 包和 node_check
 ├── docs/                   # 部署、配置、恢复、架构和排障文档
 ├── tools/                  # 独立辅助工具

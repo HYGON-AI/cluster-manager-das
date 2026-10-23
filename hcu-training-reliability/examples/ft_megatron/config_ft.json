@@ -1,5 +1,5 @@
 {
-  "base_dir": "/public/home/user/workspace/new_labs/hcu_cluster_manager/cluster_manager",
+  "base_dir": "/public/home/user/workspace/cluster-manager-das/hcu-training-reliability",
   "slots": 1,
   "launch_model" :"mpirun",
   "Program":"ft_megatron",
@@ -10,7 +10,7 @@
   "conda_name": "megatron_train",
   "training_exec_path":"/public/home/user/workspace/new_labs/ft_hcu_megatron/examples/llama/run.sh",
   "ckpt_file":"/public/home/user/ckpt/llama",
-  "training_output_log":"/public/home/user/workspace/new_labs/hcu_cluster_manager/cluster_manager/mega.log",
+  "training_output_log":"/public/home/user/workspace/cluster-manager-das/hcu-training-reliability/mega.log",
   "is_gemm_std": false,
   "std_multiplier": 2,
   "relative_threshold": 1.5

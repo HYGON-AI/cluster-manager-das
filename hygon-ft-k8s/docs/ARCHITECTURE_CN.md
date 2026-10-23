@@ -106,4 +106,4 @@ PyTorchJob 通过 Volcano PodGroup 实现 gang scheduling。资源不足总副�
 
 ## 8. 代码边界
 
-Kubernetes 模块的目录职责见[目录结构](DIRECTORY_STRUCTURE_CN.md)，关键函数和资源调用关系见[代码走读](CODE_WALKTHROUGH_CN.md)。原 `cluster_manager/` 下的 mpirun 容错链路保持独立，不受 K8s 控制面安装和卸载影响。
+Kubernetes 模块的目录职责见[目录结构](DIRECTORY_STRUCTURE_CN.md)，关键函数和资源调用关系见[代码走读](CODE_WALKTHROUGH_CN.md)。`hcu-training-reliability/` 下的 MPI 容错链路保持独立，不受 K8s 控制面安装和卸载影响。

@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
 
           pythonpath="/ci-deps:/workspace"
-          pythonpath="${pythonpath}:/workspace/cluster_manager"
+          pythonpath="${pythonpath}:/workspace/hcu-training-reliability"
           pythonpath="${pythonpath}:/workspace/hcu-envcheck"
           pythonpath="${pythonpath}:/workspace/hcu_resiliency_ext"
           pythonpath="${pythonpath}:/workspace/hygon-ft-k8s"

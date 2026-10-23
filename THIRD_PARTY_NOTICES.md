@@ -13,7 +13,7 @@ copyright notices remain controlling.
 
 - Project: DLRover
 - Upstream: https://github.com/intelligent-machine-learning/dlrover
-- Local file: `cluster_manager/cluster_manager/utils/detection_utils.py`
+- Local file: `hcu-training-reliability/cluster_manager/utils/detection_utils.py`
 - License: Apache License 2.0 (`Apache-2.0`)
 - Copyright: Copyright 2023 The DLRover Authors
 - Modifications: adapted for the HCU cluster manager integration

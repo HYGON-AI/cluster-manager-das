@@ -3,13 +3,13 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# cluster_manager 故障恢复与日常操作
+# hcu-training-reliability 故障恢复与日常操作
 
-本文说明 `cluster_manager` 在裸机 MPI 和 Slurm + MPI 场景中的故障处理顺序、磁盘状态以及控制进程重启后的恢复行为。部署参数见[部署与启动指南](deployment_guide.md)，内部模块关系见[代码结构与处理链路](architecture.md)。
+本文说明 `hcu-training-reliability` 在裸机 MPI、Slurm + MPI 和 Docker 场景中的故障处理顺序、磁盘状态以及控制进程重启后的恢复行为。部署参数见[部署与启动指南](deployment_guide.md)，内部模块关系见[代码结构与处理链路](architecture.md)。
 
 ## 恢复边界
 
-`cluster_manager` 负责发现异常、隔离节点、选择备用节点、停止当前训练并重新执行训练启动脚本。训练状态能否从正确位置继续，取决于训练框架自身的 checkpoint 保存和加载逻辑。
+`hcu-training-reliability` 负责发现异常、隔离节点、选择备用节点、停止当前训练并重新执行训练启动脚本。训练状态能否从正确位置继续，取决于训练框架自身的 checkpoint 保存和加载逻辑。
 
 使用前必须满足以下条件：
 

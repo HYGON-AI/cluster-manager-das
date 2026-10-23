@@ -63,7 +63,7 @@ metadata:
     ft.hygon.io/log-dir: "/workspace/hygon-ft-logs"
     ft.hygon.io/log-monitor-roles: "all"
     ft.hygon.io/log-monitor-command: >-
-      python /workspace/hcu_cluster_manager/cluster_manager/cluster_manager/monitor/log_monitor.py
+      python /workspace/cluster-manager-das/hcu-training-reliability/cluster_manager/monitor/log_monitor.py
       --log-file "${FT_LOG_FILE}" --mode k8s
     ft.hygon.io/exit-after-fault-event-report: "true"
 spec:

@@ -3,13 +3,13 @@ Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# cluster_manager 代码结构与处理链路
+# hcu-training-reliability 代码结构与处理链路
 
-本文是 `cluster_manager` 当前实现的唯一架构说明；面向用户的安装、配置和启动方式统一维护在项目 [README](../README.md) 及对应操作文档中。
+本文是 `hcu-training-reliability` 当前实现的唯一架构说明；面向用户的安装、配置和启动方式统一维护在项目 [README](../README.md) 及对应操作文档中。
 
 ## 定位
 
-`cluster_manager` 是单训练任务控制面，支持裸机 hostfile + MPI 和 Slurm + MPI。它不实现训练算法，也不保存 checkpoint；它负责节点分配、训练启停、运行事件监控和故障后的重新编排。
+`hcu-training-reliability` 是单训练任务可靠性控制面，支持裸机 hostfile + MPI、Slurm + MPI 和 Docker 启动路径。它不实现训练算法，也不保存 checkpoint；它负责节点分配、训练启停、长稳运行监控和故障后的重新编排。
 
 ## 核心组件
 

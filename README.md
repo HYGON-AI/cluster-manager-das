@@ -14,7 +14,7 @@ SPDX-License-Identifier: Apache-2.0
 | 目标 | 子项目 | 典型环境 | 主要影响 |
 |---|---|---|---|
 | 训练前检查 HCU、驱动、DTK、CPU、内存、NIC、RDMA、IB 和软件环境 | [`hcu-envcheck`](hcu-envcheck/README.md) | 裸金属、Slurm、Kubernetes | 普通检查以采集为主；主动模式会产生测试流量 |
-| 监控训练，故障后隔离节点、选择备用节点并重启 | [`cluster_manager`](cluster_manager/README.md) | Slurm + MPI | 会停止并重新拉起训练进程 |
+| 持续监控长稳训练，故障后隔离节点、选择备用节点并重启 | [`hcu-training-reliability`](hcu-training-reliability/README.md) | 裸金属、Slurm、Docker | 会停止并重新拉起训练进程 |
 | 为 PyTorchJob 或 Volcano Job 增加运行期容错 | [`hygon-ft-k8s`](hygon-ft-k8s/README.md) | Kubernetes | 会创建集群资源，可能 taint 节点和删除 Pod |
 | 训练 hang 后采集所有 rank 的 Python 堆栈并给出隔离建议 | [`stack-analyzer`](stack-analyzer/README.md) | Kubernetes、Docker、Ansible、单机 | 默认只采集和分析，不自动驱逐节点 |
 | 将 `nvidia-resiliency-ext` profiling 模块重定向到 HCU 适配实现 | [`hcu_resiliency_ext`](hcu_resiliency_ext/Readme.md) | 第三方容错库适配 | 会修改 Python 模块导入行为 |
@@ -32,14 +32,14 @@ SPDX-License-Identifier: Apache-2.0
 - [README](hcu-envcheck/README.md)
 - [完整使用手册](hcu-envcheck/docs/USER_GUIDE.md)
 
-### cluster_manager
+### hcu-training-reliability
 
-Slurm/MPI 单任务控制面，负责节点池、日志/NHC/Slurm 监控、状态持久化以及故障后的停止、换节点和重启。
+面向裸金属、Slurm 和 Docker 分布式训练的长稳运行保障组件，负责节点池、日志/NHC/Slurm 监控、状态持久化以及故障后的停止、换节点和重启。
 
-- [README](cluster_manager/README.md)
-- [部署与启动](cluster_manager/docs/deployment_guide.md)
-- [故障恢复与日常操作](cluster_manager/docs/recovery_workflow.md)
-- [配置参考](cluster_manager/docs/config_guide.md)
+- [README](hcu-training-reliability/README.md)
+- [部署与启动](hcu-training-reliability/docs/deployment_guide.md)
+- [故障恢复与日常操作](hcu-training-reliability/docs/recovery_workflow.md)
+- [配置参考](hcu-training-reliability/docs/config_guide.md)
 
 ### hygon-ft-k8s
 
@@ -67,10 +67,10 @@ Slurm/MPI 单任务控制面，负责节点池、日志/NHC/Slurm 监控、状�
 ## 目录结构
 
 ```text
-hcu_cluster_manager/
+cluster-manager-das/
 ├── docs/                       # 套件级流程
 ├── hcu-envcheck/               # 训练前环境检查
-├── cluster_manager/            # Slurm/MPI 训练容错
+├── hcu-training-reliability/   # 长稳训练监控与故障恢复
 ├── hygon-ft-k8s/               # Kubernetes 训练容错
 ├── stack-analyzer/             # hang 堆栈诊断
 └── hcu_resiliency_ext/         # 第三方容错库适配
@@ -78,14 +78,14 @@ hcu_cluster_manager/
 
 ## 根目录文件边界
 
-`cluster_manager/start.sh` 是 Slurm/MPI 场景的环境模板，使用前必须按目标集群修改训练规模、Conda、共享路径和 Slurm 参数。Kubernetes 用户应进入 `hygon-ft-k8s`，使用该目录下的 `start.sh`。
+`hcu-training-reliability/start.sh` 是 Slurm/MPI 场景的环境模板，使用前必须按目标集群修改训练规模、Conda、共享路径和 Slurm 参数。Kubernetes 用户应进入 `hygon-ft-k8s`，使用该目录下的 `start.sh`。
 
 `hygon-ft-k8s/docs/train_volcano.yaml` 是启用 `ft.hygon.io` 的 Volcano Job 示例，包含示例 Namespace、镜像、训练路径、数据路径、节点规模和存储挂载。复制到其他集群前必须逐项核对。
 
 ## 安全边界
 
 - 主动带宽、RCCL、完整筛机、故障模拟和恢复测试只能在已确认空闲的节点上执行。
-- `cluster_manager` 当前可能按 `python` 关键字终止目标节点进程，要求训练节点独占。
+- `hcu-training-reliability` 当前可能按 `python` 关键字终止目标节点进程，要求训练节点独占。
 - `hygon-ft-k8s` 可能创建集群级资源、taint 节点、删除 Pod 并触发任务重建。
 - `stack-analyzer` 需要 ptrace 权限；分析结果是诊断证据，不会自动执行驱逐。
 - `hcu_resiliency_ext` 只能在已验证的第三方库版本上使用。
@@ -100,7 +100,7 @@ python -m pytest
 
 也可以把 `pytest.ini` 中列出的子项目测试目录传给 Pytest，仅验证单个模块。
 
-`cluster_manager` 的完整验证依赖 Slurm、MPI、HCU 和真实训练环境，不能把单元测试通过等同于生产链路验证。
+`hcu-training-reliability` 的完整验证依赖 Slurm、MPI、HCU 和真实训练环境，不能把单元测试通过等同于生产链路验证。
 
 README 只维护项目定位、能力、最短入口和文档导航；运行顺序、处理链路和恢复流程统一维护在对应 `docs/` 中。
 

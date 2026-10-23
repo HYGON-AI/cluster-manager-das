@@ -1,0 +1,26 @@
+name: PR Test (hcu-training-reliability)
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "hcu-training-reliability/**"
+      - ".github/actionlint.yaml"
+      - ".github/workflows/_run-unit-tests.yml"
+      - ".github/workflows/pr-test-hcu-training-reliability.yml"
+
+concurrency:
+  group: pr-test-hcu-training-reliability-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    uses: ./.github/workflows/_run-unit-tests.yml
+    with:
+      module-id: hcu-training-reliability
+      test-name: hcu-training-reliability unit tests
+      test-path: hcu-training-reliability/test/unit
