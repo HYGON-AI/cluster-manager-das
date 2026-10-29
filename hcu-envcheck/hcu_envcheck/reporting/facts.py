@@ -250,6 +250,34 @@ def load_group(state: Path, group: str) -> GroupFacts | None:
     return result
 
 
+def invalidate(path: Path) -> None:
+    """Drop any cached compact-facts read for the group owning `path`.
+
+    `load_group`'s cache hit path trusts a pre-open `stat()` (mtime_ns,
+    ctime_ns, size, inode) match against the previous read. The write side
+    (controller.sh, on the host) and the read side (this reporting process,
+    inside the container via docker exec) can observe the same facts.json
+    through different filesystem-attribute-cache views, so a `stat()` taken
+    moments after a host-side commit can still report the pre-commit
+    attributes to the container, matching the cached entry even though the
+    file's revision has already advanced. The one read that must be
+    authoritative (the final, `final=True` tick) calls this first to force
+    a real re-open+fstat on its next `load_group`, rather than trusting that
+    `stat()` comparison.
+    """
+    location = logical_location(path)
+    if location is None:
+        return
+    state, group = location[0], location[1]
+    if not GROUP.fullmatch(group):
+        return
+    facts_path = Path(state).absolute() / "prepared" / group / "facts.json"
+    _cache.pop(facts_path, None)
+    pinned = _snapshot.get()
+    if pinned is not None:
+        pinned.pop(facts_path, None)
+
+
 def read_rows(path: Path) -> list[dict] | None:
     location = logical_location(path)
     if location is None:

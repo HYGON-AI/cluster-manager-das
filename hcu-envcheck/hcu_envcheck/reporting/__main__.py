@@ -32,7 +32,7 @@ def probe(root: Path, *, ready=True):
 
 
 def watch(args):
-    root = Path(args.run_dir).resolve()
+    root = Path(args.run_dir)
     final_status = "ERROR"
     interrupted = False
     finalized = False
@@ -95,12 +95,12 @@ def watch(args):
 
 
 def rccl_local(args):
-    with report_lock(Path(args.log_dir).resolve()):
+    with report_lock(Path(args.log_dir)):
         return _rccl_local(args)
 
 
 def _rccl_local(args):
-    directory, plan_file = Path(args.log_dir).resolve(), Path(args.plan_file).resolve()
+    directory, plan_file = Path(args.log_dir), Path(args.plan_file)
     plan, executed = rows(plan_file), rows(directory / "execution.tsv")
     if not plan or not executed:
         raise RuntimeError("RCCL plan 或 execution.tsv 缺失")
@@ -138,7 +138,7 @@ def main():
         return watch(args)
     if args.command == "rccl-local":
         return rccl_local(args)
-    root = Path(args.run_dir).resolve()
+    root = Path(args.run_dir)
     with report_lock(root):
         probe(root, ready=args.command == "probe")
         if args.command == "probe":
