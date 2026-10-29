@@ -70,7 +70,11 @@ class ActiveTestExecutor:
         self.execution_scope, self.container_name = execution_scope, container_name
         self.container_shell, self.container_ssh_port = container_shell, container_ssh_port
         self.container_workdir = container_workdir
-        self.worker_root = (container_workdir or str(Path(__file__).resolve().parents[1]))
+        # No .resolve(): this must stay the path Python was actually invoked
+        # with (set via PYTHONPATH to the site's canonical ROOT), not a
+        # symlink-resolved alias (e.g. /public -> /public2) that may not be
+        # mounted inside the container this path gets run in.
+        self.worker_root = (container_workdir or str(Path(__file__).parents[1]))
         self.ib_config, self.ib_state_config = ib_config, ib_state_config
         self.session = None
 

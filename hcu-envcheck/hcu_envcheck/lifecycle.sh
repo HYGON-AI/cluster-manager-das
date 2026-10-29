@@ -22,9 +22,21 @@ Options:    --image-tar TAR
             --yes (container-recreate/container-delete)
             --dry-run
 
-container-create/container-recreate use these default mounts:
+container-create/container-recreate use this default mount:
   /opt/hyhal:/opt/hyhal:ro
-  /root/.ssh:/root/.ssh:ro
+
+After create, the contents of HCU_SSH_DIR are copied (docker cp, not a bind
+mount) into the container's /root/.ssh and chowned to root so sshd and the
+ssh client accept them.
+
+Env:        HCU_SSH_USER   ssh user for the login-node-to-host hop (default: current user)
+            HCU_SSH_DIR    host dir whose contents are copied into the
+                           container's /root/.ssh after create (default: /root/.ssh).
+                           Must hold a key pair usable for passwordless root@container-ip
+                           ssh across every node in -f HOSTFILE (e.g. a shared-NFS home
+                           directory with the same key pair and authorized_keys on all
+                           nodes), and must be visible at the same absolute path on
+                           every node in HOSTFILE.
 HELP
 }
 
@@ -42,10 +54,15 @@ esac
 HOSTFILE='' CONTAINER='' IMAGE='' IMAGE_TAR='' PORT='' CONCURRENCY=32 OUTPUT_DIR='' LOG_DETAIL=milestone
 YES=0 DRY_RUN=0
 SSH_USER=${HCU_SSH_USER:-${USER:-root}}
+# T32: host dir whose contents are docker-cp'd into the container's /root/.ssh
+# after create; see usage() above. Not bind-mounted, so ownership inside the
+# container is fixed to root right after the copy (see provisioning step
+# below), which keeps both sshd and the ssh client's own strict permission
+# checks happy without needing StrictModes=no.
+SSH_DIR=${HCU_SSH_DIR:-/root/.ssh}
 declare -a VOLUMES=() DOCKER_ARGS=() NODES=()
 declare -a DEFAULT_VOLUMES=(
     /opt/hyhal:/opt/hyhal:ro
-    /root/.ssh:/root/.ssh:ro
 )
 
 while (( $# )); do
@@ -412,6 +429,8 @@ for node in "${NODES[@]}"; do
             printf '[ERROR] docker run failed on %s\n' "$node" >&2
             exit 1
         fi
+        container_id=$(remote "$node" docker inspect --type container -f '{{.Id}}' "$CONTAINER" 2>/dev/null) || container_id=''
+        node_result "$node" create PASS OK 0 "${container_id:--}" "$IMAGE" "container created"
     ) > "$LIFECYCLE_WORK_DIR/create/$node.log" 2>&1 & PIDS+=("$!")
     if (( ${#PIDS[@]} >= CONCURRENCY )); then wait_wave; (( WAVE_FAILED == 0 )) || failed=1; fi
 done
@@ -423,20 +442,38 @@ lifecycle_output_stage ssh-identity || die 'cannot prepare lifecycle output'
 # target identity. A listening port, a bare `ssh true` or the container name
 # alone prove nothing: each node must actually enter ITS container over SSH.
 # On this site the SSH client cannot be the dispatching user (no key of that
-# user is in the container's authorized_keys, which are the host-mounted
-# read-only /root/.ssh); the client is the container itself, riding the same
-# host root keypair the RCCL/DeepEP interconnect uses. Identity cannot come
-# from /proc/self/cgroup (docker's private cgroup namespace masks it inside
-# the container) nor from hostname (--network=host shares the host UTS ns),
-# so a one-time token equal to the container's full ID is staged in the
-# container-private /run via docker exec and must be read back through a real
-# SSH connection on $PORT: only the target container's filesystem can return
-# it. No keys are exchanged, host checking is not disabled and no passwords
-# are enabled.
+# user is in the container's authorized_keys); the client is the container
+# itself, riding the same host keypair the RCCL/DeepEP interconnect uses.
+# $SSH_DIR is copied (not bind-mounted) into the container and chowned to
+# root right below, so both sshd and the ssh client accept it under their
+# normal strict permission checks. Identity cannot come from /proc/self/cgroup
+# (docker's private cgroup namespace masks it inside the container) nor from
+# hostname (--network=host shares the host UTS ns), so a one-time token equal
+# to the container's full ID is staged in the container-private /run via
+# docker exec and must be read back through a real SSH connection on $PORT:
+# only the target container's filesystem can return it. No keys are
+# exchanged, host checking is not disabled and no passwords are enabled.
 PIDS=()
 for node in "${NODES[@]}"; do
     (
-        if ! remote "$node" docker exec "$CONTAINER" bash -c "mkdir -p /var/run/sshd && /usr/sbin/sshd -p $PORT" >/dev/null 2>&1; then
+        remote "$node" docker exec "$CONTAINER" mkdir -p /root/.ssh >/dev/null 2>&1 || {
+            node_result "$node" ssh-init FAIL EXECUTION_FAILED 1 - "$IMAGE" "cannot create /root/.ssh in $CONTAINER"
+            printf '[ERROR] %s: cannot create /root/.ssh in %s\n' "$node" "$CONTAINER" >&2
+            exit 1
+        }
+        remote "$node" docker cp "$SSH_DIR/." "$CONTAINER:/root/.ssh/" >/dev/null 2>&1 || {
+            node_result "$node" ssh-init FAIL EXECUTION_FAILED 1 - "$IMAGE" "cannot copy $SSH_DIR into $CONTAINER:/root/.ssh"
+            printf '[ERROR] %s: cannot copy %s into %s:/root/.ssh\n' "$node" "$SSH_DIR" "$CONTAINER" >&2
+            exit 1
+        }
+        remote "$node" docker exec "$CONTAINER" bash -c \
+            'chown -R root:root /root/.ssh && chmod 700 /root/.ssh && find /root/.ssh -maxdepth 1 -type f -exec chmod 600 {} \;' \
+            >/dev/null 2>&1 || {
+            node_result "$node" ssh-init FAIL EXECUTION_FAILED 1 - "$IMAGE" "cannot fix ownership/permissions of /root/.ssh in $CONTAINER"
+            printf '[ERROR] %s: cannot fix ownership/permissions of /root/.ssh in %s\n' "$node" "$CONTAINER" >&2
+            exit 1
+        }
+        if ! remote "$node" docker exec "$CONTAINER" bash -c "mkdir -p /var/run/sshd && /usr/sbin/sshd -p $PORT -o StrictModes=no" >/dev/null 2>&1; then
             node_result "$node" ssh-init FAIL EXECUTION_FAILED 1 - "$IMAGE" "sshd initialization failed in $CONTAINER"
             printf '[ERROR] %s: sshd initialization failed in %s\n' "$node" "$CONTAINER" >&2
             exit 1

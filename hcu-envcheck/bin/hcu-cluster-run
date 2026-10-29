@@ -7,23 +7,27 @@
 set -u
 
 resolve_script_dir() {
+    # Logical (non -P) cd: this must not resolve ancestor directory symlinks
+    # (e.g. a site's /public -> /public2 mount alias), only the script's own
+    # symlink chain, so ROOT stays the path the caller actually used -- the
+    # same absolute path that must also be visible inside containers/workers.
     local target=$1 target_dir link
     while [[ -h "$target" ]]; do
-        target_dir=$(CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd) || return 1
+        target_dir=$(CDPATH= cd -- "$(dirname -- "$target")" 2>/dev/null && pwd) || return 1
         link=$(readlink "$target") || return 1
         case "$link" in
             /*) target=$link ;;
             *) target=$target_dir/$link ;;
         esac
     done
-    CDPATH= cd -P -- "$(dirname -- "$target")" 2>/dev/null && pwd
+    CDPATH= cd -- "$(dirname -- "$target")" 2>/dev/null && pwd
 }
 
 SCRIPT_DIR=$(resolve_script_dir "${BASH_SOURCE[0]}") || {
     printf 'hcu-cluster-run: cannot resolve launcher path: %s\n' "$0" >&2
     exit 70
 }
-ROOT=$(CDPATH= cd -P -- "$SCRIPT_DIR/.." 2>/dev/null && pwd) || exit 70
+ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd) || exit 70
 if ! pwd -P >/dev/null 2>&1; then
     printf 'hcu-cluster-run: current directory no longer exists; switching to package root: %s; relative paths now use this directory\n' "$ROOT" >&2
     CDPATH= cd -P -- "$ROOT" || exit 70
