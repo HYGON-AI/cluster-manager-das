@@ -358,11 +358,11 @@ class JobStateMachine:
         if data_type == "proc" and data.get("runtime") == "prte":
             # PRTE names the aborting process
             # [prterun-<hnp-host>-<pid>@<namespace>,<rank>]. The hostname in it is
-            # where mpirun runs, not where the process died, and it is identical
-            # for every rank -- only the trailing rank locates the node, through
-            # the same rank//slots mapping the global_rank path uses.
+            # where mpirun runs, not where the process died. The trailing rank
+            # belongs to MPI, which may launch one torchrun per node rather
+            # than one process per GPU. Use the MPI layout, not training slots.
             handled = self.ctx.handle_runtime_fault(
-                fault_info, "rank", fault_reason=payload
+                fault_info, "mpi_rank", fault_reason=payload
             )
             if not handled:
                 return self._require_manual_intervention(
@@ -372,9 +372,13 @@ class JobStateMachine:
                 f"prte process exit {fault_info}, exit_code={exit_code}"
             )
         if data_type in ("global_rank", "rank", "node"):
-            self.ctx.handle_runtime_fault(
+            handled = self.ctx.handle_runtime_fault(
                 fault_info, data_type, fault_reason=payload
             )
+            if not handled:
+                return self._require_manual_intervention(
+                    f"cannot locate the node behind {data_type} exit: {fault_info}"
+                )
             return self._to_recovering(f"exit with {fault_info} fault")
         return self._require_manual_intervention(f'exit with unknown type: {data_type}')
 

@@ -13,6 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 |---|---:|---:|---|
 | `--nodes_num` | 必填 | 必填 | 每轮训练需要的节点数，必须大于 0 |
 | `--slots` | 必填 | 必填 | 每个节点的训练进程数，必须大于 0 |
+| `--mpi-ranks-per-node` | 可选 | 可选 | 训练脚本中每节点的 MPI 进程数；也可用 `MPI_RANKS_PER_NODE` 设置，命令行优先。MPI 退出后备定位需要此配置 |
 | `--exec` | 必填 | 必填 | 训练启动 Shell 脚本；必须存在且可读 |
 | `--hostfile` | 必填 | 必填 | 节点列表；Slurm 模式启动后会按 allocation 更新 |
 | `--job_id` | 不需要 | 必填 | 已有 Slurm Job ID |
@@ -31,6 +32,48 @@ hcu-cluster-inspect \
 
 ## 2. 核心环境变量
 
+MPI rank 与训练 global rank 必须分别配置。对于 `mpirun` 每节点启动一个
+`torchrun --nproc_per_node=4` 的两节点任务，管理器参数为：
+
+```bash
+hcu-cluster-inspect --nodes_num 2 --slots 4 --mpi-ranks-per-node 1 \
+  --exec /path/to/run.sh --hostfile /path/to/hostfile
+```
+
+也可以在启动管理器前 `export MPI_RANKS_PER_NODE=1`。
+`start.sh` 和 `examples/start_docker.sh` 默认将其设为 `SLOTS`，适用于 MPI 直接启动各训练进程，并通过
+`--mpi-ranks-per-node "${MPI_RANKS_PER_NODE}"` 显式传给管理器；外部环境变量可覆盖默认值。
+当使用 MPI 每节点启动一个 `torchrun` 时，必须显式设置 `MPI_RANKS_PER_NODE=1`，
+与 `torchrun` 启动的 GPU/训练进程数无关。直接运行管理器入口时，此参数仍默认为未配置。
+
+| 训练脚本的 MPI 启动方式 | `MPI_RANKS_PER_NODE` | `--slots` |
+|---|---:|---:|
+| 每节点一个 `torchrun --nproc_per_node=4` | `1` | `4` |
+| 每节点一个 `torchrun --nproc_per_node=8` | `1` | `8` |
+| MPI 直接每节点启动 4 个训练进程 | `4` | `4` |
+| MPI 直接每节点启动 8 个训练进程 | `8` | `8` |
+
+完成启动脚本中路径、镜像、hostfile 等必要配置后，可按实际 MPI 布局启动：
+
+```bash
+# 每节点一个 torchrun：当前 DeepSeek 启动方式。
+MPI_RANKS_PER_NODE=1 bash start.sh
+# Docker 模式，每节点一个 torchrun，申请 2 个节点，每节点 4 个训练进程。
+MPI_RANKS_PER_NODE=1 NODES_NUM=2 SLOTS=4 bash examples/start_docker.sh
+# MPI 直接每节点启动 4 个训练进程，未设置 MPI_RANKS_PER_NODE 时默认跟随 SLOTS：
+NODES_NUM=2 SLOTS=4 bash examples/start_docker.sh
+```
+
+`MPI_RANKS_PER_NODE` 必须为正整数，只用于监控映射，不会改写训练脚本中的
+`mpirun` 命令，也不决定训练节点数或 GPU 数。`NODES_NUM` 用于管理器申请节点，
+`SLOTS` 描述每节点训练进程数；训练脚本仍须按管理器分配的 hostfile 启动相应节点。
+
+`Root Cause` 仍优先使用明确的 `host`；MPI 退出后备路径使用
+`MPI rank // mpi_ranks_per_node`，训练 global rank 使用 `rank // slots`。
+映射要求每节点进程数一致、MPI ranks 按当前分配节点顺序连续排列；轮转、重排或非均匀布局
+不能使用此算式，应依赖明确的 host 信息。未配置 MPI 布局时不会回退使用训练 slots 猜测节点，
+而是记录无法定位并进入现有人工介入告警路径。
+
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `CLUSTER_LAUNCH_MODE` | `mpi` | 启动器类型；支持 `mpi`、`docker`（以及兼容别名 `docker_exec`） |
@@ -40,6 +83,8 @@ hcu-cluster-inspect \
 | `MEGATRON_SCRIPT_PATH` | 空 | 训练参数来源，可指向 Shell、JSON 或 YAML 文件 |
 | `LOG_PARSER_TYPE` | `base` | `base` 为 Megatron；`special` 为特定训练框架日志 |
 | `MPI_LAUNCH_TIMEOUT` | `300` | MPI 启停命令超时，单位秒 |
+| `MPI_RANKS_PER_NODE` | 管理器未配置；`start.sh` / `examples/start_docker.sh` 为 `${SLOTS}` | 每节点 MPI 进程数，仅用于 MPI 退出后备定位；每节点一个 `torchrun` 时必须显式改为 `1`，命令行 `--mpi-ranks-per-node` 优先 |
+| `RUN_NHC_EXEC_MODE` | `host` | `host` 在目标宿主机执行 `run_nhc`；`container` 通过 `docker exec` 在目标节点的训练容器内执行 |
 | `INTERVAL_MONITOR` | `60` | 节点和恢复轮询基础间隔，单位秒 |
 | `TRAIN_ALERT_THRESHOLD` | `20000` | 单步耗时告警阈值，单位毫秒 |
 | `TRAIN_NO_UPDATE_THRESHOLD` | `1800` | 已有日志停止更新的阈值，单位秒 |
@@ -72,6 +117,10 @@ Docker launcher 变量（仅 `CLUSTER_LAUNCH_MODE=docker` 使用）：
 
 在 `CLUSTER_LAUNCH_MODE=docker` 下，容器准备由 `clush --hostfile` 并发执行到所有训练节点，训练脚本只在
 hostfile 第一台节点的容器内通过 `docker exec -d` 启动。
+
+NHC 的分发始终由宿主机上的 `clush` 完成。设置 `RUN_NHC_EXEC_MODE=container` 后，各目标宿主机执行
+`docker exec -u root ${DOCKER_CONTAINER_NAME} bash -lc run_nhc`；因此容器必须已经存在且可运行，并且容器内
+能够通过 `PATH` 找到 `run_nhc`。保持默认值 `host` 时，各目标宿主机直接执行 `run_nhc`。
 
 `MPI_RANK_ENV` / `MPI_FORWARD_ENV` 通过 Open MPI 的 `mca_base_env_list` 下发，而不是简单
 `export`：mpirun 不会把任意环境变量转发给远端 rank，只 `export` 的话仅协调节点的 rank 生效。

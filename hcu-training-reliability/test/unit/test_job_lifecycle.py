@@ -9,6 +9,8 @@ import pytest
 from cluster_manager.event.event_bus import Event, EventType
 from cluster_manager.runtime.job_state_machine import JobCommand, JobStateMachine
 from cluster_manager.runtime.run_state_manager import RunState, RunStateManager
+from cluster_manager.runtime.runtime_context import RuntimeContext
+from cluster_manager.monitor.log_patterns import parse_error_log
 
 
 class FakeContext:
@@ -141,7 +143,7 @@ def test_prte_process_exit_locates_the_node_from_the_rank(machine):
     assert command is JobCommand.STOP_TRAINING
     assert ctx.run_state is RunState.RECOVERING
     ctx.handle_runtime_fault.assert_called_once_with(
-        "[prterun-m09r2n09-2091658@1,11]", "rank", fault_reason=payload
+        "[prterun-m09r2n09-2091658@1,11]", "mpi_rank", fault_reason=payload
     )
 
 
@@ -167,6 +169,44 @@ def test_unmappable_prte_exit_does_not_restart_blindly(machine):
     )
 
     assert command is JobCommand.NONE
+    assert ctx.run_state is RunState.RUNNING
+    notify.send_feishu_alert.assert_called_once()
+
+
+def test_prte_torchrun_log_marks_c9_through_runtime_mapping(machine):
+    state_machine, ctx, _ = machine
+    ctx.run_state = RunState.RUNNING
+    runtime = object.__new__(RuntimeContext)
+    runtime.runtime_args = {
+        "slots_per_node": 4, "mpi_ranks_per_node": 1, "required_nodes_num": 2,
+    }
+    runtime.node_pool_proxy = ctx.node_pool_proxy
+    ctx.handle_runtime_fault = runtime.handle_runtime_fault
+    running_nodes = ["p8c7", "p8c9"]
+    marked = []
+    ctx.node_pool_proxy.add_fault_nodes_no.side_effect = (
+        lambda index, fault_reason: marked.append(running_nodes[index])
+    )
+    payload = parse_error_log(
+        "Process name: [prterun-p8c7-27072@1,1] Exit code: 1"
+    )
+    # FaultHandler renames this field before publishing to the state machine.
+    data = payload["data"]
+    data["fault_info"] = data.pop("fault_pid")
+    assert state_machine.on_event(
+        Event(EventType.LOG_MONITOR, payload)
+    ) is JobCommand.STOP_TRAINING
+    assert marked == ["p8c9"]
+
+
+def test_unknown_legacy_mpi_layout_does_not_restart_blindly(machine):
+    state_machine, ctx, notify = machine
+    ctx.run_state = RunState.RUNNING
+    ctx.handle_runtime_fault.return_value = False
+    assert state_machine.on_event(Event(EventType.LOG_MONITOR, {
+        "type": "exit",
+        "data": {"type": "rank", "fault_info": "[[1,1],1]"},
+    })) is JobCommand.NONE
     assert ctx.run_state is RunState.RUNNING
     notify.send_feishu_alert.assert_called_once()
 

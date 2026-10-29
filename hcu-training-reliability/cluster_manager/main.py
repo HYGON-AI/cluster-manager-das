@@ -86,6 +86,12 @@ def parse_args():
     # 训练参数（保持原有使用方式）
     parser.add_argument("--nodes_num", type=int, default=None, help="required nodes number")
     parser.add_argument("--slots", type=int, default=None, help="slots per node")
+    parser.add_argument(
+        "--mpi-ranks-per-node", "--mpi_ranks_per_node",
+        type=int, default=os.getenv("MPI_RANKS_PER_NODE"),
+        help="MPI processes per node in the training script (1 for mpirun + torchrun); "
+             "required for MPI exit fallback, independent of --slots",
+    )
     parser.add_argument("--exec", type=str, default=None, help="executable training script path")
     parser.add_argument("--hostfile", type=str, default=None, help="hostfile path")
     parser.add_argument("--job_name", type=str, default=None, help="Job name for this training job")
@@ -114,6 +120,9 @@ def build_runtime_args(args) -> dict:
         "sbatch_script": args.sbatch_script,
         "cluster_schedule": global_config.CLUSTER_SCHEDULE,
     }
+    mpi_ranks_per_node = getattr(args, "mpi_ranks_per_node", None)
+    if mpi_ranks_per_node is not None:
+        runtime_args["mpi_ranks_per_node"] = mpi_ranks_per_node
     return runtime_args
 
 def to_abs_path(path: str) -> str:
@@ -130,6 +139,13 @@ def validate_training_args(args) -> str:
             "CLUSTER_LAUNCH_MODE must be mpi, mpi_docker, or docker "
             "(aliases: mpi-docker, docker_exec, docker-exec), "
             f"got: {launch_mode}"
+        )
+
+    run_nhc_exec_mode = os.getenv("RUN_NHC_EXEC_MODE", "host").strip().lower()
+    if run_nhc_exec_mode not in ("host", "container"):
+        raise ValueError(
+            "RUN_NHC_EXEC_MODE must be host or container, "
+            f"got: {run_nhc_exec_mode}"
         )
 
     schedule = global_config.CLUSTER_SCHEDULE
@@ -168,6 +184,12 @@ def validate_training_files(args, schedule: str) -> None:
         raise ValueError(f"--nodes_num must be a positive integer, got: {args.nodes_num}")
     if args.slots <= 0:
         raise ValueError(f"--slots must be a positive integer, got: {args.slots}")
+    mpi_ranks_per_node = getattr(args, "mpi_ranks_per_node", None)
+    if mpi_ranks_per_node is not None and mpi_ranks_per_node <= 0:
+        raise ValueError(
+            "--mpi-ranks-per-node must be a positive integer, "
+            f"got: {mpi_ranks_per_node}"
+        )
     # In Docker mode the training script may exist only inside the container;
     # DOCKER_EXEC_PATH is then the authoritative path used by the launcher.
     exec_available_locally = os.path.isfile(args.exec) and os.access(args.exec, os.R_OK)

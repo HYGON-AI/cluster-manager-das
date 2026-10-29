@@ -28,6 +28,11 @@ TRIAN_PATH="/path/to/train.sh"
 export MEGATRON_SCRIPT_PATH="${TRIAN_PATH}"
 NODES_NUM=1024
 SLOTS=8
+# 每节点 MPI 进程数，默认等于 SLOTS，适用于 MPI 直接启动各训练进程。
+# mpirun 每节点启动一个 torchrun 时必须改为 1：
+# MPI_RANKS_PER_NODE=1 bash start.sh
+# 仅用于 MPI/prterun 退出日志的故障节点映射，不控制训练节点数或 GPU 数。
+export MPI_RANKS_PER_NODE="${MPI_RANKS_PER_NODE:-${SLOTS}}"
 RUN_PATH="/path/to/run.sh"
 
 HOSTFILE="/path/to/hostfile"
@@ -41,6 +46,7 @@ conda activate conda_env_name
 nohup python /path/to/cluster-manager-das/hcu-training-reliability/cluster_manager/main.py \
   --nodes_num "${NODES_NUM}" \
   --slots "${SLOTS}" \
+  --mpi-ranks-per-node "${MPI_RANKS_PER_NODE}" \
   --exec "${RUN_PATH}" \
   --hostfile "${HOSTFILE}" \
   --job_id "${JOB_ID}" \
