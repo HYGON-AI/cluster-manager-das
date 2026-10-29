@@ -24,4 +24,5 @@ hcu-cluster-run = "cluster_run.__main__:entrypoint"
 include = ["hcu_envcheck*", "cluster_run*"]
 
 [tool.setuptools.package-data]
-cluster_run = ["payloads/*.sh", "baselines/*.example", "cluster_env.conf.example", "common.sh"]
+cluster_run = ["*.sh", "baselines/*.example", "cluster_env.conf.example"]
+hcu_envcheck = ["*.sh", "payloads/*.sh"]

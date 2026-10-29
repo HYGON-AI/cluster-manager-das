@@ -61,17 +61,6 @@ class ShellBootstrapTests(unittest.TestCase):
                 self.assertIn("hcu-cluster-run", result.stdout)
         self.assertFalse(self.capture.exists())
 
-    def test_controller_environment_selects_python_without_default_python(self):
-        script = self.directory / "controller env.sh"
-        script.write_text(
-            f"export HCU_ENVCHECK_PYTHON='{shell_path(self.python)}'\n"
-            "export CONTROLLER_MARK=loaded\n", encoding="utf-8")
-        result = self.run_entry("shared-conda", "resource", "-f", "nodes.txt",
-                                "--controller-env-script", shell_path(script),
-                                env=dict(self.env, HCU_ENVCHECK_PYTHON="/unavailable"))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.directory / "mark").read_text(), "loaded")
-        self.assertNotIn(b"controller-env-script", self.capture.read_bytes())
 
     def test_explicit_controller_python_overrides_legacy_environment(self):
         result = self.run_entry("--controller-python=" + shell_path(self.python),
@@ -79,34 +68,21 @@ class ShellBootstrapTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.capture.read_bytes(), b"-m\x00cluster_run\x00--help\x00")
 
-    def test_target_environment_is_never_sourced_and_payload_values_are_opaque(self):
-        script = self.directory / "target env.sh"
+
+    def test_bash_core_does_not_load_controller_environment_or_python(self):
+        hostfile = self.directory / "nodes.txt"
+        hostfile.write_text("n01\n", encoding="utf-8")
+        script = self.directory / "unused controller env.sh"
         script.write_text("exit 91\n", encoding="utf-8")
-        args = ["shared-conda", "script", "-f", "nodes.txt", "--env-script", shell_path(script),
-                "--script", "/share/with spaces/check.py", "--script-arg", "--controller-python",
-                "--script-arg", "--help"]
-        result = self.run_entry(*args)
+        result = self.run_entry(
+            "shared-conda", "resource", "-f", shell_path(hostfile), "--dry-run",
+            "--output-dir", shell_path(self.directory / "dry-run"),
+            "--controller-env-script", shell_path(script),
+            env=dict(self.env, HCU_ENVCHECK_PYTHON="/unavailable"),
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.capture.read_bytes().decode().split("\0")[:-1],
-                         ["-m", "cluster_run", *args])
-
-    def test_controller_setup_failure_is_not_ignored(self):
-        script = self.directory / "bad.sh"
-        script.write_text("false\nexport CONTROLLER_MARK=should-not-run\n", encoding="utf-8")
-        result = self.run_entry("--controller-env-script", shell_path(script), "shared-conda", "resource")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("controller environment setup failed", result.stderr)
+        self.assertIn("resource", result.stdout)
         self.assertFalse(self.capture.exists())
-
-    def test_invalid_bootstrap_options_have_actionable_errors(self):
-        for args in (("--controller-python",), ("--controller-env-script", "relative.sh", "shared-conda")):
-            with self.subTest(args=args):
-                result = self.run_entry(*args)
-                self.assertEqual(result.returncode, 3, result.stderr)
-                self.assertIn("requires", result.stderr)
-        result = self.run_entry("shared-conda", "resource", env=dict(self.env, MOCK_VERSION_RC="1"))
-        self.assertEqual(result.returncode, 69)
-        self.assertIn("--controller-env-script", result.stderr)
 
     @unittest.skipIf(os.name == "nt", "POSIX unlinked cwd semantics")
     def test_deleted_cwd_recovers_before_python_exec(self):

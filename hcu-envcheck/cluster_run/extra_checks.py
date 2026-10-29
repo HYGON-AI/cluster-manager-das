@@ -1,18 +1,9 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-"""Execution adapters for existing NHC, IB state and paired IB tests.
+"""Execution adapters for per-node IB state and paired IB bandwidth.
 
-Platform uses the IB-state adapter internally; NHC remains a public operation.
-Both run once per node and never launch a bandwidth workload.
-``run_group_ib`` accepts ONE already-selected group: it reuses cluster_checks'
-IB inventory, directed per-HCA plan, server/client execution and parsers. The
-caller owns grouping/slots and the RemoteTaskSession for all selected nodes.
-Pass session.config, session.run_token and session.cancel_event to these
-functions while session.signal_handlers() is installed. Managed processes
-live inside the selected host/container scope so session cleanup can find them.
-
-Each invocation requires its own output_dir. No remote Python, MPI or torchrun
-is used by these adapters. env.sh and commands must be visible in target scope.
+The caller owns grouping and the RemoteTaskSession. Commands execute inside
+the selected host/container scope; each invocation owns its output directory.
 """
 
 from __future__ import annotations
@@ -32,7 +23,6 @@ from hcu_envcheck.cluster_checks import (
     ClusterExtraCheckConfig,
     IBStateCheckConfig,
     IBWriteBandwidthConfig,
-    NHCCheckConfig,
     run_cluster_extra_checks,
 )
 from hcu_envcheck.output import atomic_write_text_exclusive
@@ -55,7 +45,7 @@ def _run(
     output_dir: str | Path, execution_config: BaremetalExecutionConfig | None,
     run_token: str | None, cancel_event: Event | None,
     runner: Callable, which: Callable[[str], str | None] | None,
-    dry_run: bool,
+    dry_run: bool, guard_file: str | Path | None = None,
 ) -> dict:
     if scope not in {"host", "container"}:
         raise ValueError("scope must be host or container")
@@ -66,6 +56,7 @@ def _run(
     if isinstance(nodes, (str, bytes)):
         raise ValueError("nodes must be a sequence of node names, not a string")
     env_script = _target_text(env_script, "env_script") if env_script is not None else None
+    guard_file = _target_text(guard_file, "guard_file") if guard_file is not None else None
     if container_workdir is not None:
         container_workdir = _target_text(container_workdir, "container_workdir")
         if not container_workdir.startswith("/"):
@@ -88,7 +79,8 @@ def _run(
         # timeout bounds remote lifetime even if the control connection fails.
         inner = managed_command(
             ["timeout", "--signal=TERM", "--kill-after=5s", f"{timeout_seconds:g}s",
-             *bootstrap_command(env_script, command, workdir=container_workdir)], token)
+             *bootstrap_command(env_script, command, workdir=container_workdir)], token,
+            **({"guard_file": guard_file} if guard_file is not None else {}))
         if scope == "container":
             return ["docker", "exec", *(["--workdir", container_workdir] if container_workdir else []),
                     str(container), *inner]
@@ -106,10 +98,8 @@ def _run(
         report.update(status="CANCELLED", returncode=130, reason_code="TASK_CANCELLED",
                       nodes=[{"node": node, "status": "CANCELLED"} for node in nodes])
     elif dry_run:
-        cfg = config.nhc if operation == "nhc" else config.ib_state
-        command = cfg.argv() if operation == "nhc" else list(cfg.command)
-        if operation == "nhc" and cfg.environment:
-            command = ["env", *(f"{name}={value}" for name, value in sorted(cfg.environment.items())), *command]
+        cfg = config.ib_state
+        command = list(cfg.command)
         report.update(status="DRY_RUN", returncode=0, command=wrap(command, cfg.timeout_seconds),
                       nodes=[{"node": node, "status": "DRY_RUN"} for node in nodes])
         if operation == "ib-write-bw":
@@ -123,7 +113,7 @@ def _run(
             output_root=root / "evidence", runner=runner, which=which or shutil.which,
             command_wrapper=wrap, cancel_event=event,
         )
-        key = {"nhc": "nhc", "ib-state": "ib_state", "ib-write-bw": "ib_write_bw"}[operation]
+        key = {"ib-state": "ib_state", "ib-write-bw": "ib_write_bw"}[operation]
         check = result[key]
         report.update(check)
         report["check_status"] = check["status"]
@@ -140,24 +130,6 @@ def _run(
     return report
 
 
-def run_nhc(
-    nodes: Sequence[str], *, config: NHCCheckConfig | None = None,
-    env_script: str | Path | None, scope: str = "host", container: str | None = None,
-    container_workdir: str | None = None, transport: str = "ssh", concurrency: int = 16,
-    output_dir: str | Path, execution_config: BaremetalExecutionConfig | None = None,
-    run_token: str | None = None, cancel_event: Event | None = None,
-    runner: Callable = subprocess.run, which: Callable[[str], str | None] | None = None,
-    dry_run: bool = False,
-) -> dict:
-    """Run real NHC per node, preserving command/config/selected/removed/env args."""
-    return _run(nodes, operation="nhc", config=ClusterExtraCheckConfig(
-        nhc=replace(config or NHCCheckConfig(), enabled=True)), env_script=env_script,
-        scope=scope, container=container, container_workdir=container_workdir,
-        transport=transport, concurrency=concurrency, output_dir=output_dir,
-        execution_config=execution_config, run_token=run_token, cancel_event=cancel_event,
-        runner=runner, which=which, dry_run=dry_run)
-
-
 def run_ib_state(
     nodes: Sequence[str], *, config: IBStateCheckConfig | None = None,
     env_script: str | Path | None, scope: str = "host", container: str | None = None,
@@ -165,7 +137,7 @@ def run_ib_state(
     output_dir: str | Path, execution_config: BaremetalExecutionConfig | None = None,
     run_token: str | None = None, cancel_event: Event | None = None,
     runner: Callable = subprocess.run, which: Callable[[str], str | None] | None = None,
-    dry_run: bool = False,
+    dry_run: bool = False, guard_file: str | Path | None = None,
 ) -> dict:
     """Read ibstat state per node; this function never starts perftest traffic."""
     return _run(nodes, operation="ib-state", config=ClusterExtraCheckConfig(
@@ -173,7 +145,7 @@ def run_ib_state(
         scope=scope, container=container, container_workdir=container_workdir,
         transport=transport, concurrency=concurrency, output_dir=output_dir,
         execution_config=execution_config, run_token=run_token, cancel_event=cancel_event,
-        runner=runner, which=which, dry_run=dry_run)
+        runner=runner, which=which, dry_run=dry_run, guard_file=guard_file)
 
 
 def run_group_ib(
@@ -184,7 +156,7 @@ def run_group_ib(
     output_dir: str | Path, execution_config: BaremetalExecutionConfig | None = None,
     run_token: str | None = None, cancel_event: Event | None = None,
     runner: Callable = subprocess.run, which: Callable[[str], str | None] | None = None,
-    dry_run: bool = False,
+    dry_run: bool = False, guard_file: str | Path | None = None,
 ) -> dict:
     """Run existing bidirectional, per-HCA server/client algorithm for ONE group.
 
@@ -200,4 +172,4 @@ def run_group_ib(
         scope=scope, container=container, container_workdir=container_workdir,
         transport=transport, concurrency=concurrency, output_dir=output_dir,
         execution_config=execution_config, run_token=run_token, cancel_event=cancel_event,
-        runner=runner, which=which, dry_run=dry_run)
+        runner=runner, which=which, dry_run=dry_run, guard_file=guard_file)

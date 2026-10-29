@@ -37,6 +37,33 @@ Hardware-, Slurm-, MPI-, Kubernetes-, or HCU-dependent changes must describe
 the environment and integration validation performed. Unit tests alone do not
 establish production compatibility.
 
+### hcu-envcheck 单元测试
+
+建议在 Linux 环境运行，要求安装 Git、Python ≥3.10 和 Bash。单测使用 Python
+标准库 `unittest`，无需安装 pytest。
+
+在希望保存代码的目录打开终端，执行：
+
+```bash
+# 克隆代码仓
+git clone https://github.com/HYGON-AI/cluster-manager-das.git
+
+# 进入克隆后的 hcu-envcheck 子目录
+cd cluster-manager-das/hcu-envcheck
+
+# 执行全部单元测试
+python3 -B -m unittest discover -s tests -v
+```
+
+`cd` 使用相对于当前目录的路径，不依赖特定服务器、账号或共享目录。
+
+测试成功时末尾显示 `OK`；若存在环境相关跳过项，会显示 `OK (skipped=N)`，应查看
+具体跳过原因。部分进程控制用例依赖 Linux，特定权限下可能跳过。用例数量随代码
+变化，不固定写入文档。
+
+单元测试用于验证程序逻辑，不能替代真实集群上的容器、通信和算子测试。
+`scripts/test.sh` 属于功能验收入口，会访问配置中的节点。
+
 ## Licensing and provenance
 
 New original, commentable source files should carry:

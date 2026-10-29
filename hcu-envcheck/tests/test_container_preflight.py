@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from cluster_run.active import ActiveTestExecutor
-from cluster_run.launchers import LaunchContext, build_mpirun_command
 from cluster_run.preflight import ContainerPreflightError, evaluate_container_inventory, fold_node_names, grouped_issue_lines, run_container_preflight
 
 
@@ -44,7 +43,7 @@ class ContainerPreflightTests(unittest.TestCase):
             ["node01", "node02"],
             {"node01": remote(), "node02": remote(success=False, stderr="Error: No such object: zy-bridge2")},
             container_name="zy-bridge2", expected_image=IMAGE,
-            launcher="mpirun-torchrun", allow_root_mpi=False,
+            launcher="mpirun", allow_root_mpi=False,
         )
         codes = {(issue["node"], issue["code"]) for issue in evaluated["issues"]}
         self.assertIn(("node01", "MPI_ROOT_FORBIDDEN"), codes)
@@ -57,7 +56,7 @@ class ContainerPreflightTests(unittest.TestCase):
              "node02": remote(image_id="sha256:" + "b" * 64, user="1000"),
              "node03": remote(name="other", user="1000")},
             container_name="zy-bridge2", expected_image=None,
-            launcher="ssh-torchrun", allow_root_mpi=False,
+            launcher="direct", allow_root_mpi=False,
         )
         codes = {issue["code"] for issue in evaluated["issues"]}
         self.assertIn("CONTAINER_IMAGE_INCONSISTENT", codes)
@@ -65,15 +64,17 @@ class ContainerPreflightTests(unittest.TestCase):
         self.assertNotIn("MPI_ROOT_FORBIDDEN", codes)
 
     def test_root_mpi_requires_explicit_opt_in_for_command(self):
-        context = LaunchContext(
-            test_name="rccl", launcher="mpirun", env_script="/share/env.sh",
-            group_name="group-000", group_hostfile=Path("/share/hostfile"),
-            nodes=("node01", "node02"), test_command=("python3", "test.py"),
-            nproc_per_node=1, np=None, master_port=29500,
-        )
-        self.assertNotIn("--allow-run-as-root", build_mpirun_command(context))
-        allowed = LaunchContext(**{**context.__dict__, "allow_root_mpi": True})
-        self.assertIn("--allow-run-as-root", build_mpirun_command(allowed))
+        for scope, allowed in (("host", False), ("container", True)):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temp:
+                report, _ = ActiveTestExecutor(
+                    scenario="shared-conda" if scope == "host" else "per-node-container",
+                    test_name="rccl", launcher="mpirun", env_script="/share/env.sh",
+                    nodes=("node01", "node02"), output_dir=Path(temp), group_size=2, slots=8,
+                    execution_scope=scope, container_name="worker" if allowed else None, dry_run=True,
+                ).run()
+                self.assertEqual(report["allow_root_mpi"], allowed)
+                body = report["groups"][0]["commands"][0]["command"][-1]
+                self.assertIn("HCU_ALLOW_ROOT_MPI=" + ("1" if allowed else "0"), body)
 
     def test_missing_container_without_image_option_does_not_report_local_image(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -83,7 +84,7 @@ class ContainerPreflightTests(unittest.TestCase):
                 })
                 report = run_container_preflight(
                     nodes=["node01"], container_name="zy-bridge2", expected_image=None,
-                    launcher="mpirun-torchrun", allow_root_mpi=False,
+                    launcher="mpirun", allow_root_mpi=False,
                     env_script="/share/env.sh", container_shell="bash",
                     transport="ssh", concurrency=1, run_dir=Path(temp),
                 )
@@ -111,7 +112,7 @@ class ContainerPreflightTests(unittest.TestCase):
                     with patch("cluster_run.preflight.build_remote_probe_command", return_value=["python3", "probe"]):
                         report = run_container_preflight(
                             nodes=["node01"], container_name="zy-bridge2", expected_image=IMAGE,
-                            launcher="ssh-torchrun", allow_root_mpi=False,
+                            launcher="direct", allow_root_mpi=False,
                             env_script="/share/env.sh", container_shell="bash",
                             transport="ssh", concurrency=1, run_dir=root,
                         )
@@ -124,7 +125,7 @@ class ContainerPreflightTests(unittest.TestCase):
             active = ActiveTestExecutor(
                 scenario="per-node-container", test_name="rccl", nodes=["node01"],
                 env_script="/share/env.sh", output_dir=root, group_size=1,
-                slots=1, launcher="mpirun-torchrun", execution_scope="container",
+                slots=1, launcher="mpirun", execution_scope="container",
                 container_name="zy-bridge2",
             )
             with patch("cluster_run.active.run_container_preflight", return_value=report):
@@ -145,7 +146,7 @@ class ContainerPreflightTests(unittest.TestCase):
                 })
                 report = run_container_preflight(
                     nodes=["node01"], container_name="worker", expected_image=None,
-                    launcher="ssh-torchrun", allow_root_mpi=False,
+                    launcher="direct", allow_root_mpi=False,
                     env_script="/share/env.sh", container_shell="bash",
                     transport="ssh", concurrency=1, run_dir=Path(temp), check_idle=False,
                 )

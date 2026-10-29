@@ -19,42 +19,72 @@ from cluster_run.cli import _log, _log_basic_execution, build_parser, main
 from cluster_run.consistency import build_consistency_summary
 from cluster_run.env import bootstrap_command, source_body
 from cluster_run.hostfile import materialize_groups, split_nodes
-from cluster_run.launchers import LaunchContext, build_mpirun_command, build_ssh_torchrun_commands
-from cluster_run.testsuites import resolve_test_command
 from cluster_run.preflight import ContainerPreflightError
-from cluster_run.payloads import ib_write_bw_worker
-from cluster_run.payloads import rccl_worker
+from hcu_envcheck.group_logs import archive_text
+from tests.test_launch_contract import run_cli
+
+
+def controller_failure(case, mode):
+    # Reuse the existing transport fixture's real reporter, facts serializer,
+    # token guard, cleanup and FIFO handling. Extend only its CPU payload.
+    from tests import test_controller_safety as safety
+    fixture = safety.ControllerSafetyTests("runTest")
+    fixture.setUp()
+    case.addCleanup(fixture.doCleanups)
+    body = safety.TOOL.replace("phase, stage, token = sys.argv[1:4]",
+                               "phase, stage, token = sys.argv[1:4]\n    runtime = pathlib.Path(sys.argv[4])")
+    body = body.replace("    print('FIXTURE_RAW_END phase='+phase+' stage='+stage, flush=True)", r'''
+    if phase == 'prepare' and mode == 'rccl-launch-failure':
+        owner = identity(runtime)
+        directory = runtime/'devices'
+        directory.mkdir(exist_ok=True)
+        (directory/'n01.json').write_text(json.dumps(dict(schema_version=1, node='n01', gpus_per_node=8,
+            hip_visible_devices='0,1,2,3,4,5,6,7', pci_devices=[f'0000:{i+3:02x}:00.0' for i in range(8)],
+            handoff={key:owner[key] for key in ('group','stage_id','phase','token')})))
+        tests = ('all_reduce','all_gather','broadcast','reduce','reduce_scatter','gather','scatter','alltoall','alltoallv','sendrecv')
+        (runtime/'rccl-plan.tsv').write_text('test\tnp\tbaseline_busbw_gbps\tmargin_pct\n'+''.join(t+'\t8\t100\t1\n' for t in tests))
+    if phase == 'execute' and mode == 'rccl-launch-failure':
+        print('mpirun: launcher failed', file=sys.stderr, flush=True)
+        raise SystemExit(127)
+    print('FIXTURE_RAW_END phase='+phase+' stage='+stage, flush=True)''')
+    body = body.replace("    print('true|fixture/image:local|fixture-container-id')", """
+    event('container-inspect')
+    if mode == 'missing-container':
+        print('No such container: fixture-container', file=sys.stderr)
+        raise SystemExit(1)
+    print('true|fixture/image:local|fixture-container-id')""")
+    body = body.replace("str(root/'bin/fixture-payload'), phase, stage, token]",
+                        "str(root/'bin/fixture-payload'), phase, stage, token, str(runtime)]")
+    for name in ("ssh", "cat", "mv", "timeout", "fixture-payload"):
+        (fixture.root / "bin" / name).write_text(body, encoding="utf-8")
+    fixture.start(mode, operation="rccl", timeout=10)
+    result = fixture.finish(seconds=60)
+    return result, fixture.state(), fixture.events()
 
 
 class ClusterRunEnvironmentTests(unittest.TestCase):
-    def test_relative_output_dir_materializes_absolute_group_hostfile(self):
+    def test_relative_output_dir_dry_run_preserves_absolute_group_plan_without_artifacts(self):
         with tempfile.TemporaryDirectory() as temp:
-            original = Path.cwd()
-            try:
-                os.chdir(temp)
-                Path("hosts").write_text("node01\nnode02\n", encoding="utf-8")
-                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    rc = main(["shared-conda", "rccl", "-f", "hosts",
-                               "--profile", "worker",
-                               "--env-script", "/share/env.sh", "--group-size", "2",
-                               "--dry-run", "-o", "relative-out"])
-                self.assertEqual(rc, 0)
-                report = json.loads(next(Path("relative-out").glob("conda_rccl_*/active-result.json")).read_text())
-                body = report["groups"][0]["commands"][0]["command"][-1]
-                # Rank guard is a quoted multiline argv; parse the complete exec.
-                argv = shlex.split(body.split("\nexec ", 1)[1])
-                self.assertTrue(Path(argv[argv.index("--hostfile") + 1]).is_absolute())
-            finally:
-                os.chdir(original)
-
-    def test_ib_binary_presence_does_not_count_as_bandwidth_pass(self):
-        output = io.StringIO()
-        with patch("cluster_run.payloads.ib_write_bw_worker.shutil.which", return_value="/usr/bin/ib_write_bw"):
-            with redirect_stdout(output):
-                rc = ib_write_bw_worker.main([])
-        self.assertNotEqual(rc, 0)
-        payload = json.loads(output.getvalue())
-        self.assertEqual(payload["status"], "PREREQUISITE_ONLY")
+            root = Path(temp)
+            (root / "hosts").write_text("node01\nnode02\n", encoding="utf-8")
+            result, calls = run_cli(self, ["shared-conda", "rccl", "-f", "hosts", "--env-script", "/share/env.sh",
+                                         "--group-size", "2", "--dry-run", "-o", "relative-out"], cwd=root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("nodes=2 groups=1 group-size=2 gpus-per-node=8", result.stdout)
+            self.assertIn("PARTICIPATING node01,node02", result.stdout)
+            self.assertEqual(sum(line.startswith("STAGE ") for line in result.stdout.splitlines()), 10)
+            self.assertEqual(calls, [])
+            self.assertFalse((root / "relative-out").exists())
+            # Retained Python adapter still materializes absolute group paths.
+            executor = ActiveTestExecutor(scenario="shared-conda", test_name="rccl", nodes=["node01", "node02"],
+                env_script="/share/env.sh", output_dir=root / "relative-out", group_size=2, slots=1,
+                launcher="mpirun", dry_run=True)
+            report, output = executor.run()
+            body = report["groups"][0]["commands"][0]["command"][-1]
+            argv = shlex.split(body.split("\nexec ", 1)[1])
+            hostfile = Path(argv[argv.index("bash") + 2])
+            self.assertTrue(hostfile.is_absolute())
+            self.assertEqual(hostfile.read_text().splitlines(), ["node01 slots=8", "node02 slots=8"])
 
     def test_ib_prerequisite_output_is_incomplete_not_pass(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -68,14 +98,6 @@ class ClusterRunEnvironmentTests(unittest.TestCase):
             self.assertEqual(executor._result_status(2, evidence), "FAIL")
             self.assertEqual(executor._result_status(255, "ssh failed"), "FAIL")
 
-    def test_single_rank_rccl_never_claims_collective_pass(self):
-        output = io.StringIO()
-        topology = {"rank": 0, "world_size": 1, "local_rank": 0, "host": "n01"}
-        with patch("cluster_run.payloads.rccl_worker.configure_direct_mpi_environment", return_value=topology):
-            with redirect_stdout(output):
-                rc = rccl_worker.main([])
-        self.assertEqual(rc, 2)
-        self.assertEqual(json.loads(output.getvalue())["status"], "INCOMPLETE")
 
     def test_missing_hostfile_error_includes_operation_and_path(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -118,46 +140,37 @@ class ClusterRunEnvironmentTests(unittest.TestCase):
         self.assertIn("transport_metadata=", output_every)
 
     def test_failed_active_group_prints_stderr_path_and_excerpt(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            hostfile = root / "hostfile"
-            hostfile.write_text("node01\n", encoding="utf-8")
-            group_dir = root / "groups" / "group-000"
-            group_dir.mkdir(parents=True)
-            (group_dir / "stderr.log").write_text("mpirun: launcher failed\n", encoding="utf-8")
-            report = {"status": "FAIL", "group_count": 1, "group_slots": 1,
-                      "launcher": "mpirun", "groups": [{"group": "group-000", "nodes": ["node01"],
-                      "status": "FAIL", "leader": "node01", "returncode": 127}]}
-            with patch("cluster_run.cli.ActiveTestExecutor") as executor:
-                executor.return_value.run.return_value = report, root
-                stderr = io.StringIO()
-                with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
-                    rc = main(["shared-conda", "rccl", "-f", str(hostfile),
-                               "--env-script", "/remote/env.sh", "--launcher", "mpirun"])
-        self.assertEqual(rc, 2)  # The current operation failed; this never gates another command.
-        self.assertIn("returncode=127", stderr.getvalue())
-        self.assertIn("mpirun: launcher failed", stderr.getvalue())
+        result, state, events = controller_failure(self, "rccl-launch-failure")
+        self.assertEqual(result[0], 1, result)
+        report = json.loads((state / "report.json").read_text())
+        self.assertEqual(report["status"], "FAIL")
+        facts = json.loads((state / "prepared/group-001/facts.json").read_text())
+        table = facts["tables"]["tasks"]
+        tasks = [dict(zip(table["fields"], row)) for row in table["rows"]]
+        executed = [task for task in tasks if task["phase"] == "execute"]
+        self.assertEqual(len(executed), 10)
+        self.assertTrue(all(task["execution_exit_code"] == "127" and task["status"] == "FAIL" for task in executed))
+        self.assertTrue(all(task["cleanup"] == "CONFIRMED" for task in tasks))
+        log = state.parent / "group-001.log"
+        self.assertEqual(log.read_text().count("mpirun: launcher failed"), 10)
+        self.assertIn("group-001.log", (state.parent / "summary.md").read_text())
+        self.assertIn(str(state.parent / "summary.md"), result[1] + result[2])
+        self.assertEqual(sum(event["event"] == "payload-start" and event["phase"] == "execute" for event in events), 10)
 
     def test_container_precheck_failure_returns_reason_without_launch(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            hostfile = root / "hostfile"
-            hostfile.write_text("node01\n", encoding="utf-8")
-            preflight = {"status": "FAIL", "issues": [{"node": "node01", "code": "CONTAINER_MISSING", "message": "container missing"}],
-                         "recreate_command_template": "bin/hcu-cluster-run ... --recreate"}
-            with patch("cluster_run.cli.ActiveTestExecutor") as executor:
-                executor.return_value.run.side_effect = ContainerPreflightError(preflight)
-                stderr = io.StringIO()
-                stdout = io.StringIO()
-                with redirect_stdout(stdout), redirect_stderr(stderr):
-                    rc = main(["per-node-container", "rccl", "-f", str(hostfile),
-                               "--env-script", "/remote/env.sh", "--container", "worker",
-                               "-i", "image:tag"])
-        self.assertEqual(rc, 3)
-        self.assertIn("CONTAINER_MISSING", stderr.getvalue())
-        self.assertIn("not run automatically", stderr.getvalue())
-        self.assertIn("PRECHECK_FAILED", stdout.getvalue())
-        self.assertNotIn("PREFLIGHT", stdout.getvalue())
+        result, state, events = controller_failure(self, "missing-container")
+        self.assertEqual(result[0], 1, result)
+        report = json.loads((state / "report.json").read_text())
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual([(row["status"], row["dispatched"]) for row in report["results"]], [("BLOCKED", False)] * 10)
+        self.assertEqual(report["preflight"][0]["status"], "FAIL")
+        log = (state.parent / "group-001.log").read_text()
+        self.assertIn("container/image mismatch", log)
+        self.assertIn("No such container: fixture-container", log)
+        self.assertFalse(any(event["event"] == "payload-start" for event in events))
+        self.assertFalse(any(event["event"] == "target-command" for event in events))
+        self.assertTrue(any(event["event"] == "container-inspect" for event in events))
+        self.assertIn("RESULT        FAIL", result[1])
 
     def test_ib_state_is_integrated_into_platform_not_a_public_operation(self):
         stderr = io.StringIO()
@@ -356,122 +369,14 @@ class ClusterRunConsistencyTests(unittest.TestCase):
 
 
 class ClusterRunLauncherTests(unittest.TestCase):
-    def _context(self, launcher: str) -> LaunchContext:
-        return LaunchContext(
-            test_name="rccl",
-            launcher=launcher,
-            env_script="/share/hcu/env.sh",
-            group_name="group-000",
-            group_hostfile=Path("/share/job/group-000/hostfile"),
-            nodes=("node01", "node02"),
-            test_command=("bash", "test.sh"),
-            nproc_per_node=8,
-            np=None,
-            master_port=29500,
-        )
 
-    def test_default_mpirun_torchrun_has_torchrun_and_bootstrap(self):
-        command = build_mpirun_command(self._context("mpirun-torchrun"))
-        text = json.dumps(command)
-        self.assertIn("mpirun", command[0])
-        self.assertIn("torch.distributed.run", text)
-        self.assertIn("/share/hcu/env.sh", text)
-        self.assertIn("HCU_RANK", text)
-        self.assertEqual(command[command.index("--map-by") + 1], "ppr:1:node")
-        self.assertIn("set -e\\nsource", text)
-
-    def test_mpi_rank_has_its_own_remote_timeout(self):
-        original = self._context("mpirun-torchrun")
-        bounded = LaunchContext(**{**original.__dict__, "timeout_seconds": 60})
-        command = build_mpirun_command(bounded)
-        self.assertIn("timeout --signal=TERM --kill-after=15s 60s python3 -m torch.distributed.run", command[-1])
-
-    def test_direct_mpirun_uses_mpi_rank_normalization(self):
-        command = build_mpirun_command(self._context("mpirun"))
-        text = json.dumps(command)
-        self.assertIn("OMPI_COMM_WORLD_RANK", text)
-        self.assertNotIn("torchrun", text)
-        self.assertEqual(command[command.index("--map-by") + 1], "ppr:8:node")
-
-    def test_direct_mpirun_rejects_partial_node_rank_layout(self):
-        original = self._context("mpirun")
-        partial = LaunchContext(**{**original.__dict__, "np": 2})
-        with self.assertRaisesRegex(ValueError, "--np must equal"):
-            build_mpirun_command(partial)
-
-    def test_ssh_torchrun_assigns_rank_by_group_hostfile_order(self):
-        commands = build_ssh_torchrun_commands(self._context("ssh-torchrun"))
-        self.assertEqual(commands[0][0], "node01")
-        self.assertEqual(commands[1][0], "node02")
-        self.assertIn("__hcu_rank=0;", " ".join(commands[0][1]))
-        self.assertIn("__hcu_rank=1;", " ".join(commands[1][1]))
-        self.assertIn('--node-rank "$HCU_RANK"', commands[1][1][-1])
-
-    def test_torchrun_uses_module_mode_for_builtin_worker(self):
-        self.assertEqual(
-            resolve_test_command("rccl", "ssh-torchrun", script=None, script_args=()),
-            ("-m", "cluster_run.payloads.rccl_worker"),
-        )
-
-    def test_torchrun_supports_shell_custom_payload(self):
-        self.assertEqual(
-            resolve_test_command(
-                "custom", "ssh-torchrun", script="check.sh", script_args=()
-            ),
-            ("--no-python", "bash", "check.sh"),
-        )
-
-    def test_container_mpirun_keeps_rank_command_inside_container(self):
-        context = LaunchContext(
-            test_name="rccl",
-            launcher="mpirun-torchrun",
-            env_script="/share/hcu/env.sh",
-            group_name="group-000",
-            group_hostfile=Path("/share/job/group-000/hostfile"),
-            nodes=("node01", "node02"),
-            test_command=("-m", "cluster_run.payloads.rccl_worker"),
-            nproc_per_node=1,
-            np=None,
-            master_port=29500,
-            execution_scope="container",
-            container_name="hcu-worker",
-            container_workdir="/share/hcu",
-        )
-        command = build_mpirun_command(context)
-        text = json.dumps(command)
-        self.assertIn("OMPI_COMM_WORLD_RANK", text)
-        self.assertIn("cluster_run.payloads.rccl_worker", text)
-
-    def test_container_mpirun_is_submitted_inside_container_scope(self):
-        with tempfile.TemporaryDirectory() as temp:
-            executor = ActiveTestExecutor(
-                profile="worker",
-                scenario="per-node-container",
-                test_name="rccl",
-                nodes=("node01", "node02"),
-                env_script="/share/hcu/env.sh",
-                output_dir=Path(temp),
-                group_size=2,
-                slots=1,
-                launcher="mpirun",
-                script="/share/tests/test.sh",
-                execution_scope="container",
-                container_name="hcu-worker",
-                container_workdir="/share/hcu",
-                dry_run=True,
-            )
-            report, run_dir = executor.run()
-            command = report["groups"][0]["commands"][0]["command"]
-            self.assertEqual(command[:4], ["docker", "exec", "-i", "-w"])
-            self.assertIn("mpirun", json.dumps(command))
-            self.assertTrue((run_dir / "groups" / "group-000" / "launch.json").is_file())
 
     def test_legacy_rccl_shell_owns_group_mpi_launch(self):
         with tempfile.TemporaryDirectory() as temp:
             executor = ActiveTestExecutor(
                 scenario="shared-conda", test_name="rccl", nodes=("node01", "node02"),
                 env_script="/share/env.sh", output_dir=Path(temp), group_size=2,
-                slots=1, launcher="mpirun-torchrun",
+                slots=1, launcher="mpirun",
                 profile="rccl-tests", dry_run=True,
             )
             report, _ = executor.run()
@@ -482,20 +387,6 @@ class ClusterRunLauncherTests(unittest.TestCase):
         self.assertNotIn("torch.distributed.run", json.dumps(group["commands"]))
         self.assertIn("HCU_CLUSTER_ENV_SCRIPT", json.dumps(group["commands"]))
         self.assertIn("--port 22", json.dumps(group["commands"]))
-
-    def test_legacy_gemm_shell_runs_once_on_each_node(self):
-        with tempfile.TemporaryDirectory() as temp:
-            executor = ActiveTestExecutor(
-                scenario="shared-conda", test_name="gemm", nodes=("node01", "node02"),
-                env_script="/share/env.sh", output_dir=Path(temp), group_size=2,
-                slots=1, launcher="mpirun-torchrun",
-                profile="rocblas", dry_run=True,
-            )
-            report, _ = executor.run()
-        group = report["groups"][0]
-        self.assertEqual(group["execution_profile"], "rocblas")
-        self.assertEqual(len(group["commands"]), 2)
-        self.assertNotIn("mpirun", json.dumps(group["commands"]))
 
 
 class ClusterRunRemoteExecutionTests(unittest.TestCase):
@@ -522,7 +413,6 @@ class ClusterRunRemoteExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             with patch("cluster_run.active.BaremetalClusterExecutor", FakeExecutor):
                 executor = ActiveTestExecutor(
-                    profile="worker",
                     scenario="shared-conda",
                     test_name="rccl",
                     nodes=("node01", "node02"),
@@ -531,7 +421,6 @@ class ClusterRunRemoteExecutionTests(unittest.TestCase):
                     group_size=2,
                     slots=1,
                     launcher="mpirun",
-                    script="/share/tests/test.sh",
                 )
                 report, _run_dir = executor.run()
 
@@ -542,30 +431,7 @@ class ClusterRunRemoteExecutionTests(unittest.TestCase):
         remote_command = execute_calls[0][2]
         self.assertIn("hcu-task-guard", remote_command)  # task guard outside env bootstrap
         self.assertIn("source /share/hcu/env.sh", remote_command[-1])
-        self.assertIn("mpirun", remote_command[-1])
-
-
-class ClusterRunDryRunTests(unittest.TestCase):
-    def test_active_dry_run_creates_group_report_without_running_mpirun(self):
-        with tempfile.TemporaryDirectory() as temp:
-            executor = ActiveTestExecutor(
-                scenario="shared-conda",
-                test_name="custom",
-                nodes=("node01", "node02", "node03"),
-                env_script="/share/hcu/env.sh",
-                output_dir=Path(temp),
-                group_size=2,
-                strict_size=False,
-                slots=2,
-                launcher="mpirun",
-                script="/share/tests/test.sh",
-                dry_run=True,
-            )
-            report, run_dir = executor.run()
-            self.assertEqual(report["status"], "DRY_RUN")
-            self.assertEqual(report["group_count"], 2)
-            self.assertTrue((run_dir / "active-result.json").is_file())
-            self.assertTrue((run_dir / "groups" / "group-000" / "launch.json").is_file())
+        self.assertIn("rccl_perf_test.sh", remote_command[-1])
 
 
 if __name__ == "__main__":

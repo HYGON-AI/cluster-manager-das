@@ -30,3 +30,6 @@ dist/
 .env
 .env.*
 !.env.example
+
+# ZCode AI 工具的会话工作目录（如再生成则忽略，不入库）
+.zcode/

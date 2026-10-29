@@ -181,15 +181,15 @@ class RdmaUserspaceEvaluationTests(unittest.TestCase):
         libraries_mock.return_value = {
             "libraries": [],
             "limits": {"max_paths": 256},
-            "explicit_ld_library_path_directories": ["/custom/lib"],
+            "explicit_ld_library_path_directories": ["/site/lib"],
         }
         result = collect_rdma_userspace_evidence(
             [{"name": "shca_0", "ibv_devinfo": {"rc": 0}}],
-            ibv_devices_path="/custom/bin/ibv_devices",
-            ibv_devinfo_path="/custom/bin/ibv_devinfo",
+            ibv_devices_path="/site/bin/ibv_devices",
+            ibv_devinfo_path="/site/bin/ibv_devinfo",
         )
         run_mock.assert_called_once_with(
-            ["/custom/bin/ibv_devices"], timeout=5, limit=64 * 1024
+            ["/site/bin/ibv_devices"], timeout=5, limit=64 * 1024
         )
         self.assertEqual(result["ibv_devices"]["enumerated_devices"], ["shca_0"])
         self.assertEqual(result["provider_configs"]["limits"]["max_files"], 64)

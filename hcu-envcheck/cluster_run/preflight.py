@@ -133,7 +133,7 @@ def evaluate_container_inventory(
             issue(node, "CONTAINER_STOPPED", f"container {container_name!r} is not running")
         if expected_image and image != expected_image:
             issue(node, "CONTAINER_IMAGE_MISMATCH", f"container image {image!r} != requested {expected_image!r}; recreate required")
-        if launcher in {"mpirun", "mpirun-torchrun"} and user.split(":", 1)[0] in {"", "0", "root"} and not allow_root_mpi:
+        if launcher == "mpirun" and user.split(":", 1)[0] in {"", "0", "root"} and not allow_root_mpi:
             issue(node, "MPI_ROOT_FORBIDDEN", "container runs as root but the internal MPI root policy was not enabled")
 
     present = [entry for entry in inventory.values() if entry.get("status") == "PRESENT"]
@@ -258,7 +258,7 @@ def run_container_preflight(
         nodes=nodes, container_name=container_name, expected_image=expected_image,
         transport=transport, concurrency=concurrency, run_dir=run_dir / "preflight", execution_config=execution_config,
     )
-    if launcher in {"mpirun", "mpirun-torchrun"} and not allow_root_mpi:
+    if launcher == "mpirun" and not allow_root_mpi:
         for node in report["ready_nodes"]:
             user = str(report["nodes"][node].get("configured_user") or "").split(":", 1)[0]
             if user in {"", "0", "root", "root (image default)"}:

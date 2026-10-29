@@ -86,6 +86,22 @@ while IFS=' ' read -r policy path rest; do
         || fail "$EX_CANTCREAT" "cannot stage: $path"
 done < "$PROJECT_ROOT/MANIFEST.release"
 
+# Ship the same repository-level legal files that setup.py stages for the
+# Python package so the offline tarball and the wheel carry identical
+# license text. The files live one level above PROJECT_ROOT, next to the
+# repository's own LICENSE.
+repository_root=$(CDPATH= cd -P -- "$PROJECT_ROOT/.." 2>/dev/null && pwd) \
+    || fail "$EX_SOFTWARE" "cannot resolve repository root"
+for legal in LICENSE NOTICE THIRD_PARTY_NOTICES.md; do
+    if [ -e "$stage/$legal" ]; then continue; fi
+    if [ ! -f "$repository_root/$legal" ]; then
+        fail "$EX_SOFTWARE" "required repository legal file not found: $repository_root/$legal"
+    fi
+    cp -- "$repository_root/$legal" "$stage/$legal" \
+        || fail "$EX_CANTCREAT" "cannot stage: $legal"
+    chmod 644 -- "$stage/$legal"
+done
+
 # Never publish interpreter caches or editor/test artifacts.
 find "$stage" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 find "$stage" -type d -name '__pycache__' -exec rm -rf -- {} +

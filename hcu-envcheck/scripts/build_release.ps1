@@ -152,6 +152,20 @@ try {
         Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
     }
 
+    # Ship the same repository-level legal files that setup.py stages for the
+    # Python package so the offline tarball and the wheel carry identical
+    # license text.
+    $RepositoryRoot = Split-Path -Parent $ProjectRoot
+    foreach ($LegalFile in @('LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md')) {
+        $LegalDestination = Join-Path $Stage $LegalFile
+        if (Test-Path -LiteralPath $LegalDestination -PathType Leaf) { continue }
+        $LegalSource = Join-Path $RepositoryRoot $LegalFile
+        if (-not (Test-Path -LiteralPath $LegalSource -PathType Leaf)) {
+            throw "Required repository legal file not found: $LegalSource"
+        }
+        Copy-Item -LiteralPath $LegalSource -Destination $LegalDestination -Force
+    }
+
     $CacheFiles = @(Get-ChildItem -LiteralPath $Stage -Recurse -File |
         Where-Object { $_.Extension -eq '.pyc' -or $_.Extension -eq '.pyo' })
     foreach ($CacheFile in $CacheFiles) {

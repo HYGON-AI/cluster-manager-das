@@ -7,10 +7,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
 "$ROOT/bin/hcu-cluster-run" --help >/dev/null
 for script in \
-    "$ROOT/cluster_run/payloads/check_deepep_env.sh" \
-    "$ROOT/cluster_run/payloads/dcu_idle_check.sh" \
-    "$ROOT/cluster_run/payloads/gemm_perf_test.sh" \
-    "$ROOT/cluster_run/payloads/rccl_perf_test.sh"; do
+    "$ROOT/hcu_envcheck/payloads/check_deepep_env.sh" \
+    "$ROOT/hcu_envcheck/payloads/dcu_idle_check.sh" \
+    "$ROOT/hcu_envcheck/payloads/rccl_perf_test.sh"; do
     bash "$script" --help >/dev/null
 done
 

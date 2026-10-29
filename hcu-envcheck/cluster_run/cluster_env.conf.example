@@ -48,13 +48,14 @@
 # 总入口只在 -s 载荷命中这个清单时才执行占用检查阶段（并导出 CLUSTER_IDLE_CHECKED=1）；
 # 其余任务（环境自检、采集信息、容器维护、只读命令等）一律跳过。
 # 写新载荷若要用卡，把文件名加进来即可，不用改脚本。
-: "${DEFAULTS_IDLE_CHECK_SCRIPTS:=rccl_perf_test.sh,gemm_perf_test.sh}"
+: "${DEFAULTS_IDLE_CHECK_SCRIPTS:=rccl_perf_test.sh}"
 
 # ============ RCCL 测试 ============
-# 本节由 cluster_run/payloads/rccl_perf_test.sh 读取（CLUSTER_ENV_FILE 可换路径）。
-# 优先级（高 -> 低）: 显式命令行参数 > env.sh 已导出的实际运行变量
+# 本节由 hcu_envcheck/payloads/rccl_perf_test.sh 读取（CLUSTER_ENV_FILE 可换路径）。
+# 通信与测量配置优先级（高 -> 低）: env.sh 已导出的实际运行变量
 #   （NCCL_SOCKET_IFNAME / NCCL_TOPO_FILE / UCX_NET_DEVICES 及下列 NCCL_*/RCCL_* 原生名）
 #   > 本文件站点默认 > 脚本内置兜底。值为空表示"不设默认"，由脚本兜底。
+# 卡数由公共 --gpus-per-node 指定；路径、通信和迭代设置不接受 RCCL 载荷透传参数。
 # 基准文件（脚本目录找不到时回退到这里）
 : "${RCCL_BASELINE_FILE:=}"
 # rccl-test 可执行目录
@@ -82,12 +83,6 @@
 : "${RCCL_ARG_W:=5}"
 # 允许低于基准的百分比（全局默认；单项可在基准文件第 4 列覆盖）
 : "${RCCL_MARGIN:=1}"
-
-# ============ GEMM 测试 ============
-: "${GEMM_BASELINE_FILE:=}"
-: "${GEMM_BIN_DIR:=}"
-# 形状文件：每行 <m> <n> <k>，与基准文件的 item 名对应
-: "${GEMM_SHAPES_FILE:=}"
 
 # ============ 镜像分发（cluster_image_sync.sh，未随本目录发布则忽略） ============
 : "${SYNC_SSH_PORT:=}"

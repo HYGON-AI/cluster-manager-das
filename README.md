@@ -13,7 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 
 | 目标 | 子项目 | 典型环境 | 主要影响 |
 |---|---|---|---|
-| 训练前检查 HCU、驱动、DTK、CPU、内存、NIC、RDMA、IB 和软件环境 | [`hcu-envcheck`](hcu-envcheck/README.md) | 裸金属、Slurm、Kubernetes | 普通检查以采集为主；主动模式会产生测试流量 |
+| 训练前检查 HCU、驱动、DTK、CPU、内存、NIC、RDMA、IB 和软件环境 | [`hcu-envcheck`](hcu-envcheck/README.md) | 登录节点 + 共享 Conda、本地 Conda、独立 Docker 容器 | 基础检测生成健康报告；主动测试占用计算卡和网络，容器维护需显式操作 |
 | 持续监控长稳训练，故障后隔离节点、选择备用节点并重启 | [`hcu-training-reliability`](hcu-training-reliability/README.md) | 裸金属、Slurm、Docker | 会停止并重新拉起训练进程 |
 | 为 PyTorchJob 或 Volcano Job 增加运行期容错 | [`hygon-ft-k8s`](hygon-ft-k8s/README.md) | Kubernetes | 会创建集群资源，可能 taint 节点和删除 Pod |
 | 训练 hang 后采集所有 rank 的 Python 堆栈并给出隔离建议 | [`stack-analyzer`](stack-analyzer/README.md) | Kubernetes、Docker、Ansible、单机 | 默认只采集和分析，不自动驱逐节点 |
@@ -27,10 +27,13 @@ SPDX-License-Identifier: Apache-2.0
 
 ### hcu-envcheck
 
-训练启动前的一次性环境检查和主动通信验收工具。支持裸金属、Slurm、已有 Pod、临时探针 Pod、主动 RDMA/RCCL 和 IB Fabric 验收。
+从登录节点对已分配 HCU 节点执行训练前的平台/资源检查、容器管理、单机/多机 RCCL 与 DeepEP，以及单机 byte-flux 测试。支持共享 Conda、本地 Conda 和各节点独立 Docker 容器；Slurm 等系统的节点申请在工具外完成。当前能力与验证限制以子项目文档为准。
 
 - [README](hcu-envcheck/README.md)
-- [完整使用手册](hcu-envcheck/docs/USER_GUIDE.md)
+- [命令示例与结果目录](hcu-envcheck/docs/USER_GUIDE.md)
+- [总体设计与运行约定](hcu-envcheck/docs/DESIGN.md)
+- [工程结构与文件职责](hcu-envcheck/docs/PROJECT_STRUCTURE.md)
+- [能力与验证边界](hcu-envcheck/docs/KNOWN_LIMITATIONS.md)
 
 ### hcu-training-reliability
 

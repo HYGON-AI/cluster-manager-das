@@ -17,10 +17,12 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from .models import CommandResult
+from .group_logs import DirectGroupLog, LogArchiveError, archive_file
 
 
 _HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9][A-Za-z0-9_.:%-]*$")
@@ -221,13 +223,17 @@ class _BoundedTextCapture:
             return head + tail
         omitted = self.total_bytes - len(self.head) - len(self.tail)
         return f"{head}\n...[HCU_ENVCHECK omitted {omitted} output bytes]...\n{tail}"
-    def drain(self, pipe: Any) -> None:
+    def drain(self, pipe: Any, sink=None) -> None:
         try:
             while True:
-                chunk = pipe.read(_OUTPUT_READ_CHUNK_BYTES)
+                chunk = getattr(pipe, "read1", pipe.read)(_OUTPUT_READ_CHUNK_BYTES)
                 if not chunk:
                     break
                 self.feed(chunk)
+                if sink is not None:
+                    sink(chunk)
+        except Exception as exc:
+            self.error = exc
         finally:
             try:
                 pipe.close()
@@ -256,6 +262,56 @@ def _extract_remote_rc(stdout: str, sentinel: str) -> tuple[str, int | None]:
     return "".join(kept), remote_rc
 
 
+class _ClushDirectLog:
+    """Route clush -L output as it arrives, without per-node staging files."""
+    def __init__(self, writers):
+        self.writers = writers
+        self.pending = {"stdout": bytearray(), "stderr": bytearray()}
+        self.active = {"stdout": None, "stderr": None}
+
+    def _emit(self, stream, line, continuation=False):
+        node = self.active[stream] if continuation else None
+        payload = line
+        if not continuation:
+            for candidate in self.writers:
+                prefix = candidate.encode("utf-8") + b": "
+                if line.startswith(prefix):
+                    node, payload = candidate, line[len(prefix):]
+                    break
+        if node is not None:
+            self.writers[node].feed(stream, payload)
+        else:
+            # Unattributed transport diagnostics belong to every affected group.
+            seen = set()
+            for writer in self.writers.values():
+                if writer.group not in seen:
+                    writer.feed(stream, payload)
+                    seen.add(writer.group)
+        return node
+
+    def feed(self, stream, data):
+        pending = self.pending[stream]
+        pending.extend(data)
+        while pending:
+            newline = pending.find(b"\n")
+            if newline >= 0:
+                line = bytes(pending[:newline + 1])
+                del pending[:newline + 1]
+                self._emit(stream, line, self.active[stream] is not None)
+                self.active[stream] = None
+            elif len(pending) >= _OUTPUT_READ_CHUNK_BYTES:
+                self.active[stream] = self._emit(stream, bytes(pending), self.active[stream] is not None)
+                pending.clear()
+            else:
+                break
+
+    def flush(self):
+        for stream, pending in self.pending.items():
+            if pending:
+                self._emit(stream, bytes(pending), self.active[stream] is not None)
+                pending.clear()
+
+
 @dataclass(frozen=True)
 class BaremetalExecutionConfig:
     output_root: Path
@@ -274,6 +330,25 @@ class BaremetalExecutionConfig:
     max_stdout_bytes: int = DEFAULT_NODE_STDOUT_LIMIT_BYTES
     max_stderr_bytes: int = DEFAULT_NODE_STDERR_LIMIT_BYTES
     cancel_event: threading.Event | None = field(default=None, compare=False, repr=False)
+    group_log_root: Path | None = None
+    group_log_groups: tuple[tuple[str, str], ...] = ()
+
+    @cached_property
+    def _group_log_index(self) -> dict[str, str]:
+        return dict(self.group_log_groups)
+
+    def log_group(self, node: str) -> str | None:
+        return self._group_log_index.get(node) if self.group_log_root is not None else None
+
+    @cached_property
+    def _group_log_members(self) -> dict[str, list[str]]:
+        groups: dict[str, list[str]] = {}
+        for node, group in self.group_log_groups:
+            groups.setdefault(group, []).append(node)
+        return groups
+
+    def log_members(self, group: str) -> list[str]:
+        return self._group_log_members.get(group, [])
 
     def validate(self) -> None:
         if self.transport not in {"auto", "clush", "ssh"}:
@@ -659,7 +734,7 @@ class BaremetalClusterExecutor:
         except subprocess.TimeoutExpired as exc:
             raise OSError("local transport could not be reaped after cancellation") from exc
 
-    def _run_bounded_process(self, argv: list[str], timeout: float) -> dict[str, Any]:
+    def _run_bounded_process(self, argv: list[str], timeout: float, log_writer=None) -> dict[str, Any]:
         """Drain transport pipes continuously so controller output cannot exhaust RAM."""
 
         with self._process_lock:
@@ -684,8 +759,8 @@ class BaremetalClusterExecutor:
         stdout_capture = _BoundedTextCapture(self.config.max_stdout_bytes)
         stderr_capture = _BoundedTextCapture(self.config.max_stderr_bytes)
         threads = [
-            threading.Thread(target=stdout_capture.drain, args=(process.stdout,), daemon=True),
-            threading.Thread(target=stderr_capture.drain, args=(process.stderr,), daemon=True),
+            threading.Thread(target=stdout_capture.drain, args=(process.stdout, (lambda data: log_writer.feed("stdout", data)) if log_writer else None), daemon=True),
+            threading.Thread(target=stderr_capture.drain, args=(process.stderr, (lambda data: log_writer.feed("stderr", data)) if log_writer else None), daemon=True),
         ]
         for thread in threads:
             thread.start()
@@ -718,6 +793,11 @@ class BaremetalClusterExecutor:
                 self._processes.discard(process)
             for thread in threads:
                 thread.join(timeout=1)
+        for capture in (stdout_capture, stderr_capture):
+            if getattr(capture, "error", None) is not None:
+                raise capture.error
+        if log_writer is not None and any(thread.is_alive() for thread in threads):
+            raise LogArchiveError("transport output readers did not finish; full log not confirmed")
         return {
             "returncode": 130 if cancelled else int(process.returncode if process.returncode is not None else 124),
             "stdout": stdout_capture.render(),
@@ -748,9 +828,16 @@ class BaremetalClusterExecutor:
             argv = base + [destination, remote_command]
             started = time.monotonic()
             timeout = self.config.connect_timeout_seconds + self.config.command_timeout_seconds + 1.0
+            group = self.config.log_group(node)
+            writer = None
+            if group is not None:
+                writer = DirectGroupLog(self.config.group_log_root, group,
+                    run_dir / "nodes" / _safe_name(node), node, command, command_name,
+                    members=self.config.log_members(group))
             try:
                 if self._runner is subprocess.run or self._cancel_event.is_set():
-                    captured = self._run_bounded_process(argv, timeout)
+                    captured = (self._run_bounded_process(argv, timeout, log_writer=writer)
+                                if writer is not None else self._run_bounded_process(argv, timeout))
                     captured_stdout = captured["stdout"]
                     captured_stderr = captured["stderr"]
                     stdout_total = captured["stdout_total_bytes"]
@@ -775,7 +862,9 @@ class BaremetalClusterExecutor:
                             stdout_truncated=stdout_truncated,
                             stderr_truncated=stderr_truncated,
                         )
-                        self._persist_node_result(run_dir, result)
+                        if writer is not None:
+                            writer.finish(result.returncode, result.error_kind or "")
+                        self._persist_node_result(run_dir, result, streamed=writer is not None)
                         return result
                 else:
                     completed = self._runner(
@@ -796,6 +885,9 @@ class BaremetalClusterExecutor:
                         completed.stderr, self.config.max_stderr_bytes
                     )
                     completed_returncode = completed.returncode
+                    if writer is not None:
+                        writer.feed("stdout", completed.stdout)
+                        writer.feed("stderr", completed.stderr)
                 stdout, remote_rc = _extract_remote_rc(captured_stdout, sentinel)
                 if self._cancel_event.is_set():
                     returncode = 130
@@ -825,6 +917,9 @@ class BaremetalClusterExecutor:
                     stderr_truncated=stderr_truncated,
                 )
             except subprocess.TimeoutExpired as exc:
+                if writer is not None:
+                    writer.feed("stdout", _text_from_timeout(exc.stdout))
+                    writer.feed("stderr", _text_from_timeout(exc.stderr))
                 captured_stdout, stdout_total, stdout_truncated = _bounded_text(
                     _text_from_timeout(exc.stdout), self.config.max_stdout_bytes
                 )
@@ -848,6 +943,8 @@ class BaremetalClusterExecutor:
                     stderr_truncated=stderr_truncated,
                 )
             except OSError as exc:
+                if writer is not None:
+                    writer.feed("stderr", str(exc) + "\n")
                 result = BaremetalNodeResult(
                     node=node,
                     transport="ssh",
@@ -859,7 +956,9 @@ class BaremetalClusterExecutor:
                     duration_seconds=time.monotonic() - started,
                     error_kind="LOCAL_TRANSPORT_LAUNCH_FAILED",
                 )
-            self._persist_node_result(run_dir, result)
+            if writer is not None:
+                writer.finish(result.returncode, result.error_kind or "")
+            self._persist_node_result(run_dir, result, streamed=writer is not None)
             return result
 
         results: dict[str, BaremetalNodeResult] = {}
@@ -882,6 +981,10 @@ class BaremetalClusterExecutor:
                         result.release_output()
                     results[node] = result
                 except Exception as exc:  # defensive isolation around a single node
+                    if isinstance(exc, LogArchiveError):
+                        # Do not overwrite the retained original with a new
+                        # executor-error result when archival could not commit.
+                        raise
                     result = BaremetalNodeResult(
                         node=node,
                         transport="ssh",
@@ -916,14 +1019,22 @@ class BaremetalClusterExecutor:
         result_handler: Callable[[BaremetalNodeResult], None] | None,
         release_output: bool,
     ) -> tuple[dict[str, BaremetalNodeResult], list[str]]:
+        writers = {node: DirectGroupLog(self.config.group_log_root, group,
+                    run_dir / "nodes" / _safe_name(node), node, command, command_name,
+                    members=self.config.log_members(group))
+                   for node in self.nodes if (group := self.config.log_group(node)) is not None}
+        router = _ClushDirectLog(writers) if writers else None
+        if router is not None:
+            file_output = False
         clush_dir = run_dir / ".clush"
         stdout_dir = clush_dir / "stdout"
         stderr_dir = clush_dir / "stderr"
-        stdout_dir.mkdir(parents=True)
-        stderr_dir.mkdir(parents=True)
-        _chmod(clush_dir, 0o700)
-        _chmod(stdout_dir, 0o700)
-        _chmod(stderr_dir, 0o700)
+        if router is None:
+            stdout_dir.mkdir(parents=True)
+            stderr_dir.mkdir(parents=True)
+            _chmod(clush_dir, 0o700)
+            _chmod(stdout_dir, 0o700)
+            _chmod(stderr_dir, 0o700)
 
         remote_command = self._remote_command(command, sentinel)
         argv = [
@@ -946,6 +1057,8 @@ class BaremetalClusterExecutor:
                     str(stderr_dir),
                 ]
             )
+        if router is not None:
+            argv.append("-L")
         argv.extend(["-w", ",".join(self.nodes), "--", remote_command])
         waves = math.ceil(len(self.nodes) / self.config.concurrency)
         controller_timeout = waves * (
@@ -959,7 +1072,8 @@ class BaremetalClusterExecutor:
         controller_launch_error: str | None = None
         try:
             if self._runner is subprocess.run or self._cancel_event.is_set():
-                captured = self._run_bounded_process(argv, controller_timeout)
+                captured = (self._run_bounded_process(argv, controller_timeout, log_writer=router)
+                            if router is not None else self._run_bounded_process(argv, controller_timeout))
                 controller_stdout = captured["stdout"]
                 controller_stderr = captured["stderr"]
                 controller_timed_out = captured["timed_out"]
@@ -978,10 +1092,16 @@ class BaremetalClusterExecutor:
                 )
                 controller_stdout = completed.stdout or ""
                 controller_stderr = completed.stderr or ""
+                if router is not None:
+                    router.feed("stdout", controller_stdout.encode("utf-8"))
+                    router.feed("stderr", controller_stderr.encode("utf-8"))
         except subprocess.TimeoutExpired as exc:
             controller_timed_out = True
             controller_stdout = _text_from_timeout(exc.stdout)
             controller_stderr = _text_from_timeout(exc.stderr)
+            if router is not None:
+                router.feed("stdout", controller_stdout.encode("utf-8"))
+                router.feed("stderr", controller_stderr.encode("utf-8"))
         except OSError as exc:
             controller_launch_error = str(exc)
             controller_stderr = str(exc)
@@ -992,8 +1112,15 @@ class BaremetalClusterExecutor:
         controller_stderr, _, _ = _bounded_text(
             controller_stderr, self.config.max_stderr_bytes
         )
-        _write_text(run_dir / "controller.stdout", controller_stdout)
-        _write_text(run_dir / "controller.stderr", controller_stderr)
+        if router is not None:
+            router.flush()
+        else:
+            _write_text(run_dir / "controller.stdout", controller_stdout)
+            _write_text(run_dir / "controller.stderr", controller_stderr)
+        group = self.config.log_group(self.nodes[0])
+        if group is not None and router is None:
+            for stream in ("stdout", "stderr"):
+                archive_file(self.config.group_log_root, group, run_dir / f"controller.{stream}")
         labeled_stdout = (
             {} if file_output else self._split_clush_labeled_output(controller_stdout)
         )
@@ -1064,7 +1191,9 @@ class BaremetalClusterExecutor:
                 stdout_truncated=stdout_truncated,
                 stderr_truncated=stderr_truncated,
             )
-            self._persist_node_result(run_dir, result)
+            if node in writers:
+                writers[node].finish(result.returncode, result.error_kind or "")
+            self._persist_node_result(run_dir, result, streamed=node in writers)
             if result_handler is not None:
                 result_handler(result)
             if release_output:
@@ -1076,6 +1205,18 @@ class BaremetalClusterExecutor:
             warnings.append(f"clush launch failed: {controller_launch_error}")
         elif controller_timed_out:
             warnings.append("clush controller exceeded its safety timeout")
+        if self.config.group_log_root is not None and router is None:
+            # Some clush releases leave extra side files. Commit those too;
+            # normal completion must not leave a second transport log tree.
+            group = self.config.log_group(self.nodes[0])
+            if group is not None:
+                for path in sorted(clush_dir.rglob("*")):
+                    if path.is_file():
+                        archive_file(self.config.group_log_root, group, path)
+                for path in sorted(clush_dir.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+                    if path.is_dir():
+                        path.rmdir()
+                clush_dir.rmdir()
         return results, warnings
 
     def _split_clush_labeled_output(self, value: str) -> dict[str, str]:
@@ -1090,9 +1231,8 @@ class BaremetalClusterExecutor:
                     break
         return {node: "".join(lines) for node, lines in output.items()}
 
-    @staticmethod
     def _read_clush_output(
-        directory: Path, node: str, limit_bytes: int
+        self, directory: Path, node: str, limit_bytes: int
     ) -> tuple[str, int, bool]:
         candidates = [directory / node, directory / _safe_name(node)]
         for candidate in candidates:
@@ -1107,12 +1247,16 @@ class BaremetalClusterExecutor:
                         if not chunk:
                             break
                         capture.feed(chunk)
-                candidate.unlink(missing_ok=True)
                 # stat() is kept as a sanity check; the byte counter is the
                 # authoritative value if a writer completed just before read.
-                return capture.render(), max(size, capture.total_bytes), capture.truncated
             except OSError:
                 continue
+            group = self.config.log_group(node)
+            if group is not None:
+                archive_file(self.config.group_log_root, group, candidate)
+            else:
+                candidate.unlink(missing_ok=True)
+            return capture.render(), max(size, capture.total_bytes), capture.truncated
         return "", 0, False
 
     @staticmethod
@@ -1123,15 +1267,24 @@ class BaremetalClusterExecutor:
         lines = [line for line in controller_stderr.splitlines() if pattern.search(line)]
         return "\n".join(lines) + ("\n" if lines else "")
 
-    @staticmethod
-    def _persist_node_result(run_dir: Path, result: BaremetalNodeResult) -> None:
+    def _persist_node_result(self, run_dir: Path, result: BaremetalNodeResult, *, streamed=False) -> None:
         node_dir = run_dir / "nodes" / _safe_name(result.node)
         node_dir.mkdir(parents=True, exist_ok=True)
         _chmod(node_dir.parent, 0o700)
         _chmod(node_dir, 0o700)
         result.result_dir = str(node_dir)
-        _write_text(node_dir / "stdout.txt", result.stdout)
-        _write_text(node_dir / "stderr.txt", result.stderr)
+        group = self.config.log_group(result.node)
+        if group is not None:
+            if not streamed:
+                writer = DirectGroupLog(self.config.group_log_root, group, node_dir,
+                    result.node, result.command, result.command_name,
+                    members=self.config.log_members(group))
+                writer.feed("stdout", result.stdout)
+                writer.feed("stderr", result.stderr)
+                writer.finish(result.returncode, result.error_kind or "")
+        else:
+            _write_text(node_dir / "stdout.txt", result.stdout)
+            _write_text(node_dir / "stderr.txt", result.stderr)
         _write_text(
             node_dir / "result.json",
             json.dumps(result.metadata(), ensure_ascii=False, indent=2) + "\n",

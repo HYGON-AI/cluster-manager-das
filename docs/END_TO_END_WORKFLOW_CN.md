@@ -25,36 +25,36 @@ SPDX-License-Identifier: Apache-2.0
 
 ### 第一步：执行训练前检查
 
-裸金属或 Slurm 节点推荐使用项目提供的示例脚本：
+先在 Slurm 等资源管理系统中分配节点，确认使用权限和空闲状态，再在 Linux 登录节点运行 `hcu-cluster-run`。工具读取 hostfile，不申请节点。当前公共场景为共享 Conda、各节点本地 Conda、各节点独立 Docker 容器。
+
+以下为已有容器场景的通用示例，进入共享工程目录后按部署替换路径、节点和镜像：
 
 ```bash
-cd hcu-envcheck
+cd /shared/cluster-manager-das/hcu-envcheck
+cat > hostfile <<'EOF'
+node001
+node002
+node003
+EOF
 
-./bin/hcu-envcheck-doctor
-vi examples/baremetal-nodes.txt
-./examples/check-nodes.sh
+bash bin/hcu-cluster-run per-node-container container-status \
+  -f hostfile --container hcu-test -i registry.example.com/hcu/train:validated
+
+bash bin/hcu-cluster-run per-node-container platform,resource \
+  -f hostfile --container hcu-test -i registry.example.com/hcu/train:validated
 ```
 
-结果默认保存在独立运行目录：
+核心分阶段检查结果默认位于 `hcu-envcheck/verify_results/<scenario>_<operation>_stages_<timestamp>_<pid>/`。先看 `summary.md`、`failures.tsv`，再按组索引进入 `.state/` 查原始日志；检查采集执行、健康规则、参与覆盖和逐节点清理，不能只看采集进程退出码。
 
-```text
-hcu-envcheck/out/nodes_check_YYYYMMDD_HHMMSS_ffffff/
-```
-
-`hcu-envcheck` 支持五类入口：
-
-- `baremetal-cluster`：裸金属或 Slurm 多节点检查。
-- `k8s-pod`：检查一个已经运行的 Pod。
-- `k8s-cluster`：使用指定训练镜像检查一批 Kubernetes 节点。
-- `active-rdma-slurm`：执行主动 RDMA/RCCL 验收。
-- `ib-fabric-slurm`：检查 Native IB 一跳链路和交换机端口计数器。
-
-日常启动前检查优先使用前三类。主动 RDMA、RCCL 和 IB Fabric 验收只能在已经确认空闲并满足独占条件的 Slurm allocation 中执行。
+主动 RCCL、DeepEP、byte-flux 和 IB 带宽测试会占用计算资源和网络，应在已确认空闲的节点上按需执行。容器创建、重建和删除属于显式维护操作，测试不会隐式创建容器。当前公共入口不提供 Kubernetes/Pod 场景，不能继续使用历史 doctor/check-nodes 入口。
 
 完整说明：
 
 - [快速使用说明](../hcu-envcheck/README.md)
-- [完整使用手册](../hcu-envcheck/docs/USER_GUIDE.md)
+- [命令示例与结果目录](../hcu-envcheck/docs/USER_GUIDE.md)
+- [总体设计与运行约定](../hcu-envcheck/docs/DESIGN.md)
+- [工程结构与文件职责](../hcu-envcheck/docs/PROJECT_STRUCTURE.md)
+- [能力与验证边界](../hcu-envcheck/docs/KNOWN_LIMITATIONS.md)
 
 ### 第二步：选择运行期容错方案
 

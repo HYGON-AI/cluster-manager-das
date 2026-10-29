@@ -1620,12 +1620,50 @@ def collect_libraries() -> dict[str, Any]:
     return inventory
 
 
+def collect_resource_metrics(samples: int = 3, interval: float = 1.0) -> dict[str, Any]:
+    """Sample per-card hy-smi metrics for resource acceptance (T05).
+
+    The commands and defaults mirror the established resource policy
+    (3 samples, 1s interval; busy thresholds are applied at report time by
+    hcu_envcheck.preflight.evaluate_metrics). A missing tool yields empty
+    captures with a nonzero rc, never fabricated values.
+    """
+    tools = collect_tools()
+    hy_smi = tools.get("hy-smi", {}).get("path")
+    rocminfo = tools.get("rocminfo", {}).get("path")
+    missing = {"rc": 127, "stdout": "", "stderr": "tool not found"}
+    metrics: dict[str, Any] = {
+        "hy_smi_path": hy_smi,
+        "rocminfo_path": rocminfo,
+        "samples": samples,
+        "interval_seconds": interval,
+        # rocminfo prints ~90KB for 8 agents; a small cap truncates the agent
+        # list and fabricates device-count mismatches.
+        "rocminfo": run([rocminfo], limit=1048576) if rocminfo else dict(missing),
+        "bus": run([hy_smi, "--showbus", "--json"], limit=20480) if hy_smi else dict(missing),
+        "memory": [], "available": [], "memory_percent": [], "utilization": [],
+    }
+    commands = (
+        ("memory", ["--showmeminfo", "vram", "--json"]),
+        ("available", ["--showmemavailable", "--json"]),
+        ("memory_percent", ["--showmemuse", "--json"]),
+        ("utilization", ["--showuse", "--json"]),
+    )
+    for index in range(max(samples, 1)):
+        for key, args in commands:
+            metrics[key].append(run([hy_smi, *args], limit=20480) if hy_smi else dict(missing))
+        if index + 1 < samples:
+            time.sleep(interval)
+    return metrics
+
+
 def main(categories: tuple[str, ...] = ("platform", "resource")) -> None:
     if "platform" not in categories:
         # Resource probes need system memory and device metrics, but importing
         # Torch and probing the network/DTK software stack belongs to platform.
         print(json.dumps({
             "schema_version": "1.0", "system": collect_system(),
+            "resource": collect_resource_metrics() if "resource" in categories else {},
             "dtk": {"tools": {}}, "driver": {}, "network": {},
             "libraries": {}, "python": {}, "torch": {}, "runtime_env": {},
         }, ensure_ascii=False, separators=(",", ":")))
@@ -1642,6 +1680,8 @@ def main(categories: tuple[str, ...] = ("platform", "resource")) -> None:
         "torch": torch_info,
         "runtime_env": collect_runtime_env(),
     }
+    if "resource" in categories:
+        payload["resource"] = collect_resource_metrics()
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 

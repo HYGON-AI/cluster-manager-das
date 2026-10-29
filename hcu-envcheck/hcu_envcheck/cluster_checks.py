@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from .group_logs import DirectGroupLog, archive_file
+
 import json
 import math
 import re
@@ -27,7 +29,6 @@ Which = Callable[[str], str | None]
 RemoteCommandWrapper = Callable[[Sequence[str], float], Sequence[str]]
 
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
-_SAFE_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _HCA_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _SSH_SENTINEL_RE = re.compile(r"^__HCU_ENVCHECK_IB_RC_[0-9a-f]+__=(-?\d+)\r?$")
 
@@ -66,17 +67,6 @@ def _safe_command(command: Sequence[str], label: str) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _safe_env(environment: dict[str, str]) -> dict[str, str]:
-    safe: dict[str, str] = {}
-    for name, value in environment.items():
-        if not _SAFE_ENV_NAME_RE.fullmatch(name):
-            raise ValueError(f"unsafe environment variable name: {name!r}")
-        if not isinstance(value, str) or any(ch in value for ch in "\x00\r\n"):
-            raise ValueError(f"unsafe environment variable value for {name}")
-        safe[name] = value
-    return safe
-
-
 def _result_finding(severity: str, reason_code: str, message: str) -> dict[str, Any]:
     return asdict(Finding(severity, reason_code, message))
 
@@ -86,50 +76,6 @@ def _command_summary(result: BaremetalNodeResult) -> dict[str, Any]:
     if result.returncode in {124, 137}:
         summary["timed_out"] = True
     return summary
-
-
-@dataclass(frozen=True)
-class NHCCheckConfig:
-    enabled: bool = False
-    command: tuple[str, ...] = ("run_nhc",)
-    installation_source: str | None = None
-    config: str | None = None
-    selected: str | None = None
-    removed: str | None = None
-    extra_args: tuple[str, ...] = ()
-    environment: dict[str, str] = field(default_factory=dict)
-    timeout_seconds: float = 600.0
-
-    def validate(self) -> None:
-        if not self.enabled:
-            return
-        _safe_command(self.command, "NHC command")
-        if self.installation_source is not None:
-            _safe_token(self.installation_source, "NHC installation source")
-        if self.config is not None:
-            _safe_token(self.config, "NHC config")
-        if self.selected is not None:
-            _safe_token(self.selected, "NHC selected")
-        if self.removed is not None:
-            _safe_token(self.removed, "NHC removed")
-        if self.extra_args:
-            # Extra arguments normally start with an option, not an executable.
-            _safe_command([*self.command, *self.extra_args], "NHC command + extra args")
-        if self.timeout_seconds <= 0 or self.timeout_seconds > 3600:
-            raise ValueError("nhc timeout must be in (0, 3600]")
-        _safe_env(self.environment)
-
-    def argv(self) -> list[str]:
-        self.validate()
-        command = list(self.command)
-        if self.config:
-            command.extend(["--config", self.config])
-        if self.selected:
-            command.extend(["--selected", self.selected])
-        if self.removed:
-            command.extend(["--removed", self.removed])
-        command.extend(self.extra_args)
-        return command
 
 
 @dataclass(frozen=True)
@@ -231,12 +177,10 @@ class IBWriteBandwidthConfig:
 @dataclass(frozen=True)
 class ClusterExtraCheckConfig:
     ib_state: IBStateCheckConfig = field(default_factory=IBStateCheckConfig)
-    nhc: NHCCheckConfig = field(default_factory=NHCCheckConfig)
     ib: IBWriteBandwidthConfig = field(default_factory=IBWriteBandwidthConfig)
 
     def validate(self) -> None:
         self.ib_state.validate()
-        self.nhc.validate()
         self.ib.validate()
 
 
@@ -287,52 +231,6 @@ def build_ib_test_plan(
                     )
                 )
     return plan
-
-
-def evaluate_nhc_output(
-    returncode: int,
-    stdout: str,
-    stderr: str,
-    timed_out: bool,
-    *,
-    installation_source: str | None = None,
-) -> dict[str, Any]:
-    combined = f"{stdout}\n{stderr}"
-    result_marker = re.search(r"^\[CHECK RESULT\]:\s*(.*?)\s*$", combined, re.M)
-    result_text = result_marker.group(1).strip() if result_marker else None
-    show_installation_source = False
-    if timed_out:
-        status, reason, message = "NOT_VERIFIED", "NHC_CHECK_TIMEOUT", "NHC command timed out"
-    elif result_text and result_text not in {"PASSED", "PASS"}:
-        status, reason, message = "FAIL", "NHC_CHECK_FAILED", "NHC check reported failures"
-    elif returncode == 0 and (result_text in {"PASSED", "PASS"} or re.search(r"^PASSED\s*$", combined, re.M)):
-        status, reason, message = "PASS", "NHC_CHECK_PASSED", "NHC check passed"
-    elif returncode == 127:
-        status, reason = "NOT_VERIFIED", "NHC_COMMAND_NOT_FOUND"
-        message = "run_nhc is not available on the node PATH; install or repair the host command"
-        show_installation_source = installation_source is not None
-    elif returncode == 125:
-        status, reason = "NOT_VERIFIED", "NHC_EXECUTION_ERROR"
-        message = "NHC supervisor reported an execution error; verify the host run_nhc installation"
-        show_installation_source = installation_source is not None
-    elif returncode != 0:
-        status, reason = "NOT_VERIFIED", "NHC_EXECUTION_FAILED"
-        message = f"run_nhc could not produce a health result (rc={returncode}); verify the host command"
-        show_installation_source = installation_source is not None
-    else:
-        status, reason = "NOT_VERIFIED", "NHC_RESULT_MARKER_MISSING"
-        message = "run_nhc output did not contain a parseable result marker; verify the host command"
-        show_installation_source = installation_source is not None
-    result = {
-        "status": status,
-        "reason_code": reason,
-        "message": message,
-        "returncode": returncode,
-        "timed_out": timed_out,
-    }
-    if show_installation_source:
-        result["installation_source"] = installation_source
-    return result
 
 
 def _natural_key(value: str) -> list[Any]:
@@ -639,77 +537,6 @@ def _run_ib_state_checks(
     return result
 
 
-def _build_nhc_command(config: NHCCheckConfig) -> list[str]:
-    argv = config.argv()
-    environment = _safe_env(config.environment)
-    if not environment:
-        return argv
-    assignments = [f"{name}={value}" for name, value in sorted(environment.items())]
-    return ["env", *assignments, *argv]
-
-
-def _run_nhc_checks(
-    *,
-    nodes: Sequence[str],
-    records_by_node: dict[str, dict[str, Any]],
-    execution_config: BaremetalExecutionConfig,
-    config: NHCCheckConfig,
-    output_root: Path,
-    runner: RunText,
-    which: Which,
-    command_wrapper: RemoteCommandWrapper | None = None,
-) -> dict[str, Any]:
-    if not config.enabled:
-        return {"enabled": False, "status": "NOT_REQUESTED", "nodes": []}
-    started_at = _utc_now()
-    nhc_execution = _execution_with_timeout(
-        execution_config,
-        output_root=output_root,
-        timeout_seconds=config.timeout_seconds,
-    )
-    executor = BaremetalClusterExecutor(nodes, nhc_execution, runner=runner, which=which)
-    command = _build_nhc_command(config)
-    if command_wrapper:
-        command = list(command_wrapper(command, config.timeout_seconds))
-    node_results: dict[str, dict[str, Any]] = {}
-
-    def consume(result: BaremetalNodeResult) -> None:
-        evaluation = evaluate_nhc_output(
-            result.returncode,
-            result.stdout,
-            result.stderr,
-            result.timed_out or result.returncode in {124, 137},
-            installation_source=config.installation_source,
-        )
-        check = {
-            "name": "run_nhc",
-            **evaluation,
-            "command": _command_summary(result),
-            "evidence_dir": result.result_dir,
-        }
-        node_results[result.node] = check
-        record = records_by_node.get(result.node)
-        if record is not None:
-            _add_check_to_record(record, check)
-
-    raw = executor.execute("run-nhc", command, result_handler=consume, release_output=True)
-    for node, result in raw.nodes.items():
-        if node not in node_results:
-            consume(result)
-    checks = [node_results[node] | {"node": node} for node in nodes if node in node_results]
-    return {
-        "enabled": True,
-        "status": _aggregate_status(checks),
-        "transport": raw.transport,
-        "command": list(config.command),
-        "installation_source": config.installation_source,
-        "evidence_dir": raw.run_dir,
-        "started_at": started_at,
-        "finished_at": _utc_now(),
-        "nodes": checks,
-    }
-
-
 def _ssh_base(config: BaremetalExecutionConfig) -> list[str]:
     executable = config.ssh_executable or "ssh"
     argv = [
@@ -774,6 +601,8 @@ def _run_remote_command(
     runner: RunText,
     command_wrapper: RemoteCommandWrapper | None = None,
     cancel_event: Event | None = None,
+    log_directory: Path | None = None,
+    log_item: str = "ib-command",
 ) -> dict[str, Any]:
     if cancel_event is not None and cancel_event.is_set():
         return {"argv": [], "returncode": 130, "stdout": "", "stderr": "task cancelled",
@@ -784,6 +613,10 @@ def _run_remote_command(
     sentinel = f"__HCU_ENVCHECK_IB_RC_{token}__"
     argv = _ssh_base(config) + [_ssh_destination(node, config), _remote_shell(command, sentinel)]
     started = time.monotonic()
+    group = config.log_group(node)
+    writer = (DirectGroupLog(config.group_log_root, group, log_directory, node, list(command), log_item,
+                            members=config.log_members(group))
+              if group is not None and log_directory is not None else None)
     try:
         captured = None
         deadline = config.connect_timeout_seconds + timeout_seconds + 1.0
@@ -791,7 +624,7 @@ def _run_remote_command(
             # Share bounded output/cancellation with the standard transport.
             # Pairing itself stays explicit SSH, independent of MPI or clush.
             executor = BaremetalClusterExecutor([node], config)
-            captured = executor._run_bounded_process(argv, deadline)
+            captured = executor._run_bounded_process(argv, deadline, log_writer=writer)
             completed = subprocess.CompletedProcess(
                 argv, captured["returncode"], captured["stdout"], captured["stderr"])
         else:
@@ -806,10 +639,15 @@ def _run_remote_command(
                 timeout=deadline,
                 check=False,
             )
+            if writer is not None:
+                writer.feed("stdout", completed.stdout)
+                writer.feed("stderr", completed.stderr)
         stdout, remote_rc = _extract_sentinel(completed.stdout or "", sentinel)
         # A missing sentinel is not evidence of a successful remote command.
         # Preserve local SSH failure even if an earlier result marker was printed.
         returncode = completed.returncode or (remote_rc if remote_rc is not None else 255)
+        if writer is not None:
+            writer.finish(returncode)
         return {
             "argv": argv,
             "returncode": returncode,
@@ -820,6 +658,10 @@ def _run_remote_command(
             "cancelled": bool(cancel_event is not None and cancel_event.is_set()),
         }
     except subprocess.TimeoutExpired as exc:
+        if writer is not None:
+            writer.feed("stdout", exc.stdout)
+            writer.feed("stderr", exc.stderr)
+            writer.finish(124, "COMMAND_TIMEOUT")
         return {
             "argv": argv,
             "returncode": 124,
@@ -829,6 +671,9 @@ def _run_remote_command(
             "timed_out": True,
         }
     except OSError as exc:
+        if writer is not None:
+            writer.feed("stderr", str(exc) + "\n")
+            writer.finish(127, "LOCAL_TRANSPORT_LAUNCH_FAILED")
         return {
             "argv": argv,
             "returncode": 127,
@@ -878,6 +723,8 @@ def _run_ib_spec(
             runner=runner,
             command_wrapper=command_wrapper,
             cancel_event=cancel_event,
+            log_directory=evidence_dir / "server" if evidence_dir is not None else None,
+            log_item=f"{spec.source}:{spec.source_hca}->{spec.destination}:{spec.destination_hca} server",
         )
         if config.startup_grace_seconds:
             if cancel_event is not None:
@@ -896,6 +743,8 @@ def _run_ib_spec(
             runner=runner,
             command_wrapper=command_wrapper,
             cancel_event=cancel_event,
+            log_directory=evidence_dir / "client" if evidence_dir is not None else None,
+            log_item=f"{spec.source}:{spec.source_hca}->{spec.destination}:{spec.destination_hca} client",
         )
         try:
             server_result = server_future.result(timeout=config.timeout_seconds + 5.0)
@@ -929,8 +778,12 @@ def _run_ib_spec(
         if evidence_dir is not None:
             evidence_dir.mkdir(parents=True, exist_ok=True)
             for stream in ("stdout", "stderr"):
-                path = evidence_dir / f"{role}.{stream}.log"
-                atomic_write_text_exclusive(path, raw.get(stream) or "")
+                group = execution_config.log_group(spec.destination if role == "server" else spec.source)
+                if group is None:
+                    path = evidence_dir / f"{role}.{stream}.log"
+                    atomic_write_text_exclusive(path, raw.get(stream) or "")
+                else:
+                    path = evidence_dir / role / f"{stream}.txt"
                 summary[f"{stream}_path"] = str(path)
             _write_json(evidence_dir / f"{role}.json", summary)
         commands.append(summary)
@@ -1241,16 +1094,6 @@ def run_cluster_extra_checks(
         implicit_for_bandwidth=implicit_ib_state,
         command_wrapper=command_wrapper,
     )
-    nhc = _run_nhc_checks(
-        nodes=nodes,
-        records_by_node=records_by_node,
-        execution_config=execution_config,
-        config=config.nhc,
-        output_root=output_root,
-        runner=runner,
-        which=resolved_which,
-        command_wrapper=command_wrapper,
-    )
     ib = _run_ib_checks(
         nodes=nodes,
         records_by_node=records_by_node,
@@ -1264,7 +1107,7 @@ def run_cluster_extra_checks(
     )
     enabled_results = [
         item
-        for item in (ib_state, nhc, ib)
+        for item in (ib_state, ib)
         if item.get("enabled")
     ]
     result = {
@@ -1273,7 +1116,6 @@ def run_cluster_extra_checks(
         "rounds": 1,
         "taint_mutation": False,
         "ib_state": ib_state,
-        "nhc": nhc,
         "ib_write_bw": ib,
     }
     _write_json(output_root / "cluster-extra-checks.json", result)

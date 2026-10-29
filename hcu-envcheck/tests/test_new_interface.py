@@ -17,7 +17,6 @@ from unittest.mock import patch
 
 from cluster_run.cli import main
 from cluster_run.lifecycle import run_container_lifecycle
-from cluster_run.node_script import run_node_script
 from cluster_run.active import ActiveTestExecutor
 
 
@@ -78,45 +77,6 @@ class NewInterfaceTests(unittest.TestCase):
                 main(argv)
             self.assertEqual(raised.exception.code, 3)
 
-    def test_script_dry_run_uses_docker_exec_and_no_mpi(self):
-        with tempfile.TemporaryDirectory() as temp:
-            report, path = run_node_script(
-                nodes=["n01", "n02"], scenario="per-node-container", env_script="/shared/env.sh",
-                script="/shared/check.sh", script_args=["--quick"], container_name="worker",
-                image=None, transport="ssh", concurrency=2, timeout=0,
-                output_dir=Path(temp), dry_run=True,
-            )
-            self.assertEqual(report["status"], "DRY_RUN")
-            command = report["nodes"]["n01"]["command"]
-            self.assertEqual(command[:3], ["docker", "exec", "worker"])
-            self.assertIn("source /shared/env.sh", command[-1])
-            self.assertIn("bash /shared/check.sh --quick", command[-1])
-            self.assertNotIn("mpirun", command[-1])
-            self.assertTrue((path / "script-result.json").exists())
-
-    def test_script_requires_absolute_target_visible_path(self):
-        with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaisesRegex(ValueError, "absolute path"):
-                run_node_script(nodes=["n01"], scenario="shared-conda", env_script="/env.sh",
-                                script="relative.sh", script_args=[], container_name=None,
-                                image=None, transport="ssh", concurrency=1, timeout=0,
-                                output_dir=Path(temp), dry_run=True)
-
-    def test_builtin_workers_are_importable_without_explicit_container_workdir(self):
-        with tempfile.TemporaryDirectory() as temp:
-            executor = ActiveTestExecutor(
-                scenario="per-node-container", test_name="gemm", nodes=["n01"],
-                env_script="/share/env.sh", output_dir=Path(temp), group_size=1,
-                slots=1, launcher="ssh-torchrun", container_name="worker",
-                execution_scope="container", dry_run=True,
-            )
-            report, _ = executor.run()
-            command = report["groups"][0]["commands"][0]["command"]
-            self.assertNotIn("-w", command)
-            self.assertIn("cluster_run.payloads.gemm_worker", command[-1])
-            self.assertIn("export PYTHONPATH=", command[-1])
-            self.assertLess(command[-1].index("source /share/env.sh"),
-                            command[-1].index("export PYTHONPATH="))
 
     def test_recreate_and_delete_require_explicit_confirmation(self):
         for operation, image in (("container-recreate", "image:tag"), ("container-delete", None)):
@@ -200,6 +160,114 @@ class NewInterfaceTests(unittest.TestCase):
         self.assertIn("IMAGE_ID_INCONSISTENT", {item["code"] for item in report["issues"]})
         self.assertEqual(execute.call_count, 3)
 
+
+    def _shell_image_preflight(self, operation, mode, *, nodes=1, image_tar=False):
+        """Run the real Bash entry; a local SSH double prevents real Docker use."""
+        root = Path(__file__).resolve().parents[1]
+        shell = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            tools = folder / "bin"
+            tools.mkdir()
+            hostfile = folder / "nodes"
+            hostfile.write_text("".join(f"n{i:02d}\n" for i in range(1, nodes+1)), encoding="utf-8")
+            tool = tools / "ssh"
+            tool.write_text(r"""#!/usr/bin/env bash
+cmd=${!#}; position=$(($#-1)); node=${!position}; node=${node##*@}
+printf '%s|%s\n' "$node" "$cmd" >> "$FIXTURE_CALLS"
+case $cmd in
+  'docker info '*) exit 0 ;;
+  'docker image inspect '*)
+    case $FIXTURE_MODE in
+      inspect-error) echo 'permission denied while inspecting image' >&2; exit 1 ;;
+      transport-error) echo 'ssh: connection closed' >&2; exit 255 ;;
+      missing|pull-failure)
+        if [[ ! -f $FIXTURE_READY.$node ]]; then
+          echo 'Error response from daemon: No such image: fixture/train:local' >&2
+          exit 1
+        fi ;;
+    esac
+    digit=a
+    [[ $FIXTURE_MODE != mismatch || $node != n02 ]] || digit=b
+    printf 'sha256:'; printf '%s' "$digit"{1..64} | tr -d '0-9'; printf '\n'
+    ;;
+  'docker pull '*)
+    [[ $FIXTURE_MODE != pull-failure ]] || { echo 'fixture pull failed' >&2; exit 7; }
+    touch "$FIXTURE_READY.$node" ;;
+  'docker load -i '*)
+    [[ $FIXTURE_MODE != load-failure ]] || { echo 'fixture load failed' >&2; exit 8; } ;;
+  'docker inspect --type container '*) exit 1 ;;
+  'docker run --rm '*)
+    [[ $FIXTURE_MODE == mismatch ]] && exit 0
+    echo 'fixture stops at SSH-tool preflight, before container mutation' >&2; exit 42 ;;
+  'bash -c '*) exit 0 ;;
+  *) echo "unexpected fixture command: $cmd" >&2; exit 99 ;;
+esac
+""", encoding="utf-8")
+            tool.chmod(0o755)
+            env = dict(os.environ)
+            env["LC_ALL"] = env["LANG"] = "C.UTF-8"
+            shell_root = folder.resolve().as_posix()
+            if os.name == "nt":
+                shell_root = "/" + shell_root[0].lower() + shell_root[2:]
+            env.update(FIXTURE_MODE=mode,
+                       FIXTURE_CALLS=shell_root+"/calls", FIXTURE_READY=shell_root+"/ready")
+            target = (root / "bin/hcu-cluster-run").as_posix()
+            if os.name == "nt":
+                target = "/" + target[0].lower() + target[2:]
+            command = [shell, "-c", 'export PATH="$1:/usr/bin:/bin:$PATH"; shift; exec bash "$@"',
+                "image-fixture", shell_root+"/bin", target, "per-node-container", operation, "-f", shell_root+"/nodes",
+                "--container", "worker", "-i", "fixture/train:local", "--port", "25901",
+                "--log-detail", "every", "-o", shell_root+"/output"]
+            if operation == "container-recreate":
+                command.append("--yes")
+            if image_tar:
+                command += ["--image-tar", "/fixture/image.tar"]
+            run = subprocess.run(command, cwd=folder, env=env, text=True, encoding="utf-8",
+                errors="replace", capture_output=True, timeout=20)
+            self.assertTrue((folder/"calls").exists(), run.stdout + run.stderr)
+            calls = (folder/"calls").read_text(encoding="utf-8").splitlines()
+            return run, [line.split("|", 1)[1] for line in calls]
+
+    def test_shell_create_and_recreate_prepare_images_before_container_changes(self):
+        cases = (("local", False, 0, 0, True), ("missing", False, 1, 0, True),
+                 ("pull-failure", False, 1, 0, False), ("local", True, 0, 1, True),
+                 ("load-failure", True, 0, 1, False), ("inspect-error", False, 0, 0, False),
+                 ("transport-error", False, 0, 0, False))
+        for operation in ("container-create", "container-recreate"):
+            for mode, tar, pulls, loads, reaches_tools in cases:
+                with self.subTest(operation=operation, mode=mode, tar=tar):
+                    run, calls = self._shell_image_preflight(operation, mode, image_tar=tar)
+                    self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                    self.assertEqual(sum(cmd.startswith("docker pull ") for cmd in calls), pulls)
+                    self.assertEqual(sum(cmd.startswith("docker load -i ") for cmd in calls), loads)
+                    self.assertEqual(any(cmd.startswith("docker run --rm ") for cmd in calls), reaches_tools)
+                    self.assertFalse(any(cmd.startswith(("docker run -dit ", "docker stop ", "docker rm ")) for cmd in calls))
+                    if reaches_tools:
+                        self.assertIn("image SSH tools missing", run.stdout)
+                    if mode == "local" and not tar:
+                        self.assertIn("source=local", run.stdout)
+                    if mode == "missing":
+                        self.assertIn("source=pull", run.stdout)
+                    if mode == "inspect-error":
+                        self.assertIn("permission denied while inspecting image", run.stdout)
+                    if mode == "transport-error":
+                        self.assertIn("ssh: connection closed", run.stdout)
+                    expected_rc = {"pull-failure": 7, "load-failure": 8,
+                                   "inspect-error": 1, "transport-error": 255}.get(mode)
+                    if expected_rc is not None:
+                        self.assertRegex(run.stdout, rf"stage=preflight status=FAIL rc={expected_rc} ")
+                    if mode == "pull-failure":
+                        self.assertIn("fixture pull failed", run.stdout)
+                    if mode == "load-failure":
+                        self.assertIn("fixture load failed", run.stdout)
+
+    def test_shell_recreate_rejects_different_local_image_ids_without_pull_or_removal(self):
+        run, calls = self._shell_image_preflight("container-recreate", "mismatch", nodes=2)
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn("image IDs differ between nodes", run.stdout)
+        self.assertFalse(any(cmd.startswith(("docker pull ", "docker load ", "docker run -dit ",
+                                            "docker stop ", "docker rm ")) for cmd in calls))
 
 if __name__ == "__main__":
     unittest.main()

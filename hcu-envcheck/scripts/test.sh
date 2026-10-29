@@ -2,12 +2,10 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 # 功能验证总入口：每项直接调用 hcu-cluster-run，不用 Shell 函数分派。
-# 默认基础只读检测；主动/NHC/IB/脚本/容器维护均 dry-run。
-# RUN_ACTIVE=yes: 短时 worker；RUN_PROFILES=yes: 既有性能脚本（短小参数）。
-# RCCL worker 显式 --profile worker；rccl-tests 用例不传 profile/--tests，验证默认十项完整二进制验收。
+# 默认基础只读检测；主动/IB/容器维护均 dry-run。
+# RUN_PROFILES=yes: RCCL 完整二进制测试（短小参数）。
+# RCCL 用例不传 profile/--tests，验证默认十项完整二进制验收。
 # 基准必须覆盖当前卡数全部十项；短小参数仅验证接口/报告，不代表生产性能达标。
-# RUN_NETWORK=yes: IB带宽；RUN_DIAGNOSTICS=yes: nhc（IB状态由platform覆盖）。
-# RUN_SCRIPTS=yes: 用户脚本；RUN_CONTEXT=yes: 无DCU的Shell/Python上下文探针。
 # contexts/ 输入须在各节点/容器内同路径可见。不会申请资源或变更容器。
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
@@ -20,15 +18,12 @@ if [[ "${1-}" == --help || "${1-}" == -h || "${1-}" == --list ]]; then
     cat <<'HELP'
 一次执行全部接口，不接受 --case 或位置参数筛选。
 HOSTFILE=./hostfile ENV_SCRIPT=/share/env.sh bash scripts/test.sh
-RUN_CONTEXT=yes ...     真实验证 env.sh、节点/容器位置、Shell/Python；不使用DCU
-RUN_ACTIVE=yes ...      小规模worker；RUN_PROFILES=yes 开启既有性能脚本
-RUN_NETWORK=yes ...     IB server/client；RUN_DIAGNOSTICS=yes 开启 nhc（IB状态由platform覆盖）
-RUN_SCRIPTS=yes ...     执行 DIAGNOSTIC_SCRIPT/CUSTOM_SCRIPT（需自行确认内容）
+RUN_PROFILES=yes ...    RCCL 完整二进制测试
+RUN_NETWORK=yes ...     IB server/client 带宽测试
 变量：HOSTFILE ENV_SCRIPT SHARED_ENV_SCRIPT NODE_LOCAL_ENV_SCRIPT CONTAINER_ENV_SCRIPT
       CONTROLLER_ENV_SCRIPT CONTROLLER_PYTHON PYTHON_BIN HCU_ENVCHECK_PYTHON
       CONTAINER_NAME IMAGE CONTAINER_SSH_PORT TRANSPORT GROUP_SIZE ACTIVE_SLOTS
-      NPROC_PER_NODE RCCL_NPROC_PER_NODE NP LAUNCHER MASTER_PORT TIMEOUT IB_GROUP_SIZE OUTPUT_DIR
-      CUSTOM_SCRIPT DIAGNOSTIC_SCRIPT
+      RCCL_GPUS_PER_NODE TIMEOUT IB_GROUP_SIZE OUTPUT_DIR
 环境BLOCKED/FAIL不作门禁；工具异常、缺报告、错节点范围、缺launch artifact返回非零。
 PRECHECK_FAILED单列BLOCKED_NOT_EXECUTED，不宣称完成真实测试。
 HELP
@@ -73,14 +68,8 @@ TRANSPORT=${TRANSPORT:-ssh}
 GROUP_SIZE=${GROUP_SIZE:-1}
 IB_GROUP_SIZE=${IB_GROUP_SIZE:-2}
 ACTIVE_SLOTS=${ACTIVE_SLOTS:-1}
-NPROC_PER_NODE=${NPROC_PER_NODE:-1}
-RCCL_NPROC_PER_NODE=${RCCL_NPROC_PER_NODE:-8}  # Binary suite uses real card-count baselines, not smoke-test ranks.
-NP=${NP:-}
-LAUNCHER=${LAUNCHER:-mpirun-torchrun}
-MASTER_PORT=${MASTER_PORT:-29500}
+RCCL_GPUS_PER_NODE=${RCCL_GPUS_PER_NODE:-8}  # Binary suite uses real card-count baselines.
 TIMEOUT=${TIMEOUT:-120}
-DIAGNOSTIC_SCRIPT=${DIAGNOSTIC_SCRIPT:-$ROOT/cluster_run/payloads/check_deepep_env.sh}
-CUSTOM_SCRIPT=${CUSTOM_SCRIPT:-$DIAGNOSTIC_SCRIPT}
 OUTPUT_DIR=${OUTPUT_DIR:-./manual_test_results}
 mkdir -p -- "$OUTPUT_DIR" || exit 1
 OUTPUT_DIR=$(cd -- "$OUTPUT_DIR" && pwd) || exit 1
@@ -89,28 +78,19 @@ mkdir -p "$RUN_DIR/logs" "$RUN_DIR/contexts"
 CALLS="$RUN_DIR/calls.tsv"
 printf 'case\treturncode\tlog_returncode\n' > "$CALLS"
 COMMON_OPTIONS=(--transport "$TRANSPORT")
-ACTIVE_OPTIONS=(--dry-run); ACTIVE_MODE=dry
 PROFILE_OPTIONS=(--dry-run); PROFILE_MODE=dry
 NETWORK_OPTIONS=(--dry-run); NETWORK_MODE=dry
-DIAGNOSTIC_OPTIONS=(--dry-run); DIAGNOSTIC_MODE=dry
-SCRIPT_OPTIONS=(--dry-run); SCRIPT_MODE=dry
-CONTEXT_OPTIONS=(--dry-run); CONTEXT_MODE=dry
-[[ "${RUN_ACTIVE:-dry-run}" == yes || "${RUN_ACTIVE:-}" == 1 ]] && { ACTIVE_OPTIONS=(); ACTIVE_MODE=real; }
 [[ "${RUN_PROFILES:-dry-run}" == yes || "${RUN_PROFILES:-}" == 1 ]] && { PROFILE_OPTIONS=(); PROFILE_MODE=real; }
 [[ "${RUN_NETWORK:-dry-run}" == yes || "${RUN_NETWORK:-}" == 1 ]] && { NETWORK_OPTIONS=(); NETWORK_MODE=real; }
-[[ "${RUN_DIAGNOSTICS:-dry-run}" == yes || "${RUN_DIAGNOSTICS:-}" == 1 ]] && { DIAGNOSTIC_OPTIONS=(); DIAGNOSTIC_MODE=real; }
-[[ "${RUN_SCRIPTS:-dry-run}" == yes || "${RUN_SCRIPTS:-}" == 1 ]] && { SCRIPT_OPTIONS=(); SCRIPT_MODE=real; }
-[[ "${RUN_CONTEXT:-dry-run}" == yes || "${RUN_CONTEXT:-}" == 1 ]] && { CONTEXT_OPTIONS=(); CONTEXT_MODE=real; }
-NP_OPTION=(); [[ -n "$NP" ]] && NP_OPTION=(--np "$NP")
 
 # 只生成本地输入，不访问目标节点。随机token验证目标env.sh确实执行。
-"$PYTHON_BIN" - "$RUN_DIR" "$HOSTFILE" "$SHARED_ENV_SCRIPT" "$NODE_LOCAL_ENV_SCRIPT" "$CONTAINER_ENV_SCRIPT" "$LAUNCHER" <<'FIXTURES' || exit 1
+"$PYTHON_BIN" - "$RUN_DIR" "$HOSTFILE" "$SHARED_ENV_SCRIPT" "$NODE_LOCAL_ENV_SCRIPT" "$CONTAINER_ENV_SCRIPT" <<'FIXTURES' || exit 1
 import json, pathlib, shlex, sys, time, uuid
 from cluster_run.hostfile import read_nodes
 out = pathlib.Path(sys.argv[1])
 nodes = read_nodes(pathlib.Path(sys.argv[2]))
 token = uuid.uuid4().hex
-(out / 'meta.json').write_text(json.dumps({'started': time.time(), 'nodes': nodes, 'token': token, 'launcher': sys.argv[6]}), encoding='utf-8')
+(out / 'meta.json').write_text(json.dumps({'started': time.time(), 'nodes': nodes, 'token': token}), encoding='utf-8')
 # MPI计划至少两节点；不足时使用明确的plan-only虚拟节点，不发起连接。
 plan_nodes = list(nodes[:2]) if len(nodes) >= 2 else ['hcu-plan-node01', 'hcu-plan-node02']
 (out / 'launcher-hostfile').write_text('\n'.join(plan_nodes) + '\n', encoding='utf-8')
@@ -119,18 +99,13 @@ for scenario, env_script in zip(('shared-conda','node-local-conda','per-node-con
         raise SystemExit('--env-script target paths must be absolute: ' + env_script)
     text = 'set -e\nsource ' + shlex.quote(env_script) + '\nexport HCU_ACCEPTANCE_TOKEN=' + token + '\n'
     (out / 'contexts' / (scenario + '.env.sh')).write_text(text, encoding='utf-8')
-(out / 'contexts' / 'context.sh').write_text('''#!/usr/bin/env bash
-set -e
-: "${HCU_ACCEPTANCE_TOKEN:?target env wrapper was not sourced}"
-scope=host
-[[ -f /.dockerenv || -f /run/.containerenv ]] && scope=container
-printf 'HCU_CONTEXT\\t%s\\t%s\\t%s\\t%s\\n' "$HCU_ACCEPTANCE_TOKEN" "$(hostname -s)" "$scope" "$$"
-''', encoding='utf-8')
-(out / 'contexts' / 'context.py').write_text('''import json, os, pathlib, socket, sys
-assert os.environ.get('HCU_ACCEPTANCE_TOKEN'), 'target env wrapper was not sourced'
-print('HCU_CONTEXT_JSON ' + json.dumps({'token': os.environ['HCU_ACCEPTANCE_TOKEN'], 'node': socket.gethostname().split('.')[0], 'scope': 'container' if pathlib.Path('/.dockerenv').exists() or pathlib.Path('/run/.containerenv').exists() else 'host', 'pid': os.getpid(), 'python': sys.executable}))
-''', encoding='utf-8')
+    # Keep RCCL's short workload in the target environment wrapper.
+    (out / 'contexts' / (scenario + '.rccl-env.sh')).write_text(
+        text + 'export RCCL_ARG_B=4 RCCL_ARG_E=4K RCCL_ARG_N=2 RCCL_ARG_W=0\n', encoding='utf-8')
 FIXTURES
+SHARED_RCCL_ENV_SCRIPT=$RUN_DIR/contexts/shared-conda.rccl-env.sh
+NODE_LOCAL_RCCL_ENV_SCRIPT=$RUN_DIR/contexts/node-local-conda.rccl-env.sh
+CONTAINER_RCCL_ENV_SCRIPT=$RUN_DIR/contexts/per-node-container.rccl-env.sh
 LOCAL_RC=0
 # 集成用例自身运行本脚本时防递归；一般用户执行始终运行本地单测。
 if [[ "${HCU_ACCEPTANCE_NESTED_TEST:-}" != 1 ]]; then
@@ -146,49 +121,22 @@ case	kind	scenario	operation	mode	directory	hostfile	env_script	context
 shared-conda-platform	basic	shared-conda	platform	real	shared-conda/platform	$HOSTFILE	$SHARED_ENV_SCRIPT	no
 shared-conda-resource	basic	shared-conda	resource	real	shared-conda/resource	$HOSTFILE	$SHARED_ENV_SCRIPT	no
 shared-conda-base	basic	shared-conda	platform,resource	real	shared-conda/base	$HOSTFILE	$SHARED_ENV_SCRIPT	no
-shared-conda-rccl	active	shared-conda	rccl	$ACTIVE_MODE	shared-conda/rccl	$HOSTFILE	$SHARED_ENV_SCRIPT	no
-shared-conda-gemm	active	shared-conda	gemm	$ACTIVE_MODE	shared-conda/gemm	$HOSTFILE	$SHARED_ENV_SCRIPT	no
-shared-conda-rccl-tests	active	shared-conda	rccl	$PROFILE_MODE	shared-conda/rccl-tests	$HOSTFILE	$SHARED_ENV_SCRIPT	no
-shared-conda-rocblas	active	shared-conda	gemm	$PROFILE_MODE	shared-conda/rocblas	$HOSTFILE	$SHARED_ENV_SCRIPT	no
+shared-conda-rccl-tests	active	shared-conda	rccl	$PROFILE_MODE	shared-conda/rccl-tests	$HOSTFILE	$SHARED_RCCL_ENV_SCRIPT	no
 shared-conda-ib-write-bw	active	shared-conda	ib-write-bw	$NETWORK_MODE	shared-conda/ib-write-bw	$HOSTFILE	$SHARED_ENV_SCRIPT	no
-shared-conda-nhc	diagnostic	shared-conda	nhc	$DIAGNOSTIC_MODE	shared-conda/nhc	$HOSTFILE	$SHARED_ENV_SCRIPT	no
-shared-conda-script	script	shared-conda	script	$SCRIPT_MODE	shared-conda/script	$HOSTFILE	$SHARED_ENV_SCRIPT	no
-shared-conda-custom	active	shared-conda	custom	$SCRIPT_MODE	shared-conda/custom	$HOSTFILE	$SHARED_ENV_SCRIPT	no
-shared-conda-context-sh	script	shared-conda	script	$CONTEXT_MODE	shared-conda/context-sh	$HOSTFILE	$RUN_DIR/contexts/shared-conda.env.sh	yes
-shared-conda-context-py	active	shared-conda	custom	$CONTEXT_MODE	shared-conda/context-py	$HOSTFILE	$RUN_DIR/contexts/shared-conda.env.sh	yes
 node-local-conda-platform	basic	node-local-conda	platform	real	node-local-conda/platform	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
 node-local-conda-resource	basic	node-local-conda	resource	real	node-local-conda/resource	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
 node-local-conda-base	basic	node-local-conda	platform,resource	real	node-local-conda/base	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
-node-local-conda-rccl	active	node-local-conda	rccl	$ACTIVE_MODE	node-local-conda/rccl	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
-node-local-conda-gemm	active	node-local-conda	gemm	$ACTIVE_MODE	node-local-conda/gemm	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
-node-local-conda-rccl-tests	active	node-local-conda	rccl	$PROFILE_MODE	node-local-conda/rccl-tests	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
-node-local-conda-rocblas	active	node-local-conda	gemm	$PROFILE_MODE	node-local-conda/rocblas	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
+node-local-conda-rccl-tests	active	node-local-conda	rccl	$PROFILE_MODE	node-local-conda/rccl-tests	$HOSTFILE	$NODE_LOCAL_RCCL_ENV_SCRIPT	no
 node-local-conda-ib-write-bw	active	node-local-conda	ib-write-bw	$NETWORK_MODE	node-local-conda/ib-write-bw	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
-node-local-conda-nhc	diagnostic	node-local-conda	nhc	$DIAGNOSTIC_MODE	node-local-conda/nhc	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
-node-local-conda-script	script	node-local-conda	script	$SCRIPT_MODE	node-local-conda/script	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
-node-local-conda-custom	active	node-local-conda	custom	$SCRIPT_MODE	node-local-conda/custom	$HOSTFILE	$NODE_LOCAL_ENV_SCRIPT	no
-node-local-conda-context-sh	script	node-local-conda	script	$CONTEXT_MODE	node-local-conda/context-sh	$HOSTFILE	$RUN_DIR/contexts/node-local-conda.env.sh	yes
-node-local-conda-context-py	active	node-local-conda	custom	$CONTEXT_MODE	node-local-conda/context-py	$HOSTFILE	$RUN_DIR/contexts/node-local-conda.env.sh	yes
 per-node-container-platform	basic	per-node-container	platform	real	per-node-container/platform	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
 per-node-container-resource	basic	per-node-container	resource	real	per-node-container/resource	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
 per-node-container-base	basic	per-node-container	platform,resource	real	per-node-container/base	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-rccl	active	per-node-container	rccl	$ACTIVE_MODE	per-node-container/rccl	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-gemm	active	per-node-container	gemm	$ACTIVE_MODE	per-node-container/gemm	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-rccl-tests	active	per-node-container	rccl	$PROFILE_MODE	per-node-container/rccl-tests	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-rocblas	active	per-node-container	gemm	$PROFILE_MODE	per-node-container/rocblas	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
+per-node-container-rccl-tests	active	per-node-container	rccl	$PROFILE_MODE	per-node-container/rccl-tests	$HOSTFILE	$CONTAINER_RCCL_ENV_SCRIPT	no
 per-node-container-ib-write-bw	active	per-node-container	ib-write-bw	$NETWORK_MODE	per-node-container/ib-write-bw	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-nhc	diagnostic	per-node-container	nhc	$DIAGNOSTIC_MODE	per-node-container/nhc	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-script	script	per-node-container	script	$SCRIPT_MODE	per-node-container/script	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-custom	active	per-node-container	custom	$SCRIPT_MODE	per-node-container/custom	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-context-sh	script	per-node-container	script	$CONTEXT_MODE	per-node-container/context-sh	$HOSTFILE	$RUN_DIR/contexts/per-node-container.env.sh	yes
-per-node-container-context-py	active	per-node-container	custom	$CONTEXT_MODE	per-node-container/context-py	$HOSTFILE	$RUN_DIR/contexts/per-node-container.env.sh	yes
 per-node-container-container-status	status	per-node-container	container-status	real	per-node-container/container-status	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
 per-node-container-container-create	lifecycle	per-node-container	container-create	dry	per-node-container/container-create	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
 per-node-container-container-recreate	lifecycle	per-node-container	container-recreate	dry	per-node-container/container-recreate	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
 per-node-container-container-delete	lifecycle	per-node-container	container-delete	dry	per-node-container/container-delete	$HOSTFILE	$CONTAINER_ENV_SCRIPT	no
-per-node-container-launcher-mpirun-torchrun	active	per-node-container	rccl	dry	per-node-container/launcher-mpirun-torchrun	$RUN_DIR/launcher-hostfile	$CONTAINER_ENV_SCRIPT	no
-per-node-container-launcher-ssh-torchrun	active	per-node-container	rccl	dry	per-node-container/launcher-ssh-torchrun	$RUN_DIR/launcher-hostfile	$CONTAINER_ENV_SCRIPT	no
-per-node-container-launcher-mpirun	active	per-node-container	rccl	dry	per-node-container/launcher-mpirun	$RUN_DIR/launcher-hostfile	$CONTAINER_ENV_SCRIPT	no
 help	help	-	--help	dry	help	-	-	no
 version	help	-	--version	dry	version	-	-	no
 CASES
@@ -229,71 +177,19 @@ printf "[RESULT] shared-conda-base rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-base.log"; then LOCAL_RC=1; fi
 
-# shared-conda-rccl: active；节点范围 $HOSTFILE；mode=$ACTIVE_MODE
-printf "[CALL] shared-conda-rccl\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    shared-conda rccl -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$SHARED_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/shared-conda/rccl" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --launcher "$LAUNCHER" --profile worker --nproc-per-node "$NPROC_PER_NODE" \
-    "${NP_OPTION[@]}" --master-port "$MASTER_PORT" --timeout "$TIMEOUT" \
-    --script-arg=--bytes --script-arg=4096 --script-arg=--iterations --script-arg=2 --script-arg=--warmup --script-arg=0 \
-    "${ACTIVE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-rccl.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "shared-conda-rccl\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] shared-conda-rccl rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-rccl.log"; then LOCAL_RC=1; fi
-
-# shared-conda-gemm: active；节点范围 $HOSTFILE；mode=$ACTIVE_MODE
-printf "[CALL] shared-conda-gemm\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    shared-conda gemm -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$SHARED_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/shared-conda/gemm" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --launcher "$LAUNCHER" --profile worker --nproc-per-node "$NPROC_PER_NODE" \
-    "${NP_OPTION[@]}" --master-port "$MASTER_PORT" --timeout "$TIMEOUT" \
-    --script-arg=--size --script-arg=128 --script-arg=--iterations --script-arg=2 \
-    "${ACTIVE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-gemm.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "shared-conda-gemm\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] shared-conda-gemm rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-gemm.log"; then LOCAL_RC=1; fi
-
 # shared-conda-rccl-tests: active；节点范围 $HOSTFILE；mode=$PROFILE_MODE
 printf "[CALL] shared-conda-rccl-tests\n"
 bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
     shared-conda rccl -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$SHARED_ENV_SCRIPT" \
+    --env-script "$SHARED_RCCL_ENV_SCRIPT" \
     --output-dir "$RUN_DIR/shared-conda/rccl-tests" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --nproc-per-node "$RCCL_NPROC_PER_NODE" --timeout "$TIMEOUT" \
-    --script-arg=-b --script-arg=4 --script-arg=-e --script-arg=4K --script-arg=-n --script-arg=2 --script-arg=-w --script-arg=0 \
+    --group-size "$GROUP_SIZE" --gpus-per-node "$RCCL_GPUS_PER_NODE" --timeout "$TIMEOUT" \
     "${PROFILE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-rccl-tests.log"
 case_rc=("${PIPESTATUS[@]}")
 printf "shared-conda-rccl-tests\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
 printf "[RESULT] shared-conda-rccl-tests rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-rccl-tests.log"; then LOCAL_RC=1; fi
-
-# shared-conda-rocblas: active；节点范围 $HOSTFILE；mode=$PROFILE_MODE
-printf "[CALL] shared-conda-rocblas\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    shared-conda gemm -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$SHARED_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/shared-conda/rocblas" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --profile rocblas --timeout "$TIMEOUT" \
-    --script-arg=--shapes --script-arg=128x128x128 --script-arg=--cards --script-arg=0 --script-arg=--iters --script-arg=2 \
-    "${PROFILE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-rocblas.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "shared-conda-rocblas\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] shared-conda-rocblas rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-rocblas.log"; then LOCAL_RC=1; fi
 
 # shared-conda-ib-write-bw: ib；节点范围 $HOSTFILE；mode=$NETWORK_MODE
 printf "[CALL] shared-conda-ib-write-bw\n"
@@ -309,73 +205,6 @@ printf "shared-conda-ib-write-bw\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "
 printf "[RESULT] shared-conda-ib-write-bw rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-ib-write-bw.log"; then LOCAL_RC=1; fi
-
-# shared-conda-nhc: diagnostic；节点范围 $HOSTFILE；mode=$DIAGNOSTIC_MODE
-printf "[CALL] shared-conda-nhc\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    shared-conda nhc -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$SHARED_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/shared-conda/nhc" \
-    --timeout "$TIMEOUT" "${DIAGNOSTIC_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-nhc.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "shared-conda-nhc\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] shared-conda-nhc rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-nhc.log"; then LOCAL_RC=1; fi
-
-# shared-conda-script: script；节点范围 $HOSTFILE；mode=$SCRIPT_MODE
-printf "[CALL] shared-conda-script\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    shared-conda script -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$SHARED_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/shared-conda/script" \
-    --script "$DIAGNOSTIC_SCRIPT" --timeout "$TIMEOUT" "${SCRIPT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-script.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "shared-conda-script\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] shared-conda-script rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-script.log"; then LOCAL_RC=1; fi
-
-# shared-conda-custom: script；节点范围 $HOSTFILE；mode=$SCRIPT_MODE
-printf "[CALL] shared-conda-custom\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    shared-conda custom -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$SHARED_ENV_SCRIPT" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --output-dir "$RUN_DIR/shared-conda/custom" \
-    --script "$CUSTOM_SCRIPT" --timeout "$TIMEOUT" "${SCRIPT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-custom.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "shared-conda-custom\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] shared-conda-custom rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-custom.log"; then LOCAL_RC=1; fi
-
-# shared-conda-context-sh: script；节点范围 $HOSTFILE；mode=$CONTEXT_MODE
-printf "[CALL] shared-conda-context-sh\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    shared-conda script -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$RUN_DIR/contexts/shared-conda.env.sh" \
-    --output-dir "$RUN_DIR/shared-conda/context-sh" \
-    --script "$RUN_DIR/contexts/context.sh" --timeout "$TIMEOUT" "${CONTEXT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-context-sh.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "shared-conda-context-sh\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] shared-conda-context-sh rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-context-sh.log"; then LOCAL_RC=1; fi
-
-# shared-conda-context-py: script；节点范围 $HOSTFILE；mode=$CONTEXT_MODE
-printf "[CALL] shared-conda-context-py\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    shared-conda custom -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$RUN_DIR/contexts/shared-conda.env.sh" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --output-dir "$RUN_DIR/shared-conda/context-py" \
-    --script "$RUN_DIR/contexts/context.py" --timeout "$TIMEOUT" "${CONTEXT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/shared-conda-context-py.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "shared-conda-context-py\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] shared-conda-context-py rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/shared-conda-context-py.log"; then LOCAL_RC=1; fi
 
 # node-local-conda-platform: basic；节点范围 $HOSTFILE；mode=real
 printf "[CALL] node-local-conda-platform\n"
@@ -413,71 +242,19 @@ printf "[RESULT] node-local-conda-base rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-base.log"; then LOCAL_RC=1; fi
 
-# node-local-conda-rccl: active；节点范围 $HOSTFILE；mode=$ACTIVE_MODE
-printf "[CALL] node-local-conda-rccl\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    node-local-conda rccl -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$NODE_LOCAL_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/node-local-conda/rccl" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --launcher "$LAUNCHER" --profile worker --nproc-per-node "$NPROC_PER_NODE" \
-    "${NP_OPTION[@]}" --master-port "$MASTER_PORT" --timeout "$TIMEOUT" \
-    --script-arg=--bytes --script-arg=4096 --script-arg=--iterations --script-arg=2 --script-arg=--warmup --script-arg=0 \
-    "${ACTIVE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-rccl.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "node-local-conda-rccl\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] node-local-conda-rccl rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-rccl.log"; then LOCAL_RC=1; fi
-
-# node-local-conda-gemm: active；节点范围 $HOSTFILE；mode=$ACTIVE_MODE
-printf "[CALL] node-local-conda-gemm\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    node-local-conda gemm -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$NODE_LOCAL_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/node-local-conda/gemm" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --launcher "$LAUNCHER" --profile worker --nproc-per-node "$NPROC_PER_NODE" \
-    "${NP_OPTION[@]}" --master-port "$MASTER_PORT" --timeout "$TIMEOUT" \
-    --script-arg=--size --script-arg=128 --script-arg=--iterations --script-arg=2 \
-    "${ACTIVE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-gemm.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "node-local-conda-gemm\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] node-local-conda-gemm rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-gemm.log"; then LOCAL_RC=1; fi
-
 # node-local-conda-rccl-tests: active；节点范围 $HOSTFILE；mode=$PROFILE_MODE
 printf "[CALL] node-local-conda-rccl-tests\n"
 bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
     node-local-conda rccl -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$NODE_LOCAL_ENV_SCRIPT" \
+    --env-script "$NODE_LOCAL_RCCL_ENV_SCRIPT" \
     --output-dir "$RUN_DIR/node-local-conda/rccl-tests" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --nproc-per-node "$RCCL_NPROC_PER_NODE" --timeout "$TIMEOUT" \
-    --script-arg=-b --script-arg=4 --script-arg=-e --script-arg=4K --script-arg=-n --script-arg=2 --script-arg=-w --script-arg=0 \
+    --group-size "$GROUP_SIZE" --gpus-per-node "$RCCL_GPUS_PER_NODE" --timeout "$TIMEOUT" \
     "${PROFILE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-rccl-tests.log"
 case_rc=("${PIPESTATUS[@]}")
 printf "node-local-conda-rccl-tests\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
 printf "[RESULT] node-local-conda-rccl-tests rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-rccl-tests.log"; then LOCAL_RC=1; fi
-
-# node-local-conda-rocblas: active；节点范围 $HOSTFILE；mode=$PROFILE_MODE
-printf "[CALL] node-local-conda-rocblas\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    node-local-conda gemm -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$NODE_LOCAL_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/node-local-conda/rocblas" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --profile rocblas --timeout "$TIMEOUT" \
-    --script-arg=--shapes --script-arg=128x128x128 --script-arg=--cards --script-arg=0 --script-arg=--iters --script-arg=2 \
-    "${PROFILE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-rocblas.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "node-local-conda-rocblas\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] node-local-conda-rocblas rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-rocblas.log"; then LOCAL_RC=1; fi
 
 # node-local-conda-ib-write-bw: ib；节点范围 $HOSTFILE；mode=$NETWORK_MODE
 printf "[CALL] node-local-conda-ib-write-bw\n"
@@ -493,73 +270,6 @@ printf "node-local-conda-ib-write-bw\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" 
 printf "[RESULT] node-local-conda-ib-write-bw rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-ib-write-bw.log"; then LOCAL_RC=1; fi
-
-# node-local-conda-nhc: diagnostic；节点范围 $HOSTFILE；mode=$DIAGNOSTIC_MODE
-printf "[CALL] node-local-conda-nhc\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    node-local-conda nhc -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$NODE_LOCAL_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/node-local-conda/nhc" \
-    --timeout "$TIMEOUT" "${DIAGNOSTIC_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-nhc.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "node-local-conda-nhc\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] node-local-conda-nhc rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-nhc.log"; then LOCAL_RC=1; fi
-
-# node-local-conda-script: script；节点范围 $HOSTFILE；mode=$SCRIPT_MODE
-printf "[CALL] node-local-conda-script\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    node-local-conda script -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$NODE_LOCAL_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/node-local-conda/script" \
-    --script "$DIAGNOSTIC_SCRIPT" --timeout "$TIMEOUT" "${SCRIPT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-script.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "node-local-conda-script\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] node-local-conda-script rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-script.log"; then LOCAL_RC=1; fi
-
-# node-local-conda-custom: script；节点范围 $HOSTFILE；mode=$SCRIPT_MODE
-printf "[CALL] node-local-conda-custom\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    node-local-conda custom -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$NODE_LOCAL_ENV_SCRIPT" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --output-dir "$RUN_DIR/node-local-conda/custom" \
-    --script "$CUSTOM_SCRIPT" --timeout "$TIMEOUT" "${SCRIPT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-custom.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "node-local-conda-custom\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] node-local-conda-custom rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-custom.log"; then LOCAL_RC=1; fi
-
-# node-local-conda-context-sh: script；节点范围 $HOSTFILE；mode=$CONTEXT_MODE
-printf "[CALL] node-local-conda-context-sh\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    node-local-conda script -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$RUN_DIR/contexts/node-local-conda.env.sh" \
-    --output-dir "$RUN_DIR/node-local-conda/context-sh" \
-    --script "$RUN_DIR/contexts/context.sh" --timeout "$TIMEOUT" "${CONTEXT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-context-sh.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "node-local-conda-context-sh\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] node-local-conda-context-sh rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-context-sh.log"; then LOCAL_RC=1; fi
-
-# node-local-conda-context-py: script；节点范围 $HOSTFILE；mode=$CONTEXT_MODE
-printf "[CALL] node-local-conda-context-py\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    node-local-conda custom -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$RUN_DIR/contexts/node-local-conda.env.sh" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --output-dir "$RUN_DIR/node-local-conda/context-py" \
-    --script "$RUN_DIR/contexts/context.py" --timeout "$TIMEOUT" "${CONTEXT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/node-local-conda-context-py.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "node-local-conda-context-py\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] node-local-conda-context-py rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/node-local-conda-context-py.log"; then LOCAL_RC=1; fi
 
 # per-node-container-platform: basic；节点范围 $HOSTFILE；mode=real
 printf "[CALL] per-node-container-platform\n"
@@ -600,54 +310,14 @@ printf "[RESULT] per-node-container-base rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-base.log"; then LOCAL_RC=1; fi
 
-# per-node-container-rccl: active；节点范围 $HOSTFILE；mode=$ACTIVE_MODE
-printf "[CALL] per-node-container-rccl\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container rccl -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/per-node-container/rccl" \
-    --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --launcher "$LAUNCHER" --profile worker --nproc-per-node "$NPROC_PER_NODE" \
-    "${NP_OPTION[@]}" --master-port "$MASTER_PORT" --timeout "$TIMEOUT" \
-    --container-ssh-port "$CONTAINER_SSH_PORT" \
-    --script-arg=--bytes --script-arg=4096 --script-arg=--iterations --script-arg=2 --script-arg=--warmup --script-arg=0 \
-    "${ACTIVE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/per-node-container-rccl.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-rccl\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-rccl rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-rccl.log"; then LOCAL_RC=1; fi
-
-# per-node-container-gemm: active；节点范围 $HOSTFILE；mode=$ACTIVE_MODE
-printf "[CALL] per-node-container-gemm\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container gemm -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/per-node-container/gemm" \
-    --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --launcher "$LAUNCHER" --profile worker --nproc-per-node "$NPROC_PER_NODE" \
-    "${NP_OPTION[@]}" --master-port "$MASTER_PORT" --timeout "$TIMEOUT" \
-    --container-ssh-port "$CONTAINER_SSH_PORT" \
-    --script-arg=--size --script-arg=128 --script-arg=--iterations --script-arg=2 \
-    "${ACTIVE_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/per-node-container-gemm.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-gemm\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-gemm rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-gemm.log"; then LOCAL_RC=1; fi
-
 # per-node-container-rccl-tests: active；节点范围 $HOSTFILE；mode=$PROFILE_MODE
 printf "[CALL] per-node-container-rccl-tests\n"
 bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
     per-node-container rccl -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
+    --env-script "$CONTAINER_RCCL_ENV_SCRIPT" \
     --output-dir "$RUN_DIR/per-node-container/rccl-tests" \
     --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --nproc-per-node "$RCCL_NPROC_PER_NODE" --timeout "$TIMEOUT" \
-    --script-arg=-b --script-arg=4 --script-arg=-e --script-arg=4K --script-arg=-n --script-arg=2 --script-arg=-w --script-arg=0 \
+    --group-size "$GROUP_SIZE" --gpus-per-node "$RCCL_GPUS_PER_NODE" --timeout "$TIMEOUT" \
     "${PROFILE_OPTIONS[@]}" \
     --container-ssh-port "$CONTAINER_SSH_PORT" 2>&1 | tee "$RUN_DIR/logs/per-node-container-rccl-tests.log"
 case_rc=("${PIPESTATUS[@]}")
@@ -655,24 +325,6 @@ printf "per-node-container-rccl-tests\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}"
 printf "[RESULT] per-node-container-rccl-tests rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-rccl-tests.log"; then LOCAL_RC=1; fi
-
-# per-node-container-rocblas: active；节点范围 $HOSTFILE；mode=$PROFILE_MODE
-printf "[CALL] per-node-container-rocblas\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container gemm -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/per-node-container/rocblas" \
-    --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --profile rocblas --timeout "$TIMEOUT" \
-    --script-arg=--shapes --script-arg=128x128x128 --script-arg=--cards --script-arg=0 --script-arg=--iters --script-arg=2 \
-    "${PROFILE_OPTIONS[@]}" \
-    --container-ssh-port "$CONTAINER_SSH_PORT" 2>&1 | tee "$RUN_DIR/logs/per-node-container-rocblas.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-rocblas\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-rocblas rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-rocblas.log"; then LOCAL_RC=1; fi
 
 # per-node-container-ib-write-bw: ib；节点范围 $HOSTFILE；mode=$NETWORK_MODE
 printf "[CALL] per-node-container-ib-write-bw\n"
@@ -689,78 +341,6 @@ printf "per-node-container-ib-write-bw\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}
 printf "[RESULT] per-node-container-ib-write-bw rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-ib-write-bw.log"; then LOCAL_RC=1; fi
-
-# per-node-container-nhc: diagnostic；节点范围 $HOSTFILE；mode=$DIAGNOSTIC_MODE
-printf "[CALL] per-node-container-nhc\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container nhc -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/per-node-container/nhc" \
-    --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --timeout "$TIMEOUT" "${DIAGNOSTIC_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/per-node-container-nhc.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-nhc\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-nhc rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-nhc.log"; then LOCAL_RC=1; fi
-
-# per-node-container-script: script；节点范围 $HOSTFILE；mode=$SCRIPT_MODE
-printf "[CALL] per-node-container-script\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container script -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/per-node-container/script" \
-    --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --script "$DIAGNOSTIC_SCRIPT" --timeout "$TIMEOUT" "${SCRIPT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/per-node-container-script.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-script\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-script rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-script.log"; then LOCAL_RC=1; fi
-
-# per-node-container-custom: script；节点范围 $HOSTFILE；mode=$SCRIPT_MODE
-printf "[CALL] per-node-container-custom\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container custom -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --output-dir "$RUN_DIR/per-node-container/custom" \
-    --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --script "$CUSTOM_SCRIPT" --timeout "$TIMEOUT" "${SCRIPT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/per-node-container-custom.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-custom\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-custom rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-custom.log"; then LOCAL_RC=1; fi
-
-# per-node-container-context-sh: script；节点范围 $HOSTFILE；mode=$CONTEXT_MODE
-printf "[CALL] per-node-container-context-sh\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container script -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$RUN_DIR/contexts/per-node-container.env.sh" \
-    --output-dir "$RUN_DIR/per-node-container/context-sh" \
-    --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --script "$RUN_DIR/contexts/context.sh" --timeout "$TIMEOUT" "${CONTEXT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/per-node-container-context-sh.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-context-sh\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-context-sh rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-context-sh.log"; then LOCAL_RC=1; fi
-
-# per-node-container-context-py: script；节点范围 $HOSTFILE；mode=$CONTEXT_MODE
-printf "[CALL] per-node-container-context-py\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container custom -f "$HOSTFILE" "${COMMON_OPTIONS[@]}" \
-    --env-script "$RUN_DIR/contexts/per-node-container.env.sh" \
-    --group-size "$GROUP_SIZE" --slots "$ACTIVE_SLOTS" \
-    --output-dir "$RUN_DIR/per-node-container/context-py" \
-    --container "$CONTAINER_NAME" -i "$IMAGE" \
-    --script "$RUN_DIR/contexts/context.py" --timeout "$TIMEOUT" "${CONTEXT_OPTIONS[@]}" 2>&1 | tee "$RUN_DIR/logs/per-node-container-context-py.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-context-py\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-context-py rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-context-py.log"; then LOCAL_RC=1; fi
 
 # per-node-container-container-status: status；节点范围 $HOSTFILE；mode=real
 printf "[CALL] per-node-container-container-status\n"
@@ -811,51 +391,6 @@ printf "per-node-container-container-delete\t%s\t%s\n" "${case_rc[0]}" "${case_r
 printf "[RESULT] per-node-container-container-delete rc=%s\n" "${case_rc[0]}"
 if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
 if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-container-delete.log"; then LOCAL_RC=1; fi
-
-# per-node-container-launcher-mpirun-torchrun: active；节点范围 $RUN_DIR/launcher-hostfile；mode=dry
-printf "[CALL] per-node-container-launcher-mpirun-torchrun\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container rccl -f "$RUN_DIR/launcher-hostfile" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/per-node-container/launcher-mpirun-torchrun" \
-    --container "$CONTAINER_NAME" \
-    --group-size 2 --slots 1 --profile worker --launcher mpirun-torchrun \
-    --container-ssh-port "$CONTAINER_SSH_PORT" --dry-run 2>&1 | tee "$RUN_DIR/logs/per-node-container-launcher-mpirun-torchrun.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-launcher-mpirun-torchrun\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-launcher-mpirun-torchrun rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-launcher-mpirun-torchrun.log"; then LOCAL_RC=1; fi
-
-# per-node-container-launcher-ssh-torchrun: active；节点范围 $RUN_DIR/launcher-hostfile；mode=dry
-printf "[CALL] per-node-container-launcher-ssh-torchrun\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container rccl -f "$RUN_DIR/launcher-hostfile" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/per-node-container/launcher-ssh-torchrun" \
-    --container "$CONTAINER_NAME" \
-    --group-size 2 --slots 1 --profile worker --launcher ssh-torchrun \
-    --container-ssh-port "$CONTAINER_SSH_PORT" --dry-run 2>&1 | tee "$RUN_DIR/logs/per-node-container-launcher-ssh-torchrun.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-launcher-ssh-torchrun\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-launcher-ssh-torchrun rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-launcher-ssh-torchrun.log"; then LOCAL_RC=1; fi
-
-# per-node-container-launcher-mpirun: active；节点范围 $RUN_DIR/launcher-hostfile；mode=dry
-printf "[CALL] per-node-container-launcher-mpirun\n"
-bash "$HCU_CLUSTER_RUN" "${CONTROLLER_OPTIONS[@]}" \
-    per-node-container rccl -f "$RUN_DIR/launcher-hostfile" "${COMMON_OPTIONS[@]}" \
-    --env-script "$CONTAINER_ENV_SCRIPT" \
-    --output-dir "$RUN_DIR/per-node-container/launcher-mpirun" \
-    --container "$CONTAINER_NAME" \
-    --group-size 2 --slots 1 --profile worker --launcher mpirun \
-    --container-ssh-port "$CONTAINER_SSH_PORT" --dry-run 2>&1 | tee "$RUN_DIR/logs/per-node-container-launcher-mpirun.log"
-case_rc=("${PIPESTATUS[@]}")
-printf "per-node-container-launcher-mpirun\t%s\t%s\n" "${case_rc[0]}" "${case_rc[1]}" >> "$CALLS"
-printf "[RESULT] per-node-container-launcher-mpirun rc=%s\n" "${case_rc[0]}"
-if (( case_rc[1] != 0 || (case_rc[0] != 0 && case_rc[0] != 2 && case_rc[0] != 3) )); then LOCAL_RC=1; fi
-if (( case_rc[0] == 3 )) && ! grep -Eq "^RESULT[[:space:]]+PRECHECK_FAILED[[:space:]]*$" "$RUN_DIR/logs/per-node-container-launcher-mpirun.log"; then LOCAL_RC=1; fi
 
 # help: help；节点范围 -；mode=dry
 printf "[CALL] help\n"
@@ -916,29 +451,6 @@ def expand_nodes(groups):
     return result
 
 
-def check_context(path, node, scenario, token):
-    text = path.read_text(encoding='utf-8')
-    records = []
-    for line in text.splitlines():
-        if line.startswith('HCU_CONTEXT_JSON '):
-            records.append(json.loads(line.partition(' ')[2]))
-        elif line.startswith('HCU_CONTEXT\t'):
-            _, marker, hostname, scope, pid = line.split('\t')
-            records.append(dict(token=marker, node=hostname, scope=scope, pid=int(pid)))
-    require(len(records) == 1, 'missing or repeated runtime-context evidence for ' + node)
-    record = records[0]
-    require(record.get('token') == token, 'env.sh execution marker missing/wrong on ' + node)
-    # Docker hostname is an observation, not the physical SSH target identity.
-    # The caller binds this evidence to the per-node result and stdout path.
-    require(isinstance(record.get('node'), str) and bool(record['node']), 'missing observed hostname')
-    if scenario != 'per-node-container':
-        require(record['node'] == node.split('.')[0], 'payload executed on wrong node: ' + repr(record))
-    require(record.get('scope') == ('container' if scenario == 'per-node-container' else 'host'),
-            'payload executed in wrong host/container scope: ' + repr(record))
-    require(isinstance(record.get('pid'), int) and record['pid'] > 0, 'missing process evidence')
-    return record
-
-
 def check_completion(record, *, allow_cancelled=False):
     require(not record.get('interrupted'), 'interrupted execution cannot pass acceptance')
     require(record.get('status') != 'CLEANUP_UNCONFIRMED' and
@@ -970,18 +482,135 @@ def aggregate_status(records):
 
 
 def check_active_launch(launch, members, operation, profile, requested):
-    effective = ('node-script' if operation == 'custom' else profile if profile != 'worker' else
-                 'local' if len(members) == 1 else requested)
+    effective = 'rccl-tests'
     require(launch.get('launcher') == effective, 'effective launcher mismatch')
     require(launch.get('execution_profile') == profile, 'group profile mismatch')
     require(launch.get('requested_launcher') == requested, 'requested launcher mismatch')
     require(launch.get('leader') == members[0], 'group leader mismatch')
-    dispatched = members if effective in {'ssh-torchrun', 'node-script', 'rocblas'} else members[:1]
+    dispatched = members[:1]
     commands = launch.get('commands') or []
     require(len(commands) == len(dispatched) and {item['node'] for item in commands} == set(dispatched),
             'launch command node coverage mismatch')
     require(all(item.get('command') for item in commands), 'empty node launch command')
     return dispatched
+
+
+def verify_staged_case(path, case, rc, nodes, result, meta):
+    from hcu_envcheck.reporting.facts import load_group, relative_source
+    from hcu_envcheck.reporting.log_store import open_log
+    report = load_json(path)
+
+    def confirmed_cleanup(facts, stage, members):
+        cleanup = [row for row in facts.table('cleanup') if row['stage_id'] == stage]
+        source = 'normal' if any(row['source'] == 'normal' for row in cleanup) else 'fallback'
+        selected = [row for row in cleanup if row['source'] == source]
+        require(selected and {row['node'] for row in selected} == set(members) and
+                all(row['status'] == 'CONFIRMED' for row in selected), 'missing staged cleanup node proof')
+    require(type(report.get('schema_version')) is int and report['schema_version'] == 1,
+            'invalid staged schema_version')
+    require(path.stat().st_mtime >= float(meta['started']) - 1, 'stale report')
+    require(report.get('final') is True, 'staged report is not final')
+    control, state = report.get('control') or {}, path.parent
+    require(control.get('state_layout') == 'compact-group-v2', 'unsupported staged layout')
+    require(control.get('scenario') == case['scenario'] and control.get('operation') == case['operation'],
+            'staged scenario/operation mismatch')
+    require(control.get('env_script') == case['env_script'], 'report env_script mismatch')
+    require(isinstance(control.get('container'), str) and
+            (bool(control['container']) if case['scenario'] == 'per-node-container' else control['container'] == ''),
+            'report execution scope mismatch')
+    status = report.get('status')
+    require(status in {'PASS', 'WARN', 'FAIL'}, 'invalid staged execution status')
+    require(rc == (0 if status in {'PASS', 'WARN'} else 1), 'staged status/exit-code mismatch')
+    groups, stages = report.get('groups'), report.get('stages')
+    require(isinstance(groups, list) and bool(groups) and isinstance(stages, list) and bool(stages),
+            'missing staged group/stage plan')
+    require(len({group['group'] for group in groups}) == len(groups) and
+            len({stage['stage_id'] for stage in stages}) == len(stages), 'duplicate staged plan identity')
+    if case['operation'] == 'rccl':
+        require([stage['item'] for stage in stages] == ['all_reduce', 'all_gather', 'broadcast', 'reduce',
+                'reduce_scatter', 'gather', 'scatter', 'alltoall', 'alltoallv', 'sendrecv'], 'RCCL suite is incomplete')
+    require(all(str(stage.get('iteration')) == '0' for stage in stages), 'unexpected staged repetition')
+    expected = [(stage['stage_id'], group['group']) for stage in stages for group in groups]
+    records = report.get('results') or []
+    require([(row['stage_id'], row['group']) for row in records] == expected, 'staged result coverage/order mismatch')
+    require(report.get('planned') == len(expected), 'staged planned count mismatch')
+    preflight = report.get('preflight') or []
+    require([row['group'] for row in preflight] == [group['group'] for group in groups], 'preflight coverage mismatch')
+    grouped, facts_by_group = [], {}
+    for group in groups:
+        ident = group['group']
+        members = group['nodes'].split(',')
+        require(bool(members) and all(members) and len(set(members)) == len(members), 'invalid staged group members')
+        grouped.extend(members)
+        facts = load_group(state, ident)
+        require(facts is not None, 'missing authoritative compact facts')
+        facts_by_group[ident] = facts
+        tasks = {row['stage_id']: row for row in facts.table('tasks')}
+        prepare = tasks.get('preflight') or {}
+        require(prepare.get('status') in {'PASS','WARN','FAIL','NA'} and prepare.get('cleanup') == 'CONFIRMED',
+                'preflight not closed with confirmed cleanup')
+        confirmed_cleanup(facts, 'preflight', members)
+        with open_log(state / 'prepared' / ident / 'group.log') as stream:
+            while stream.read(65536):
+                pass
+    omitted = report.get('non_participating') or {}
+    omitted = omitted.get('nodes', []) if isinstance(omitted, dict) else []
+    require(len(grouped) == len(set(grouped)) and grouped == [node for node in nodes if node not in omitted]
+            and set(grouped).isdisjoint(omitted) and set(grouped + omitted) == set(nodes),
+            'staged group coverage differs from hostfile')
+    for row in records:
+        group, stage = row['group'], row['stage_id']
+        facts = facts_by_group[group]
+        task = next((task for task in facts.table('tasks') if task['stage_id'] == stage), {})
+        require(task and task.get('phase') == 'execute', 'missing staged execution task')
+        members = next(group_row['nodes'].split(',') for group_row in groups if group_row['group'] == group)
+        require(row.get('nodes') == ','.join(members), 'staged result member mismatch')
+        if not row.get('dispatched'):
+            require(task.get('status') == row.get('status') == 'BLOCKED', 'undispatched staged task is not BLOCKED')
+            for node in members:
+                result['node_execution'].setdefault(node, 'NOT_EXECUTED')
+            continue
+        require(task.get('cleanup') == row.get('cleanup') == 'CONFIRMED', 'staged cleanup unconfirmed')
+        confirmed_cleanup(facts, stage, members)
+        require(task.get('status') in {'PASS','WARN','FAIL'} and row.get('status') in {'PASS','WARN','FAIL'},
+                'interrupted or incomplete staged task')
+        require(str(task.get('exit_code', '')).lstrip('-').isdigit(), 'missing staged raw exit code')
+        require(row['status'] != 'PASS' or (task['status'] == 'PASS' and str(task['exit_code']) == '0'),
+                'staged PASS contradicts execution facts')
+        prefix = f'stages/{stage}/groups/{group}/'
+        with open_log(state / prefix / 'group.log') as stream:
+            while stream.read(65536):
+                pass
+        node_rows = [node for node in facts.table('nodes') if node['stage_id'] == stage]
+        require([node['node'] for node in node_rows] == members, 'staged node execution coverage mismatch')
+        if case['operation'] == 'ib-write-bw':
+            saved = [item for item in facts.table('ib') if item['stage_id'] == stage]
+            require(len(saved) == 1 and saved[0]['token'] == task['token'], 'missing authoritative IB metadata')
+            evidence = saved[0]['metadata']
+            require(evidence.get('selected_nodes') == members and evidence.get('run_token') == task['token'], 'IB group inventory identity mismatch')
+            pairs = evidence.get('pairs')
+            require(isinstance(pairs, list), 'missing IB pair artifacts')
+            require(evidence.get('status') != 'PASS' or bool(pairs), 'IB PASS without server/client measurements')
+            for pair in pairs:
+                require(pair.get('source') in members and pair.get('destination') in members, 'IB pair outside group')
+                commands = pair.get('commands') or []
+                require(len(commands) == 2, 'IB pair missing server/client command evidence')
+                for command in commands:
+                    require(type(command.get('returncode')) is int and command.get('argv'), 'IB endpoint missing command/returncode')
+                    for name in ('stdout_path', 'stderr_path'):
+                        source = relative_source(command.get(name))
+                        require(source.startswith(prefix), 'IB endpoint log outside its task')
+                        with open_log(state / source) as stream:
+                            while stream.read(65536):
+                                pass
+            result['pairs_executed'] = result.get('pairs_executed', 0) + len(pairs)
+        for node in members:
+            result['node_execution'][node] = 'EXECUTION_ATTEMPTED'
+    for node in omitted:
+        result['node_execution'][node] = 'NOT_EXECUTED'
+    result.update(report=str(path), status=status, nodes_reported=grouped,
+                  execution_state='EXECUTION_ATTEMPTED' if any(row.get('dispatched') for row in records) else 'BLOCKED_NOT_EXECUTED')
+    return result
 
 
 def verify_case(root, case, receipt, meta):
@@ -1012,6 +641,11 @@ def verify_case(root, case, receipt, meta):
             result.update(status='PRECHECK_FAILED', execution_state='BLOCKED_NOT_EXECUTED')
             result['node_execution'] = {node: 'NOT_EXECUTED' for node in nodes}
             return result
+        if mode == 'real' and kind in {'basic', 'active', 'ib'}:
+            staged = [path for path in (root / case['directory']).rglob('report.json') if path.parent.name == '.state']
+            if staged:
+                require(len(staged) == 1, 'expected exactly one current staged report')
+                return verify_staged_case(staged[0], case, rc, nodes, result, meta)
         require(rc in ({0} if mode == 'dry' else {0, 2}), 'unexpected tool exit code: ' + str(rc))
         if kind in {'status', 'lifecycle'}:
             match = re.search(r'^RESULT\s+(\S+)\s*$', text, re.M)
@@ -1025,7 +659,6 @@ def verify_case(root, case, receipt, meta):
             return result
         directory = root / case['directory']
         names = {'basic': ('cluster-result.json',), 'active': ('active-result.json',),
-                 'script': ('script-result.json',), 'diagnostic': (case['operation'] + '-result.json',),
                  'ib': ('ib-write-bw-result.json',)}[kind]
         files = [p for name in names for p in directory.rglob(name)]
         require(len(files) == 1, 'expected exactly one current report: ' + ','.join(names))
@@ -1034,7 +667,7 @@ def verify_case(root, case, receipt, meta):
         require(path.stat().st_mtime >= float(meta['started']) - 1, 'stale report')
         report = load_json(path)
         require(isinstance(report, dict), 'report must be an object')
-        require(report.get('schema_version') == ({'basic':'2.0', 'active':'1.1', 'script':'1.1'}.get(kind, '1.0')), 'invalid schema_version')
+        require(report.get('schema_version') == ({'basic':'2.0', 'active':'1.1'}.get(kind, '1.0')), 'invalid schema_version')
         require(not report.get('error'), 'report contains tool exception: ' + str(report.get('error')))
         check_completion(report)
         execution = report.get('run', {}).get('execution') or {}
@@ -1044,11 +677,6 @@ def verify_case(root, case, receipt, meta):
         require((execution.get('scope') if kind == 'basic' else report.get('execution_scope')) == scope,
                 'report execution scope mismatch')
         scenario = report.get('scenario', (report.get('run', {}).get('execution') or {}).get('scenario'))
-        if kind == 'diagnostic':
-            require(report.get('execution_scope') == ('container' if case['scenario'] == 'per-node-container' else 'host'), 'diagnostic execution scope mismatch')
-            require(report.get('env_script') == case['env_script'], 'diagnostic env_script mismatch')
-        else:
-            require(scenario == case['scenario'], 'report scenario mismatch')
         if kind == 'basic':
             require(rc == 0, 'basic environment outcomes must return zero after report collection')
             require(execution.get('categories') == case['operation'].split(','), 'basic categories mismatch')
@@ -1068,13 +696,8 @@ def verify_case(root, case, receipt, meta):
                 result['node_execution'][node] = 'EXECUTED' if record.get('reachable') else 'NO_TARGET_EVIDENCE'
         elif kind == 'active':
             require(report.get('test_name') == case['operation'], 'report test_name mismatch')
-            # Infer fixed profiles/launcher cases from existing directories. Only
-            # normal worker cases use the configurable LAUNCHER captured in meta.
-            leaf = pathlib.PurePosixPath(case['directory']).name
-            profile = leaf if leaf in {'rccl-tests', 'rocblas'} else 'worker'
-            requested = (leaf[len('launcher-'):] if leaf.startswith('launcher-') else
-                         meta.get('launcher', 'mpirun-torchrun') if case['operation'] in {'rccl', 'gemm'} and profile == 'worker'
-                         else 'mpirun' if profile == 'rccl-tests' else 'mpirun-torchrun')
+            profile = 'rccl-tests' if case['operation'] == 'rccl' else None
+            requested = 'mpirun' if case['operation'] == 'rccl' else 'direct'
             require(report.get('profile') == profile, 'report profile mismatch')
             require(report.get('launcher') == requested, 'report launcher mismatch')
             groups = report.get('groups')
@@ -1136,59 +759,15 @@ def verify_case(root, case, receipt, meta):
                                 require((group_dir / 'nodes' / record['node'] / (stream + '.log')).is_file(),
                                         'missing worker ' + stream + ' evidence')
                         require(group.get('status') == aggregate_status(records), 'group/worker status mismatch')
-                if case['operation'] == 'custom' and mode == 'dry':
-                    require(group.get('launcher') == 'node-script', 'custom must not launch MPI/torchrun')
-                    require({item['node'] for item in launch.get('commands', [])} == set(members), 'custom missing node launch')
                 for node in members:
                     result['node_execution'][node] = ('PLANNED_ONLY' if mode == 'dry' else
                         'NOT_EXECUTED' if group.get('status') in {'SKIPPED','BLOCKED','PRECHECK_FAILED'} else 'EXECUTION_ATTEMPTED')
-                if case['context'] == 'yes' and mode == 'real':
-                    by_node = {item['node']: item for item in group.get('node_results', [])}
-                    require(set(by_node) == set(members), 'context missing node results')
-                    for node, record in by_node.items():
-                        require(record.get('returncode') == 0 and record.get('status') == 'PASS', 'runtime-context payload failed')
-                        context = check_context(group_dir / 'nodes' / node / 'stdout.log', node, case['scenario'], meta['token'])
-                        result.setdefault('runtime_context', {})[node] = context
-                        result['node_execution'][node] = 'EXECUTED_VERIFIED'
             require(len(grouped) == len(set(grouped)) and set(grouped) == set(nodes), 'group coverage differs from hostfile')
             require(set(report.get('nodes') or []) == set(nodes), 'active node list mismatch')
             node_records = dict.fromkeys(grouped)
             status = report.get('status')
             if mode == 'real':
                 require(status == aggregate_status(groups), 'report/group status mismatch')
-        elif kind in {'script', 'diagnostic'}:
-            require(report.get('operation') == case['operation'], 'report operation mismatch')
-            node_records = expand_nodes(report.get('nodes'))
-            status = report.get('status')
-            for node, record in node_records.items():
-                check_completion(record)
-                if mode == 'dry':
-                    require(record.get('status') == 'DRY_RUN' and (record.get('command') or (kind == 'diagnostic' and report.get('command'))), 'missing per-node launch artifact')
-                    result['node_execution'][node] = 'PLANNED_ONLY'
-                elif record.get('status') in {'SKIPPED','BLOCKED','PRECHECK_FAILED'}:
-                    require(record.get('issues') or record.get('reason'), 'skipped node lacks reason')
-                    result['node_execution'][node] = 'NOT_EXECUTED'
-                else:
-                    require(isinstance(record.get('returncode'), int), 'missing per-node return code')
-                    if kind == 'script':
-                        check_worker_result(record)
-                    if kind == 'diagnostic':
-                        require(isinstance(record.get('command'), dict) and record.get('evidence_dir'), 'missing diagnostic execution evidence')
-                        require(pathlib.Path(record['evidence_dir']).is_dir(), 'missing diagnostic evidence directory')
-                    else:
-                        for stream in ('stdout','stderr'):
-                            require(record.get(stream) and pathlib.Path(record[stream]).is_file(), 'missing ' + stream + ' evidence')
-                            require(pathlib.Path(record[stream]).resolve() == (path.parent / 'nodes' / node / (stream + '.log')).resolve(),
-                                    'script log is bound to wrong node: ' + node)
-                    result['node_execution'][node] = 'EXECUTION_ATTEMPTED'
-                    if case['context'] == 'yes':
-                        require(record.get('status') == 'PASS' and record['returncode'] == 0, 'runtime-context payload failed')
-                        context = check_context(pathlib.Path(record['stdout']), node, case['scenario'], meta['token'])
-                        result.setdefault('runtime_context', {})[node] = context
-                        result['node_execution'][node] = 'EXECUTED_VERIFIED'
-            if kind == 'script' and mode == 'real':
-                expected = 'PASS' if all(item.get('status') == 'PASS' for item in node_records.values()) else 'FAIL'
-                require(status == expected, 'report/node status mismatch')
         else:
             # The paired server/client adapter must account for every requested
             # node, including an unmatched last node; no MPI launch is expected.
@@ -1205,7 +784,7 @@ def verify_case(root, case, receipt, meta):
         require(set(node_records) == set(nodes), 'report node scope differs from hostfile')
         allowed = {'DRY_RUN'} if mode == 'dry' else {'PASS','FAIL','READY','BLOCKED','INCOMPLETE','PRECHECK_FAILED','SKIPPED'}
         require(status in allowed, 'invalid execution status: ' + str(status))
-        if kind in {'active','script','diagnostic'}:
+        if kind == 'active':
             require(rc == (0 if status in {'PASS','DRY_RUN','INCOMPLETE'} else 2), 'report status/exit-code mismatch')
         result.update(status=status, nodes_reported=list(node_records), execution_state='PLANNED_ONLY' if mode == 'dry' else 'EXECUTION_ATTEMPTED')
         if mode == 'real' and all(state in {'NOT_EXECUTED','NO_TARGET_EVIDENCE'} for state in result['node_execution'].values()):

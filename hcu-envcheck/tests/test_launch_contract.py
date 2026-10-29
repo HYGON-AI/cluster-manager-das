@@ -6,39 +6,73 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from cluster_run.active import ActiveTestExecutor
 from cluster_run.cli import main
-from cluster_run.launchers import LaunchContext, build_local_command, build_mpirun_command, build_ssh_torchrun_commands
 from cluster_run.preflight import verify_container_mpi_peers
 
+
 ROOT = Path(__file__).resolve().parents[1]
-BASH = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
+
+
+def run_cli(case, args, *, cwd=None):
+    temporary = tempfile.TemporaryDirectory()
+    case.addCleanup(temporary.cleanup)
+    root = Path(temporary.name)
+    calls = root / "transport-calls"
+    for name in ("ssh", "docker"):
+        path = root / name
+        path.write_text('#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$TEST_TRANSPORT_CALLS"\nexit 97\n', encoding="utf-8")
+        path.chmod(0o755)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("HCU_", "RCCL_", "CLUSTER_", "NCCL_", "DEFAULTS_"))}
+    env.update(PATH=str(root) + os.pathsep + os.environ["PATH"], PYTHONPATH=str(ROOT),
+               PYTHONDONTWRITEBYTECODE="1", TEST_TRANSPORT_CALLS=str(calls))
+    command = [sys.executable, "-B", "-c", "import sys; from cluster_run.cli import main; sys.exit(main(sys.argv[1:]))", *args]
+    result = subprocess.run(command, cwd=cwd or ROOT, env=env, text=True, capture_output=True, timeout=20)
+    return result, calls.read_text().splitlines() if calls.exists() else []
 
 
 class LaunchContractTests(unittest.TestCase):
+    def test_removed_test_modes_are_rejected_before_reading_nodes(self):
+        for operation, options in (("gemm", []), ("rccl", ["--profile", "worker"]),
+                                   ("rccl", ["--profile", "rocblas"])):
+            with self.subTest(operation=operation, options=options):
+                result, calls = run_cli(self, ["shared-conda", operation, "-f", "missing-hostfile", *options, "--dry-run"])
+                self.assertEqual(result.returncode, 3 if operation == "gemm" else 2)
+                self.assertIn("invalid choice" if operation == "gemm" else "unsupported staged argument: --profile", result.stderr)
+                self.assertNotIn("readable hostfile required", result.stderr)
+                self.assertEqual(calls, [], "invalid modes must fail before transport")
+
+    def test_executor_rejects_removed_builtin_tests(self):
+        for name, profile in (("gemm", None), ("gemm", "rocblas"), ("rccl", "worker")):
+            with self.subTest(name=name, profile=profile), self.assertRaises(ValueError):
+                ActiveTestExecutor(scenario="shared-conda", test_name=name, nodes=["n1"],
+                    env_script=None, output_dir=Path("."), group_size=1, slots=1,
+                    launcher="mpirun", profile=profile, dry_run=True)
+
     def test_default_rccl_uses_binary_payload_eight_processes_and_container_root(self):
         with tempfile.TemporaryDirectory() as temp:
             report, root = ActiveTestExecutor(scenario="per-node-container", test_name="rccl", nodes=["n1", "n2"],
                 env_script="/share/env.sh", output_dir=Path(temp), group_size=2, slots=1,
-                launcher="mpirun-torchrun", execution_scope="container", container_name="worker", dry_run=True).run()
+                launcher="mpirun", execution_scope="container", container_name="worker", dry_run=True).run()
             self.assertEqual(report["profile"], "rccl-tests")
             self.assertEqual(report["launcher"], "mpirun")
             self.assertEqual(report["nproc_per_node"], 8)
             self.assertTrue(report["allow_root_mpi"])
-            self.assertEqual((root / "groups/group-000/hostfile").read_text().splitlines(), ["n1 slots=8", "n2 slots=8"])
+            self.assertEqual((root / ".state/groups/group-000/hostfile").read_text().splitlines(), ["n1 slots=8", "n2 slots=8"])
             command = report["groups"][0]["commands"][0]["command"]
             self.assertEqual(command[:4], ["docker", "exec", "-i", "worker"])
             self.assertIn("rccl_perf_test.sh", command[-1])
             self.assertIn("HCU_ALLOW_ROOT_MPI=1", command[-1])
-            self.assertIn(str(root / "groups/group-000/rccl"), command[-1])
+            self.assertIn(str(root / ".state/groups/group-000/rccl"), command[-1])
             self.assertNotIn("torch.distributed.run", command[-1])
 
     def test_binary_preflight_and_actual_root_permission_agree(self):
@@ -48,19 +82,19 @@ class LaunchContractTests(unittest.TestCase):
             with self.assertRaises(ContainerPreflightError):
                 ActiveTestExecutor(scenario="per-node-container", test_name="rccl", nodes=["n1", "n2"],
                     env_script="/env.sh", output_dir=Path(temp), group_size=2, slots=1,
-                    launcher="mpirun-torchrun", execution_scope="container", container_name="worker").run()
+                    launcher="mpirun", execution_scope="container", container_name="worker").run()
             self.assertTrue(check.call_args.kwargs["allow_root_mpi"])
             self.assertEqual(check.call_args.kwargs["launcher"], "mpirun")
 
     def test_container_mpi_automatically_allows_root_but_host_mpi_does_not(self):
         common = dict(test_name="rccl", nodes=["n1", "n2"], env_script="/env.sh", output_dir=Path("."),
-                      group_size=2, slots=1, launcher="mpirun-torchrun")
+                      group_size=2, slots=1, launcher="mpirun")
         host = ActiveTestExecutor(scenario="shared-conda", **common)
         worker = ActiveTestExecutor(scenario="per-node-container", execution_scope="container", container_name="worker",
-                                    profile="worker", **common)
+                                    **common)
         self.assertFalse(host.allow_root_mpi)
         self.assertTrue(worker.allow_root_mpi)
-        self.assertEqual(worker.nproc_per_node, 1)
+        self.assertEqual(worker.nproc_per_node, 8)
 
     def test_removed_allow_root_mpi_is_not_exposed_by_cli(self):
         from cluster_run.cli import build_parser
@@ -72,119 +106,38 @@ class LaunchContractTests(unittest.TestCase):
                                    "--container", "worker", "--allow-root-mpi"])
         self.assertEqual(stopped.exception.code, 3)
 
-    def test_cli_rccl_defaults_and_explicit_worker_are_distinct(self):
+    def test_cli_rccl_defaults_and_explicit_scale_match_and_legacy_flags_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             nodes = Path(temp) / "nodes"
-            nodes.write_text("n1\nn2\n")
-            for options, expected in (([], "rccl-tests"), (["--profile", "worker"], "worker"),
-                                      (["--launcher", "mpirun"], "rccl-tests")):
-                folder = Path(temp) / (expected + str(len(options)))
-                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    rc = main(["per-node-container", "rccl", "-f", str(nodes), "--env-script", "/env.sh",
-                               "--container", "worker", "-i", "image:tag", "--dry-run", "-o", str(folder), *options])
-                self.assertEqual(rc, 0)
-                report = json.loads(next(folder.glob("container_rccl_*/active-result.json")).read_text())
-                self.assertEqual(report["profile"], expected)
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                rc = main(["per-node-container", "rccl", "-f", str(nodes), "--env-script", "/env.sh",
-                           "--container", "worker", "-i", "image:tag",
-                           "--launcher", "ssh-torchrun", "--dry-run"])
-            self.assertEqual(rc, 3)  # explicit worker required, never silently substitutes Python
+            nodes.write_text("n1\nn2\n", encoding="utf-8")
+            outputs = []
+            for index, options in enumerate(([], ["--group-size", "1", "--gpus-per-node", "8"])):
+                folder = Path(temp) / str(index)
+                result, calls = run_cli(self, ["per-node-container", "rccl", "-f", str(nodes), "--env-script", "/env.sh",
+                    "--container", "worker", "-i", "image:tag", "--dry-run", "-o", str(folder), *options])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("groups=2 group-size=1 gpus-per-node=8", result.stdout)
+                self.assertEqual([line.split()[2] for line in result.stdout.splitlines() if line.startswith("STAGE ")],
+                    ["all_reduce", "all_gather", "broadcast", "reduce", "reduce_scatter", "gather", "scatter", "alltoall", "alltoallv", "sendrecv"])
+                self.assertEqual(calls, [])
+                self.assertFalse(folder.exists(), "dry-run must not invent execution reports")
+                outputs.append(result.stdout)
+            self.assertEqual(outputs[0], outputs[1])
+            for options in (["--profile", "rccl-tests"], ["--launcher", "mpirun"]):
+                result, calls = run_cli(self, ["per-node-container", "rccl", "-f", str(nodes), "--dry-run", *options])
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unsupported staged argument: " + options[0], result.stderr)
+                self.assertEqual(calls, [])
 
-    def context(self, **kwargs):
-        values = dict(test_name="rccl", launcher="mpirun", env_script="/share/env.sh",
-            group_name="group-000", group_hostfile=Path("/share/hostfile"), nodes=("n1", "n2"),
-            test_command=("true",), nproc_per_node=8, np=None, master_port=29500)
-        values.update(kwargs)
-        return LaunchContext(**values)
 
-    def test_mpi_environment_is_snapshotted_then_training_values_are_overridden(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "env.sh"
-            path.write_text("export RANK=999 WORLD_SIZE=999 LOCAL_RANK=999 MASTER_ADDR=wrong MASTER_PORT=1\n"
-                            "export OMPI_COMM_WORLD_RANK=900 OMPI_COMM_WORLD_SIZE=900\n", encoding="utf-8")
-            probe = ("bash", "-c", 'printf "%s|%s|%s|%s|%s|%s|%s" "$RANK" "$WORLD_SIZE" "$LOCAL_RANK" "$MASTER_ADDR" "$MASTER_PORT" "$OMPI_COMM_WORLD_RANK" "$OMPI_COMM_WORLD_SIZE"')
-            ctx = self.context(env_script=path.as_posix(), test_command=probe)
-            env = dict(os.environ, OMPI_COMM_WORLD_RANK="9", OMPI_COMM_WORLD_SIZE="16", OMPI_COMM_WORLD_LOCAL_RANK="1")
-            result = subprocess.run([BASH, "-c", build_mpirun_command(ctx)[-1]], env=env,
-                                    capture_output=True, encoding="utf-8", check=False)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "9|16|1|n1|29500|9|16")
-
-    def test_pythonpath_is_injected_after_env_source_for_all_launchers(self):
-        ctx = self.context(launcher="ssh-torchrun", worker_root="/mapped/project", python_executable="/conda/bin/python")
-        for _, command in build_ssh_torchrun_commands(ctx):
-            body = command[-1]
-            self.assertLess(body.index("source /share/env.sh"), body.index("export PYTHONPATH="))
-            self.assertIn("/conda/bin/python -m torch.distributed.run", body)
-        self.assertLess(build_mpirun_command(replace(ctx, launcher="mpirun"))[-1].index("source "),
-                        build_mpirun_command(replace(ctx, launcher="mpirun"))[-1].index("export PYTHONPATH="))
-
-    def test_container_mpi_uses_explicit_ssh_port_and_rank_cwd_before_env(self):
-        command = build_mpirun_command(self.context(execution_scope="container", container_name="worker",
-                                  container_ssh_port=25222, container_workdir="/work/project"))
-        self.assertEqual(command[command.index("--mca") + 1:command.index("--mca") + 3], ["plm_rsh_args", "-p 25222"])
-        self.assertLess(command[-1].index("cd /work/project"), command[-1].index("source /share/env.sh"))
-
-    def test_single_node_never_uses_mpi_even_with_direct_launcher_and_eight_processes(self):
-        for launcher in ("mpirun", "mpirun-torchrun", "ssh-torchrun"):
-            with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as temp:
-                report, _ = ActiveTestExecutor(scenario="shared-conda", test_name="gemm", nodes=["n1"],
-                    env_script="/share/env.sh", output_dir=Path(temp), group_size=1, slots=1,
-                    launcher=launcher, nproc_per_node=8, dry_run=True).run()
-                group = report["groups"][0]
-                self.assertEqual(group["launcher"], "local")
-                body = group["commands"][0]["command"][-1]
-                self.assertNotIn("exec mpirun", body)
-                self.assertIn("torch.distributed.run", body)
-                self.assertIn("--nproc-per-node 8", body)
-
-    def test_single_node_container_preflight_does_not_request_mpi(self):
-        with tempfile.TemporaryDirectory() as temp, patch("cluster_run.active.run_container_preflight") as check:
-            check.return_value = {"status": "FAIL", "issues": []}
-            from cluster_run.preflight import ContainerPreflightError
-            with self.assertRaises(ContainerPreflightError):
-                ActiveTestExecutor(scenario="per-node-container", test_name="gemm", nodes=["n1"],
-                    env_script="/share/env.sh", output_dir=Path(temp), group_size=1, slots=1,
-                    launcher="mpirun-torchrun", execution_scope="container", container_name="worker").run()
-            self.assertEqual(check.call_args.kwargs["launcher"], "direct")
-            self.assertFalse(check.call_args.kwargs["mpi_groups"])
-
-    def test_invalid_remainder_np_is_rejected_before_remote_precheck(self):
-        with tempfile.TemporaryDirectory() as temp, patch("cluster_run.active.run_container_preflight") as check:
-            with self.assertRaisesRegex(ValueError, "every group"):
-                ActiveTestExecutor(scenario="per-node-container", test_name="rccl", nodes=["n1", "n2", "n3"],
-                    profile="worker",
-                    env_script="/share/env.sh", output_dir=Path(temp), group_size=2, slots=1,
-                    launcher="mpirun-torchrun", np=2, execution_scope="container", container_name="worker").run()
-            check.assert_not_called()
-
-    def test_unknown_script_basename_does_not_switch_execution_profile(self):
-        with tempfile.TemporaryDirectory() as temp:
-            report, _ = ActiveTestExecutor(scenario="shared-conda", test_name="custom", nodes=["n1", "n2"],
-                env_script="/share/env.sh", output_dir=Path(temp), group_size=2, slots=1,
-                launcher="mpirun-torchrun", script="/share/rccl_perf_test.sh", dry_run=True).run()
-            self.assertEqual(report["groups"][0]["launcher"], "node-script")
-            self.assertEqual(len(report["groups"][0]["commands"]), 2)
-
-    def test_partial_worker_json_never_masks_timeout_or_transport_failure(self):
+    def test_payload_json_never_masks_execution_failure(self):
         executor = ActiveTestExecutor(scenario="shared-conda", test_name="rccl", nodes=["n1", "n2"],
-            profile="worker",
             env_script="/env.sh", output_dir=Path("."), group_size=2, slots=1, launcher="mpirun")
-        evidence = json.dumps({"test": "rccl", "status": "INCOMPLETE"})
-        self.assertEqual(executor._result_status(2, evidence), "INCOMPLETE")
-        for rc in (1, 124, 125, 127, 137, 255):
-            self.assertEqual(executor._result_status(rc, evidence), "FAIL")
+        evidence = json.dumps({"test": "rccl", "status": "PASS"})
+        for code in (1, 2, 124, 125, 127, 137, 255):
+            self.assertEqual(executor._result_status(code, evidence), "FAIL")
         self.assertEqual(executor._result_status(130, evidence), "CANCELLED")
 
-    def test_custom_rejects_ignored_mpi_parameters(self):
-        with tempfile.TemporaryDirectory() as temp:
-            nodes = Path(temp) / "nodes"
-            nodes.write_text("n1\n")
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                code = main(["shared-conda", "custom", "-f", str(nodes), "--env-script", "/env.sh",
-                             "--script", "/test.sh", "--launcher", "mpirun", "--dry-run"])
-            self.assertEqual(code, 3)
 
     def test_container_ssh_identity_mismatch_is_not_a_valid_peer(self):
         def item(output):

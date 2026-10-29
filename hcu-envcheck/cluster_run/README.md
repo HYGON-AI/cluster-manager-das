@@ -1,24 +1,32 @@
-# cluster_run 执行层
+<!--
+Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+SPDX-License-Identifier: Apache-2.0
+-->
 
-`cluster_run` 是 `hcu-cluster-run` 的 Python 编排层：入口节点读取 hostfile、切分 group、限制 `--slots`、构造远程命令并生成报告；基础探针在目标计算节点执行，主动测试在测试组的计算节点执行。
+# cluster_run 控制层
 
-新版入口不再分发无场景旧参数。操作分为 `platform/resource` 基础检测、`rccl/gemm/ib-write-bw/custom` 分组主动测试、`script` 逐节点独立诊断、`container-status/create/recreate/delete` 宿主机容器管理。容器修改仅由显式维护操作执行；重建/删除需 `--yes`。
+`cluster_run` 负责公共入口分流、节点分组、阶段调度和远程报告启动。源码入口 `bin/hcu-cluster-run` 与安装后的 console script 均将公共命令交给 `dispatch.sh`；`python -m cluster_run` 是保留的 Python 内部入口，其中 RCCL/DeepEP 也转交同一 Bash controller，使用统一的 G/C 参数和设备选择协议。
 
-基础检测报告为 `cluster-result.json`（schema 2.0）和 `cluster-summary.md`。JSON 顶层按节点状态、硬件设备、系统、驱动/DTK、软件组件、网络/RDMA 配置、资源状态、网络健康、执行证据分类；每类各自折叠相同节点，`members` 保留真实节点名。Markdown 优先给出逐节点显卡状态与配置差异，瞬时资源占用不冒充静态配置差异。旧版内部 `report["nodes"]` 数据结构仍供检测逻辑使用，不是落盘格式。
+| 组件 | 职责 | 执行位置 |
+|---|---|---|
+| `dispatch.sh` | 维护三个场景和 14 个操作的公共清单，路由请求 | 登录节点 |
+| `controller.sh` | 生成完整分组与阶段计划，调度 prepare / execute / cleanup，写入事实文件 | 登录节点 Bash |
+| `remote.sh` | 在选定报告节点启动报告进程 | 登录节点发起 SSH，目标环境运行 Python |
+| `../hcu_envcheck/worker.sh` | 构造并执行单组远程命令，收集节点结果与清理证据 | 适配器在登录节点，任务在计算节点 |
+| `../hcu_envcheck/lifecycle.sh` | 四项 Docker 容器管理操作 | 登录节点调度计算节点宿主机 |
+| `cli.py`、`active.py` 等 Python 模块 | 完整帮助及内部兼容实现 | 依调用路径执行 |
+| `rerun_plan.py` | 校验导出清单并恢复原组、项目与规模；GPU 规模通过 reporting/scale.py 解析 | 登录节点 Python |
 
-多节点 RCCL/GEMM worker：入口 SSH 到组首 -> 按需 source env.sh -> mpirun -> 组内每节点按需 source -> torchrun/直接 worker。单节点不调用 MPI；普通 `script/custom` 每节点直接执行。容器 MPI 通过 `--container-ssh-port` 设置 `plm_rsh_args -p` 并核验 SSH 身份。
+`consistency.py` 被当前报告路径复用；`extra_checks.py` 被 IB 复用。不能仅凭模块位于旧 Python 控制路径就认定其没有调用方，也不能把它们的全部接口当作公共入口能力。
 
-`rccl` 默认 `--profile rccl-tests`，执行已有 Shell 二进制测试：每节点默认 8 slots，多节点直接 MPI 启动 `*_perf -g 1`，单节点直接 `-g <卡数>`，没有嵌套 MPI/torchrun。容器内保留原命令的 root MPI 许可及通信参数默认值；env.sh 可以覆盖站点配置。默认完整执行十项并逐项比较当前 np 的 busbw 基准和容差；基准缺失/缺项报配置错误，不跳项或降级成功。执行失败继续剩余项，取消除外。各项日志、完整命令及含四列实测带宽的 `rccl-summary.md/tsv` 保存在每组 `rccl/` 下。RCCL Python smoke test 使用显式 `--profile worker`；GEMM 默认 worker，完整基准显式 `--profile rocblas`。不猜脚本 basename。`platform` 默认包含现有 IB 状态检查；`ib-write-bw` 复用实际 server/client 配对主动测试，不使用 MPI；`nhc` 是独立节点检测。所有执行层环境、取消和新增脚本契约见 [AGENTS.md](../AGENTS.md)。
+RCCL/DeepEP 使用 `--group-size` 指定节点数、`--gpus-per-node` 指定每节点卡数。完整语义、设备预检及支持范围集中在 [DESIGN](../docs/DESIGN.md#测试规模与设备选择)，不在此维护另一套参数表。
 
-`task_control.py` 与 `payloads/task_guard.sh` 管理任务 token、晚到任务阻断及逐节点取消确认。`env.py` 在登录 Shell 初始化后恢复显式 workdir，并在提供脚本时再 source；目标工具解析不能依赖入口节点的 Python/DTK。Python 编排与报告仍在入口节点，需要入口 Python >= 3.10；可用 `--controller-env-script` 独立引导。
+阅读入口：
 
-容器状态可单独检查，无需 `env.sh`：
+- [命令示例与结果目录](../docs/USER_GUIDE.md)：核心操作命令、单机/多机示例和结果位置。
+- [总体设计与运行约定](../docs/DESIGN.md)：部署、架构、调度、参数与结果判读。
+- [文档导航](GUIDE.md)：按操作查找统一命令与设计章节。
+- [工程结构与文件职责](../docs/PROJECT_STRUCTURE.md)：本目录各模块、载荷与报告文件的用途和调用方。
+- [能力与验证边界](../docs/KNOWN_LIMITATIONS.md)：当前实现与生产验收之间的差距。
 
-```bash
-./bin/hcu-cluster-run per-node-container container-status \
-  -f nodes.txt --container hcu-train -i "$IMAGE"
-```
-
-它在宿主机读取已有容器的精确名称、运行状态、镜像标签和跨节点镜像 ID，不检查 DCU 空闲、不 pull 或重建。容器内基础检测和主动测试共用此检查；基础检测保留异常节点报告且继续检测健康节点，主动测试在预检失败时不启动。容器场景的基础/主动测试与 `script` 的 `-i/--image` 均为必填，按其核验用户期望镜像；仅 `container-delete` 不接受该参数。检查运行中容器不要求本地仍保留镜像标签。
-
-`container-create/recreate --port N` 由 `lifecycle.py` 编排、`container_ssh.py` 生成目标 Bash：全节点依赖/端口检查 → 创建并随容器启动 sshd → 只交换公钥与可信 host keys → SSH namespace/UID 验证。控制端需要 Python，目标 SSH 配置不需要 Python。`--port` 不改变宿主机传输端口；MPI 仍使用 `--container-ssh-port N`。只读 `container-status` 不隐式配置或验证 SSH 互联。
+新增或修改操作时，应维护 `dispatch.sh` 的唯一公共清单、对应路由的参数边界和文档。保留的内部 Python 帮助不等同于 Bash 参数全集。

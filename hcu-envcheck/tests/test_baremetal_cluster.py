@@ -435,7 +435,6 @@ class ReportTests(unittest.TestCase):
             "rounds": 1,
             "taint_mutation": False,
             "ib_state": {"enabled": False},
-            "nhc": {"enabled": False},
             "ib_write_bw": {
                 "enabled": True,
                 "status": "FAIL",

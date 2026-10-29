@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import subprocess
 import tempfile
 import traceback
 from dataclasses import asdict, replace
@@ -16,6 +18,7 @@ from pathlib import Path
 
 from hcu_envcheck import __version__
 from hcu_envcheck.output import claim_labeled_run_directory, run_directory_label
+from hcu_envcheck.group_logs import metadata_text, ensure_group_log, read_log_text
 from hcu_envcheck.baremetal_cluster import (
     BaremetalPreflightPolicy,
     build_node_first_result,
@@ -27,22 +30,53 @@ from .active import ActiveTestExecutor
 from .consistency import build_consistency_summary
 from .env import validate_local_script
 from .hostfile import read_nodes
-from .launchers import LAUNCHERS
 from .lifecycle import run_container_lifecycle
-from .testsuites import default_profile, default_processes
-from .node_script import run_node_script
+from .testsuites import default_profile, default_processes, validate_profile
 from .preflight import (
     ContainerPreflightError, container_status_excluded_records,
     fold_node_names, grouped_issue_lines, run_container_status,
 )
 
 
-SCENARIOS = ("shared-conda", "node-local-conda", "per-node-container")
+def _public_manifest() -> dict[str, tuple[str, ...]]:
+    """Parse the public operation groups from the unique dispatch source.
+
+    cluster_run/dispatch.sh owns the public operation table (and the routing
+    on it); deriving argparse choices from the same manifest keeps --help-full
+    aligned with the real public capability instead of a second copy of the
+    list drifting inside Python.
+    """
+
+    source = Path(__file__).resolve().parent / "dispatch.sh"
+    try:
+        text = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"public dispatch source unreadable: {source}") from exc
+    groups: dict[str, tuple[str, ...]] = {}
+    for name in ("SCENARIOS", "LIFECYCLE_OPS", "CONTROLLER_OPS", "WORKER_OPS", "PYTHON_OPS"):
+        match = re.search(rf"^HCU_{name}='([^']*)'\s*$", text, re.MULTILINE)
+        if name in {"WORKER_OPS", "PYTHON_OPS"}:
+            # T35: the worker-op group (model placeholder) is retired from the
+            # public capability; a missing or empty manifest entry means no
+            # worker ops, not a broken manifest.
+            groups[name] = tuple(match.group(1).split("|")) if match and match.group(1) else ()
+            continue
+        if not match or not match.group(1):
+            raise RuntimeError(f"public dispatch manifest variable HCU_{name} missing in {source}")
+        groups[name] = tuple(match.group(1).split("|"))
+    return groups
+
+
+_MANIFEST = _public_manifest()
+SCENARIOS = _MANIFEST["SCENARIOS"]
+OPERATIONS = frozenset().union(*(
+    _MANIFEST[name] for name in ("LIFECYCLE_OPS", "CONTROLLER_OPS", "WORKER_OPS", "PYTHON_OPS")
+))
+# Python-core behavior groups (internal routing only; the public routing on
+# these names lives solely in cluster_run/dispatch.sh).
 BASE_CATEGORIES = {"platform", "resource", "platform,resource"}
-ACTIVE_TESTS = {"rccl", "gemm", "ib-write-bw", "custom"}
+ACTIVE_TESTS = {"rccl", "ib-write-bw"}
 CONTAINER_OPERATIONS = {"container-status", "container-create", "container-recreate", "container-delete"}
-NODE_OPERATIONS = {"script", "nhc"}
-OPERATIONS = BASE_CATEGORIES | ACTIVE_TESTS | CONTAINER_OPERATIONS | NODE_OPERATIONS
 
 
 _COMMON_FLAGS = {"-f", "--hostfile", "--transport", "--concurrency", "--log-detail"}
@@ -55,14 +89,10 @@ _BASIC_FLAGS = {"--env-script", "-o", "--output-dir", "--container", "-i", "--im
                 "--rdma-policy-file", "--rdma-counter-interval", "--ibstat-command", "--timeout"}
 _ACTIVE_FLAGS = {"--env-script", "-o", "--output-dir", "--container", "-i", "--image",
                  "--container-shell", "--container-workdir",
-                 "--group-size", "--slots", "--strict-size", "--launcher", "--script",
-                 "--script-arg", "--nproc-per-node", "--np", "--master-port",
+                 "--group-size", "--slots", "--strict-size", "--launcher",
                  "--timeout", "--dry-run", "--skip-idle-check", "--profile", "--test-python", "--container-ssh-port"}
-_SCRIPT_FLAGS = {"--env-script", "-o", "--output-dir", "--container", "-i", "--image",
-                 "--script", "--script-arg", "--timeout", "--dry-run", "--container-shell", "--container-workdir", "--test-python"}
 _EXTRA_COMMON_FLAGS = {"--env-script", "-o", "--output-dir", "--container", "-i", "--image",
                        "--container-workdir", "--timeout", "--dry-run"}
-_NHC_FLAGS = {"--nhc-command", "--nhc-installation-source", "--nhc-config", "--nhc-selected", "--nhc-removed", "--nhc-arg"}
 _IB_FLAGS = {"--ib-tool", "--ib-protocol", "--ib-device", "--ib-port", "--ib-gid-index", "--ib-control-port",
              "--ib-message-bytes", "--ib-iterations", "--ib-minimum-gbps", "--ib-concurrency", "--ib-max-tests", "--ibstat-command"}
 _STATUS_FLAGS = {"--container", "-i", "--image"}
@@ -74,20 +104,21 @@ def _validate_used_flags(operation: str, argv: list[str]) -> None:
     allowed = _COMMON_FLAGS | (
         _BASIC_FLAGS if operation in BASE_CATEGORIES else
         (_EXTRA_COMMON_FLAGS | _IB_FLAGS | {"--group-size", "--slots", "--strict-size"}) if operation == "ib-write-bw" else
-        _ACTIVE_FLAGS if operation in ACTIVE_TESTS else
-        (_EXTRA_COMMON_FLAGS | _NHC_FLAGS) if operation == "nhc" else
-        _SCRIPT_FLAGS if operation == "script" else
+        _ACTIVE_FLAGS if operation in ACTIVE_TESTS or operation == "deepep" else
         _STATUS_FLAGS if operation == "container-status" else
         _LIFECYCLE_FLAGS
     )
+    if operation in {"rccl", "deepep"}:
+        allowed.discard("--slots")
+        allowed.add("--gpus-per-node")
     allowed |= {"-h", "--help", "--version"}
-    if operation == "custom":
-        allowed -= {"--launcher", "--profile", "--nproc-per-node", "--np", "--master-port", "--container-ssh-port", "--skip-idle-check"}
     for token in argv:
         if token.startswith("-"):
             option = token.split("=", 1)[0]
             if option not in allowed:
-                raise ValueError(f"{option} is not valid for {operation}")
+                message = (f"unsupported parameter for {operation}: {option}" if operation in {"rccl", "deepep"}
+                           else f"{option} is not valid for {operation}")
+                raise ValueError(message)
 
 
 class RunnerArgumentParser(argparse.ArgumentParser):
@@ -101,10 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hcu-cluster-run",
         description="Unified HCU platform checks and active test runner",
     )
+    parser.add_argument("--release", action="store_true", help="idle-check: stop occupying containers and recheck")
     parser.add_argument("scenario", choices=SCENARIOS)
     parser.add_argument(
         "operation", choices=sorted(OPERATIONS),
-        help="basic checks, active tests, node script, or container lifecycle",
+        help="basic checks, active tests, or container lifecycle",
     )
     parser.add_argument("-f", "--hostfile", type=Path, required=True)
     parser.add_argument("--env-script", help="optional env.sh path visible in each target execution scope; omitted uses the current target environment")
@@ -142,16 +174,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-python", default="python3", help="interpreter resolved AFTER target env.sh (never controller Python)")
     parser.add_argument("--container-ssh-port", type=int, default=25901,
                         help="multi-node container MPI peer SSH port; verified against docker exec namespace/user")
-    parser.add_argument("--profile", choices=("worker", "rccl-tests", "rocblas"), default=None,
-                        help="rccl defaults to rccl-tests (all 10 collectives, required scale baselines); gemm defaults to worker; worker explicitly selects Python/torchrun")
+    parser.add_argument("--profile", choices=("rccl-tests",), default=None,
+                        help="Python CLI compatibility option for RCCL's binary suite (all 10 collectives, required scale baselines)")
     parser.add_argument("--rdma-policy-file", type=Path, help="explicit JSON RoCE policy (not environment configuration)")
     parser.add_argument("--rdma-counter-interval", type=float, default=1.0)
-    parser.add_argument("--nhc-command", default="run_nhc")
-    parser.add_argument("--nhc-installation-source")
-    parser.add_argument("--nhc-config")
-    parser.add_argument("--nhc-selected")
-    parser.add_argument("--nhc-removed")
-    parser.add_argument("--nhc-arg", action="append", default=[])
     parser.add_argument("--ibstat-command", default="ibstat", help="platform IB/RDMA state command (default: ibstat)")
     parser.add_argument("--ib-tool", choices=("ib_write_bw", "ib_read_bw", "ib_send_bw"), default="ib_write_bw")
     parser.add_argument("--ib-protocol", choices=("ib", "roce"), default="ib")
@@ -188,17 +214,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="package to collect from the activated env; repeatable",
     )
 
-    # Active test options.  ``slots`` means concurrent groups, not MPI slots.
-    parser.add_argument("--group-size", type=int)
-    parser.add_argument("--slots", type=int, default=1, help="maximum concurrent test groups")
+    # Scale options are operation-scoped by _validate_used_flags.
+    parser.add_argument("--group-size", type=int, help="RCCL/DeepEP nodes per group (default 1)")
+    parser.add_argument("--gpus-per-node", type=int, default=8,
+                        help="RCCL/DeepEP GPUs per node (default 8); DeepEP single: 2/4/8, multi: 8; total ranks must divide mode expert counts")
+    parser.add_argument("--slots", type=int, default=8, help="retained IB setting; unsupported by RCCL/DeepEP")
     parser.add_argument("--strict-size", action="store_true")
-    parser.add_argument("--launcher", choices=LAUNCHERS, default="mpirun-torchrun")
-    parser.add_argument("--script", help="target-visible Shell/Python script (required by script/custom)")
-    parser.add_argument("--script-arg", action="append", default=[])
-    parser.add_argument("--nproc-per-node", type=int, default=None,
-                        help="processes per node: default 8 for rccl-tests, 1 for worker")
-    parser.add_argument("--np", type=int)
-    parser.add_argument("--master-port", type=int, default=29500)
+    parser.add_argument("--launcher", choices=("mpirun",), default="mpirun",
+                        help="Python CLI compatibility option; RCCL's binary payload owns MPI")
     parser.add_argument("--timeout", type=float, default=0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-idle-check", action="store_true", help="active container tests only; explicitly skip DCU idle precheck")
@@ -299,9 +322,8 @@ def _stderr_excerpt(result_dir: object, filename: str = "stderr.txt") -> str:
         return ""
     path = Path(str(result_dir)) / filename
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as stream:
-            lines = [line.strip() for line in stream.readlines(4096) if line.strip()]
-    except OSError:
+        lines = [line.strip() for line in read_log_text(path, limit=4096).splitlines() if line.strip()]
+    except (OSError, ValueError):
         return ""
     return " | ".join(lines[:4])[:800]
 
@@ -455,30 +477,6 @@ def _run_lifecycle(args: argparse.Namespace) -> int:
     return 0 if report["status"] in {"PASS", "DRY_RUN"} else 2
 
 
-def _run_script(args: argparse.Namespace) -> int:
-    if not args.script:
-        raise ValueError("script requires --script")
-    if args.scenario == "per-node-container" and (not args.container or not args.image):
-        raise ValueError("per-node-container script requires --container and -i/--image")
-    nodes = read_nodes(args.hostfile)
-    report, run_dir = run_node_script(
-        nodes=nodes, scenario=args.scenario, env_script=args.env_script,
-        script=args.script, script_args=args.script_arg,
-        container_name=args.container, image=args.image,
-        transport=args.transport, concurrency=args.concurrency,
-        timeout=args.timeout, output_dir=args.output_dir, dry_run=args.dry_run,
-        container_shell=args.container_shell, container_workdir=args.container_workdir,
-        test_python=args.test_python,
-    )
-    for node, result in report["nodes"].items():
-        _log("SUCCESS" if result["status"] == "PASS" else "WARN" if result["status"] == "DRY_RUN" else "ERROR",
-             f"node={node} status={result['status']} stderr={result.get('stderr') or '-'}")
-    print(f"RESULT        {report['status']}")
-    print(f"RUN_DIR       {run_dir}")
-    print(f"JSON          {run_dir / 'script-result.json'}")
-    return _execution_exit(report, args)
-
-
 def _execution_exit(report: dict, args: argparse.Namespace | None = None) -> int:
     cleanup = report.get("cleanup")
     if cleanup:
@@ -499,52 +497,6 @@ def _execution_exit(report: dict, args: argparse.Namespace | None = None) -> int
     if report.get("interrupted") or report.get("status") == "CANCELLED":
         return 130
     return 0 if report["status"] in {"PASS", "DRY_RUN", "INCOMPLETE"} else 2
-
-
-def _run_extra(args: argparse.Namespace) -> int:
-    from hcu_envcheck.baremetal import BaremetalExecutionConfig
-    from hcu_envcheck.cluster_checks import NHCCheckConfig
-    from .extra_checks import run_nhc
-    from .task_control import RemoteTaskSession, TaskInterrupted
-    nodes = read_nodes(args.hostfile)
-    scope = "container" if args.scenario == "per-node-container" else "host"
-    if scope == "container" and (not args.container or not args.image):
-        raise ValueError("per-node-container requires --container and -i/--image")
-    config = NHCCheckConfig(enabled=True, command=(args.nhc_command,),
-                  installation_source=args.nhc_installation_source, config=args.nhc_config,
-                  selected=args.nhc_selected, removed=args.nhc_removed,
-                  extra_args=tuple(args.nhc_arg), timeout_seconds=args.timeout or 600)
-    config.validate()
-    if scope == "container" and not args.dry_run:
-        status = _check_container_status(args, nodes)
-        _log_container_status(status)
-        if status["status"] != "PASS":
-            print("RESULT        PRECHECK_FAILED")
-            return 3
-    root = claim_labeled_run_directory(
-        args.output_dir, run_directory_label(args.scenario, args.operation))
-    session = RemoteTaskSession(nodes, BaremetalExecutionConfig(output_root=root / "evidence",
-        transport=args.transport, concurrency=args.concurrency), execution_scope=scope, container_name=args.container)
-    report = None
-    try:
-        with session:
-            report = run_nhc(nodes, config=config,
-                env_script=args.env_script, scope=scope, container=args.container,
-                container_workdir=args.container_workdir, output_dir=root,
-                execution_config=session.config, run_token=session.run_token,
-                cancel_event=session.cancel_event, dry_run=args.dry_run)
-    except TaskInterrupted:
-        report = report or {"operation": args.operation, "nodes": nodes}
-        report.update({"status": "CANCELLED", "interrupted": True})
-    if session.last_report:
-        report["cleanup"] = asdict(session.last_report)
-        if not session.last_report.confirmed:
-            report["status"] = "CLEANUP_UNCONFIRMED"
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{args.operation}-result.json"
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"RESULT        {report['status']}\nJSON          {path}")
-    return _execution_exit(report, args)
 
 
 def _run_basic(args: argparse.Namespace, operation: str) -> int:
@@ -760,14 +712,14 @@ def _run_active(args: argparse.Namespace, operation: str) -> int:
     _log(
         "INFO",
         f"active test start: scenario={args.scenario} test={operation} "
-        f"nodes={len(nodes)} profile={args.profile} launcher={args.launcher if args.profile == 'worker' else args.profile} transport={args.transport} "
-        f"group_size={args.group_size or len(nodes)} slots={args.slots} dry_run={args.dry_run}",
+        f"nodes={len(nodes)} profile={args.profile or '-'} launcher={'mpirun' if operation == 'rccl' else 'direct'} transport={args.transport} "
+        f"group_size={args.group_size or len(nodes)} slots_per_node={args.slots} concurrency={args.concurrency} dry_run={args.dry_run}",
     )
     _log(
         "INFO",
         f"execution scope={scope} container={args.container or '-'} env_script={args.env_script or '<current-target-environment>'}",
     )
-    if scope == "container" and (args.profile == "rccl-tests" or args.launcher in {"mpirun", "mpirun-torchrun"}):
+    if scope == "container" and operation == "rccl":
         _log("INFO", "container MPI policy automatically adds --allow-run-as-root when the selected container user is root")
     executor = ActiveTestExecutor(
         scenario=args.scenario,
@@ -779,11 +731,7 @@ def _run_active(args: argparse.Namespace, operation: str) -> int:
         strict_size=args.strict_size,
         slots=args.slots,
         launcher=args.launcher,
-        script=args.script,
-        script_args=args.script_arg,
-        nproc_per_node=args.nproc_per_node,
-        np=args.np,
-        master_port=args.master_port,
+        nproc_per_node=default_processes(args.profile),
         timeout_seconds=args.timeout,
         transport=args.transport,
         concurrency=args.concurrency,
@@ -810,7 +758,7 @@ def _run_active(args: argparse.Namespace, operation: str) -> int:
         if exc.report.get("interrupted"):
             print(f"RESULT        {exc.report['status']}")
             return _execution_exit(exc.report, args)
-        _log("ERROR", "container preflight failed; no active group was launched and no preflight report was written")
+        _log("ERROR", f"container preflight failed; evidence retained in {exc.report.get('run_dir', '-')}")
         for line in grouped_issue_lines(exc.report.get("issues") or []):
             _log("ERROR", line)
         if any(
@@ -841,54 +789,64 @@ def _run_active(args: argparse.Namespace, operation: str) -> int:
             f"nodes={fold_node_names(group.get('nodes') or [])}",
         )
         if status == "FAIL":
-            group_dir = run_dir / "groups" / str(group.get("group"))
+            group_dir = run_dir / ".state" / "groups" / str(group.get("group"))
             node_results = group.get("node_results") or []
             if node_results:
                 for item in node_results:
                     if item.get("status") == "PASS":
                         continue
                     node = str(item.get("node") or "-")
-                    stderr_path = group_dir / "nodes" / node / "stderr.log"
-                    _log("ERROR", f"group={group.get('group')} node={node} returncode={item.get('returncode')} stderr_file={stderr_path} evidence={item.get('result_dir') or '-'}")
-                    excerpt = _stderr_excerpt(stderr_path.parent, "stderr.log")
+                    result_dir = item.get("result_dir")
+                    stderr_path = Path(result_dir) / "stderr.txt" if result_dir else group_dir / "nodes" / node / "stderr.log"
+                    _log("ERROR", f"group={group.get('group')} node={node} returncode={item.get('returncode')} group_log={run_dir / (str(group.get('group')) + '.log')} evidence={result_dir or '-'}")
+                    excerpt = _stderr_excerpt(stderr_path.parent, stderr_path.name)
                     if excerpt and detail != "quiet":
                         _log("ERROR", f"group={group.get('group')} node={node} remote_stderr={excerpt}")
             else:
-                _log("ERROR", f"group={group.get('group')} leader={group.get('leader') or '-'} returncode={group.get('returncode')} stderr_file={group_dir / 'stderr.log'} evidence={group.get('result_dir') or '-'}")
+                _log("ERROR", f"group={group.get('group')} leader={group.get('leader') or '-'} returncode={group.get('returncode')} group_log={run_dir / (str(group.get('group')) + '.log')} evidence={group.get('result_dir') or '-'}")
                 excerpt = _stderr_excerpt(group_dir, "stderr.log")
                 if excerpt and detail != "quiet":
                     _log("ERROR", f"group={group.get('group')} remote_stderr={excerpt}")
-    _log("SUCCESS" if report["status"] in {"PASS", "DRY_RUN"} else "WARN" if report["status"] == "INCOMPLETE" else "ERROR", f"active report written: {run_dir / 'active-result.json'}")
+    _log("SUCCESS" if report["status"] in {"PASS", "DRY_RUN"} else "WARN" if report["status"] == "INCOMPLETE" else "ERROR", f"active report written: {run_dir / '.state' / 'active-result.json'}")
     print(f"RESULT        {report['status']}")
     if report["status"] == "PRECHECK_FAILED":
         print(f"GROUPS        planned={report['group_count']} executed=0 launcher={report['launcher']}")
     else:
         print(
             f"GROUPS        total={report['group_count']} "
-            f"slots={report['group_slots']} launcher={report['launcher']}"
+            f"slots_per_node={report['slots_per_node']} launcher={report['launcher']}"
         )
     print(f"RUN_DIR       {run_dir}")
-    print(f"JSON          {run_dir / 'active-result.json'}")
+    print(f"JSON          {run_dir / '.state' / 'active-result.json'}")
     # Nonzero signals execution/cleanup failure, never gates a subsequent command.
     return _execution_exit(report, args)
 
 
+def _run_group_controller(argv: list[str]) -> int:
+    try:
+        result = subprocess.run(["bash", str(Path(__file__).with_name("controller.sh")), *argv], check=False)
+    except OSError as exc:
+        _log("ERROR", str(exc))
+        return 3
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
 def main(argv: list[str] | None = None) -> int:
+    # RCCL/DeepEP share the Bash parser and execution contract, including
+    # report/rerun options. Do not parse them through legacy Python defaults.
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    if len(raw) >= 2 and raw[0] in SCENARIOS and raw[1] in {"rccl", "deepep"}:
+        return _run_group_controller(raw)
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.operation in {"rccl", "deepep"}:
+        return _run_group_controller(raw)
     try:
         args.profile = args.profile or default_profile(args.operation)
-        if args.nproc_per_node is None:
-            args.nproc_per_node = default_processes(args.profile)
+        if args.operation in ACTIVE_TESTS:
+            validate_profile(args.operation, args.profile)
         _validate_used_flags(args.operation, list(argv) if argv is not None else sys.argv[1:])
         used = {item.split("=", 1)[0] for item in (argv if argv is not None else sys.argv[1:]) if item.startswith("-")}
-        invalid = used & {"--launcher", "--np", "--master-port"}
-        if args.profile == "rccl-tests" and args.launcher == "mpirun":
-            invalid -= {"--launcher"}
-        if args.profile != "worker" and invalid:
-            raise ValueError("binary benchmarks own their launch; use --profile worker for Python/torchrun/--np, or --nproc-per-node for rccl-tests")
-        if args.profile == "rocblas" and "--nproc-per-node" in used:
-            raise ValueError("rocblas enumerates local cards; use --script-arg=--cards --script-arg=0,1")
         try:
             current_dir = Path.cwd()
         except OSError as exc:
@@ -916,30 +874,15 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError(f"{flag} is only valid for container-create/recreate/delete")
         if args.operation not in ACTIVE_TESTS and args.skip_idle_check:
             raise ValueError("--skip-idle-check is only valid for active tests")
-        if args.operation != "script" and args.operation not in ACTIVE_TESTS and args.script:
-            raise ValueError("--script is only valid for script/custom/active operations")
         if args.operation in BASE_CATEGORIES:
             return _run_basic(args, args.operation)
         if args.operation == "container-status":
             return _run_container_status(args)
         if args.operation in CONTAINER_OPERATIONS:
             return _run_lifecycle(args)
-        if args.operation == "nhc":
-            return _run_extra(args)
-        if args.operation == "script":
-            return _run_script(args)
         if args.operation in ACTIVE_TESTS:
             return _run_active(args, args.operation)
         raise ValueError("unsupported operation")
     except (OSError, RuntimeError, ValueError) as exc:
         _log_failure(exc, args)
         return 3
-
-
-def entrypoint() -> int:
-    try:
-        return main()
-    except KeyboardInterrupt:
-        print("RESULT        TOOL_ERROR", file=sys.stderr)
-        _log("ERROR", "interrupted by user")
-        return 130

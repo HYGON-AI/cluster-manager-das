@@ -1,52 +1,57 @@
-# 工程约定（实现与扩展必须遵守）
+<!--
+Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+SPDX-License-Identifier: Apache-2.0
+-->
 
-## 唯一入口与执行位置
+# hcu-envcheck 工程约定
 
-- 公共入口仅 `bin/hcu-cluster-run <scenario> <operation> ...`。不增加旧命令兼容分流、Slurm 控制面或 Kubernetes 检测。
-- 三种 scenario：`shared-conda`、`node-local-conda`、`per-node-container`。Slurm 仅由用户在工具外申请节点，工具输入是 hostfile。
-- 入口 Shell 负责帮助、参数引导和控制端解释器选择。调度、结果解析及报告仍用入口节点的 Python >= 3.10 标准库；不能宣称实际检测完全不依赖入口 Python。
-- `--controller-env-script` 仅在入口节点加载；`--env-script` 是可选的目标环境初始化脚本，仅在目标计算节点/指定容器加载。省略时直接使用目标当前环境；二者不得互相代替。
-- 基础探针在目标环境使用 `--remote-python`；测试程序使用 `--test-python`。传入 `--env-script` 时在 source 后解析，省略时从目标当前环境解析。报告只在入口节点生成。
-- Shell 载荷、NHC、IB perftest 不得为了执行命令而依赖目标 Python。受控执行需要目标 Linux `/proc`、Bash 4+、`setsid`、`flock`、`timeout`。
+本文件约束工程维护和自动化协作。命令与结果目录见 [USER_GUIDE](docs/USER_GUIDE.md)，总体架构及运行约定见 [DESIGN](docs/DESIGN.md)，目录和文件职责见 [PROJECT_STRUCTURE](docs/PROJECT_STRUCTURE.md)，当前缺陷见 [KNOWN_LIMITATIONS](docs/KNOWN_LIMITATIONS.md)。以下接口和不变量是修改时需要维持的约定，不代表现有缺陷已经修复。
 
-## 环境与配置
+## 公共接口与修改边界
 
-- 提供 `env.sh` 时，它必须是真实可 source 的脚本：module/source/export/conda activate。不解析脚本文本，不要求版本、节点、rank 等元数据变量；未提供时不得猜测或搜索环境脚本。
-- 探针从 source 后的 PATH、库路径、DTK/ROCM 等环境变量和命令输出获得实际信息；保留解析来源。不能用固定 `/opt/dtk` 值覆盖用户选中的版本。
-- 先进入 `--container-workdir`，再 source。预检、MPI rank、SSH worker、基础探针必须使用同一工作目录语义。
-- 项目及主动测试输出目录需要在计算节点可见；容器内项目路径不同时传 `--container-workdir`。分组 hostfile 必须位于所有组员可见的共享路径，不能只在入口本地生成后假定可见。
-- 版本差异、资源忙等检测结果与工具执行错误分开；无跨命令全局门禁。
+- 唯一公共命令为 `hcu-cluster-run <scenario> <operation>`。源码启动器和安装后的 console entrypoint 均将公共命令交给 `cluster_run/dispatch.sh`；公共操作清单只在该文件维护。
+- 三个场景是 shared-conda、node-local-conda、per-node-container；共 13 个公共操作，model 已退出公共清单。节点申请在外部完成，不把旧内部类写成当前 Kubernetes 或其他公共能力。
+- 核心检查、主动测试与 IB 走 Bash controller；容器管理走 Bash lifecycle。当前 rerun-plan 也需要登录节点 python3。
+- 不将 Python 内部帮助参数自动开放给 Bash。保留模块仍有调用方时，不仅凭“旧实现”删除；consistency、IB 的 Python 依赖尤其需要核对。
+- 不执行未经任务授权的提交、推送、部署、容器销毁或硬件测试。遵循用户对文档、代码、测试及真实服务器验证范围的最新明确要求。
 
-## 载荷调用协议
+## 参数、环境和分组
 
-1. `platform/resource`：每节点独立并发采集，之后自动生成一致性报告；不启动 MPI。
-2. `script`：Shell/Python 脚本每节点执行一次，无 MPI、无自动 rank。`custom` 同样逐节点执行，可保留组目录组织结果；不能把任意 Shell 脚本自动套在 torchrun 上。
-3. `rccl/gemm --profile worker`：无 `--script` 使用内置 Python worker；指定 `--script` 表示**每 rank worker**，不允许 worker 再调用 MPI/torchrun。GEMM 默认 worker；RCCL 使用 worker 必须显式选择，不能替换既有二进制测试。
-4. 单节点组不调用 MPI；需要本机多进程时由选定 Python 的 `-m torch.distributed.run` 启动。
-5. 多节点 RCCL/GEMM **worker**：默认 MPI 每节点一个 bootstrap，再 torchrun；`--launcher mpirun` 直接每卡/进程 worker；`--launcher ssh-torchrun` 由入口并发启动每节点 torchrun。
-6. `rccl` 默认 `--profile rccl-tests`，每节点默认 8 个 slots，保留现有 RCCL 二进制基准脚本。脚本拥有唯一一层组级 MPI：多节点每 rank `*_perf -g 1`，单节点直接二进制 `-g <卡数>`；不得外套 MPI/torchrun。可显式 `--launcher mpirun`，其他 launcher 须选择 worker。容器内所有实际 MPI 启动由统一入口自动应用 `--allow-run-as-root`，预检与执行保持一致，不暴露用户开关；宿主机 MPI 不使用该策略。通信参数继承 env.sh，未设置时用用户原命令的站点默认值，显式脚本参数优先；不编造 RCCL_NET_PLANE。RCCL 默认一次完整执行十项并逐项比较当前 np 的 busbw 基准和 margin；缺少规模/项目基准须报配置错误，不静默跳项，不降级成功。正常启动后的单项失败不跳过剩余项，取消除外。保留显式 --tests 诊断能力，但子集结果不能宣称完整验收。报告输出 out/in-place algbw/busbw 四列独立峰值以及基准、容差、偏差和原因；不得把一列 busbw 基准当作四列阈值。`gemm --profile rocblas` 保留每节点各卡/形状 rocBLAS 基准，不接受 launcher。不能根据脚本 basename 猜测执行类型。
-7. `platform` 默认包含每节点 IB/RDMA 状态检查；`nhc` 每节点独立；`ib-write-bw` 为真实 server/client 配对主动测试，不用 MPI/torchrun。平台检查不隐式启动带宽流量。
-8. `--script-arg=VALUE` 逐项透传，始终按 argv 安全引用，不 eval。`--group-size` 是组内节点数，`--slots` 是并发组数，`--nproc-per-node` 是每节点进程数，三者不可混用。
-9. 由 runner 在 source 后生成 `HCU_GROUP_NAME/HCU_GROUP_HOSTFILE/HCU_GROUP_NODES`；worker 的 `RANK/WORLD_SIZE/LOCAL_RANK/MASTER_ADDR/MASTER_PORT` 由本次 launcher 生成，覆盖外部遗留值。MPI 原始值在 source 前保存。用户不应在 env.sh 设置它们。
-10. worker 退出 0 才可认定执行通过；内置 worker 返回 2 且输出匹配本测试的 `INCOMPLETE` 证据才标不完整。返回 124/255、信号退出、启动失败等不得被部分 worker JSON 掩盖。
+- RCCL/DeepEP 统一使用 group-size G（每组节点数，默认 1）与 gpus-per-node C（每节点卡数，默认 8），均为正整数、含义独立。拒绝旧公共 slots、nproc-per-node 和用户 hostfile 的 slots 字段；controller 在组目录生成 slotsfile，逐行写 node slots=N（RCCL 为 C，DeepEP 为 1），多机 MPI 直接使用该文件，载荷不再生成临时 MPI hostfile。
+- RCCL/DeepEP 在各目标环境加载后，通过 payloads/device_selection.py 查询 HIP 可见设备，保留已有允许范围及顺序，选前 C 张并保存各节点 PCI 身份；执行前复用并复核记录。不在登录节点探测 GPU，不将组首节点的设备列表作为所有节点的选择。
+- RCCL/DeepEP 只执行 hostfile 顺序中的完整组，尾部余数不预检、不派发、不清理，不进入任务分母、NA 或失败清单；零完整组在实际派发前失败，dry-run 同样适用。
+- 已计划组出现节点故障不能缩组、补节点或调整计划分母。单节点检查与 byte-flux 的 group-size 为 1；IB 每组至少两节点，不能套用余数跳过规则。
+- concurrency 是活跃节点/组任务上限；Bash ≥5.1 支持滚动补位，旧版本部分路径按批等待。node-concurrency 是控制 SSH 额度，不能代替 MPI 连接与清理总预算控制。
+- env-script 仅在目标环境 source，目标工作目录先切换；controller-env-script 仅供保留的登录节点 Python 路径。禁止猜测脚本或解析 env.sh 文本推断运行环境。
+- 工程、组节点文件（RCCL/DeepEP 为 slotsfile）、配置及输出必须在目标环境共享可见；工程外路径不自动翻译挂载前缀。参数按 argv 引用传递，不使用 eval。
 
-## 容器 MPI 与取消
+## 载荷与容器
 
-- 组首宿主机 SSH → `docker exec` 指定容器 → source → mpirun → `--mca plm_rsh_args "-p PORT"` 进入各节点容器。默认容器 SSH 端口 25901，可显式修改。
-- 在启动前用实际容器 SSH 路径与 `docker exec` 比对命名空间和 UID；端口监听不等于容器身份正确。检测/测试不自动修改 sshd 或容器网络。
-- 仅显式 `container-create/recreate --port N` 为新容器配置 host 网络及 root 公钥 SSH；不传时不修改 SSH 行为。保留镜像原 Entrypoint/Cmd；bootstrap 每次容器启动执行，不能只 docker exec 启动一次。先全节点检查镜像依赖与端口，再删除旧容器；端口占用无法归属时拒绝，禁止杀宿主机 sshd。
-- 每容器独立生成用户及 host 私钥；只交换公钥，固定 known_hosts 且严格验签，不复制私钥、不启用密码登录、不重置 root 密码、不挂载/写宿主机 SSH 配置。该模式要求宿主机 ss，root Linux 镜像已有 Bash/OpenSSH/PAM 与 /proc，离线不自动安装。32 节点以内全互联验证；更大规模采用组首星形+环形 O(N) 路径验证，主动 MPI 仍校验实际组路径，不能声称完成所有 N² 链路实测。
-- 容器状态失败终端折叠输出原因；不创建 preflight.json、不自动 pull/recreate；创建/重建/删除必须使用显式操作及确认。
-- 每次执行生成不可复用 token；组首、所有 MPI rank、每节点脚本、NHC/IB 两端都受 token guard 管理。不能只终止入口 SSH。
-- Ctrl+C/SIGTERM 停止派发并对所有计划节点清理，TERM→KILL 后验证，保留停止标记拒绝晚到 rank。禁止 `pkill python/mpirun` 等宽泛清理。
-- `CONFIRMED` 必须有远程零存活进程及停止标记证据。节点失联/权限不足/容器不可访问必须 `UNCONFIRMED`，不得称“全部结束”。控制端被 SIGKILL 或断电不能承诺即时远程清理；远程 timeout 是兜底，不是确认凭证。
-- 自定义脚本不得主动脱离任务管控（清空 task token 后 daemonize、跨用户后台启动等）；此类行为不属于可受控载荷协议。
+- worker.sh 是登录节点上的单组远程适配器；探针、payload、MPI/torchrun 与实际算子在计算节点目标环境运行。
+- RCCL 常规入口固定完整十项，路径、通信与测量配置从目标 env-script 的受支持环境变量读取。内部阶段选择与历史重跑保持原机制。测试项在外、分组并发在内；单机直接二进制，多机只保留一层 MPI，每卡一个 rank，基准按参与总卡数匹配。
+- DeepEP 经 run_deepep_test.sh：单机执行一次 intranode，当前允许 C=2/4/8；多机分别执行一次 lowl、norm，C 必须为 8，G×C 须同时整除默认专家数 256 和 288，当前完整多机组限 G=2/4。限制在远程预检前检查，不跳过 norm 或修改第三方测例扩大范围。
+- DeepEP 多机内部 slots=1、MPI np=G，每节点一个 MPI 控制 rank → torchrun --nproc-per-node=1 → 测例 --num-processes C → 上游 spawn C 个 GPU worker。RCCL 单机 -g C、多机 slots=C、np=G×C；不得混淆控制进程与 GPU 工作进程。
+- byte-flux 为单机 TP4、64 项矩阵；AG N=10240/57344，GemmRS 形状以 payload 为准，每组执行一次完整 sweep。工具不额外重复 DeepEP 或 byte-flux 测试，保留上游测例自身的 warmup 和测量迭代。
+- 检测中的 image 只核对已有容器，不隐式 pull/create/recreate。容器创建使用明确端口和挂载；重建/删除实际执行需要 yes。不得把 Python lifecycle 行为套用为 Bash 已具备能力。
+- 所有改动应保持本次 token 的进程隔离与逐节点清理；禁止宽泛按进程名 pkill。远端停止无法确认时保留 UNCONFIRMED，并阻断该组后续执行，不把 SSH 退出当作停止证明。
 
-## 报告与测试
+## 结果、文档与验证
 
-- 前台日志按节点数必须是 O(摘要) 而非 O(节点数)：默认（`--log-detail milestone`）按「状态×原因码」折叠同类节点为单行，cleanup 汇总为计数行，健康组不逐组输出；`every` 恢复逐节点/逐组明细，`quiet` 只保留 ERROR 级折叠。折叠不得吞掉 ERROR：未确认清理和失败原因必须保留在终端可见输出中。JSON/Markdown 报告始终逐节点完整记录，不受日志粒度影响。
-- 配置分组与差异报告共用静态字段契约，包含硬件、系统内存/限制、驱动/DTK、Python packages/Torch/RCCL/UCX/MPI、网络配置；不将利用率、显存使用量或设备唯一序列号算作配置差异。
-- 证据缺失不能合并成“配置相同”。节点和 device_id 折叠必须可逆、且保留完整证据路径。
-- `scripts/test.sh` 是单测和接口验收总入口。每个用例记录退出码、状态、报告是否存在/可读/属于本次执行、节点覆盖；不能只统计执行了几条命令。
-- 环境健康 FAIL/BLOCKED 是有效检测；PRECHECK_FAILED 表示主动测试未执行，dry-run 表示仅验证命令构造，不得统计为计算实测覆盖。
-- 单测需覆盖参数拒绝、环境顺序、三种场景、分组/余数组、MPI/torchrun rank、实际 SSH 身份校验、失败状态优先级、取消并验证、NHC/IB/基准脚本、报告分组。Linux 进程测试不得在 Windows 上假装通过。
+- 分别记录执行状态、健康/正确性/性能结论、覆盖和清理；未知、缺失、NA、BLOCKED、取消及超时不计通过。采集退出 0 不能代替健康判定。
+- platform/resource 已连接健康规则及静态一致性，但规则入口和缺失覆盖有局限；文档不可描述成“仅采集”，也不可声称完整站点策略已实现。
+- 报告在可选择的目标节点环境运行 Python ≥3.10；默认第一个 hostfile 节点。新 Bash 运行使用 `compact-group-v2`：组事实集中到 `.state/prepared/<group>/facts.json`，按用途保存 `fields+rows`，原始测试输出仅在根部组日志。分组与阶段计划各保存一份；旧 `.state`、hostfile、日志索引和逐任务标记继续兼容读取，不能批量转换历史运行。
+- controller 主进程 C 是 `facts.json` 唯一发布者。目标环境 `state_facts.py` 只生成唯一命名、关闭并校验的候选；C 核对身份、revision、SHA256 后原子发布。worker、节点、watchdog 和 reporter 不修改持久事实；reporter 只写派生报告，不补跑。重跑创建新目录和 token，保留原证据。
+- 每个活动组只用固定 `.state/runtime/<group>/`；该组下一子项复用同一路径，不按测试项积累执行目录。正常清理、兜底清理按来源和 attempt 独立交付；所有交接包含 group/stage/phase/token。必须先 join 执行、SSH、deadline witness、watchdog、清理及日志收集写方，再校验并提交，token 校验不能代替等待。
+- 新运行的阶段 task/node-results/execution 等路径是 facts 的逻辑读取地址，不要求存在对应物理文件。报告不创建未来阶段执行目录。公共报告、原位重建和导出使用同一个稳定 `report.lock` 覆盖完整写入周期；不能 unlink、截断或原子替换该活动锁文件。
+- reporting/scale.py 统一计划规模与有证据的历史规模转换；计划卡数、MPI ranks、DeepEP worker 数与实际执行证据分开记录。新 GPU 重跑计划保存 G/C；旧 slots 含义不明时拒绝猜测，不能为历史计划重新开放旧 CLI 参数。
+- 当前已有超时、清理、生命周期、解析完整性、重跑和许可收尾问题。维护者必须保留未解决状态，不能因改文档、dry-run、阻断或部分真实运行而宣称全部通过。
+- 文档公开示例使用通用账号/节点/镜像/路径；真实站点配置、私有性能基准和验收材料置于工程外。原创文档保留仓库版权与 SPDX 声明，不覆盖第三方通知。
+- README 只维护定位、能力和最短入口；USER_GUIDE 保留各项命令示例、必要的可选参数速查与结果目录。环境准备、完整参数语义、架构、流程及结果判读集中在 DESIGN，文件职责集中在 PROJECT_STRUCTURE，缺陷集中在 KNOWN_LIMITATIONS。cluster_run/GUIDE 只作导航，不维护第二套命令。改接口时同步对应章节和链接。
+- scripts/test.sh 和部分历史测试有旧断言，先核对当前接口及授权范围；单测、静态检查或计划验证不能替代实际硬件链路证据。报告必须明确说明做了哪些验证、哪些未执行。
+
+- `.state` 脚本缓存、逐项工作区回收与运行收尾由 state_runtime.sh 统一实现。只有 C 确认完整事实已发布且各写方已退出，才回收本项白名单临时文件；普通 FAIL 或有完整证据且清理确认的 TIMEOUT 可以回收。清理未确认、仍有写方、证据不一致、日志或提交失败时保留现场并阻断该组后续派发。存在性标记必须删除，不能仅清空。运行及报告结束后再回收公共运行期文件，稳定 report.lock、事实、slotsfile、原始日志及命令引用的必要脚本保留。
+
+- 新运行的 `control.tsv` 标记 `state_layout=compact-group-v2`、`log_format=direct-group-v3`。每活动组的开始、命令、原始 stdout/stderr 和结束共用 FIFO 通道，唯一 cat 收集进程追加根部组日志；worker、目标 Python 和载荷不得旁路打开根日志追加。facts 只记录日志的精确 offset/length/SHA256 与逻辑 source，不逐行重写 JSON。历史日志索引和 direct-log 指针仍须可读。
+- RCCL/DeepEP 的设备选择持久化在 facts.devices；`prepared/<group>/devices/<node>.json` 是执行读取的虚拟定位路径，历史独立 JSON 仍可读。每次目标 shell/rank 仍加载 env-script、复核可见性/权限/PCI 身份及实际二进制、参数和基准。组 rank 正文相同时复用，变化时保留不可变版本；公共 guard 在派发前由 C 发布一次。禁止以复用为由减少动态检查、改变 argv、隐藏原始错误或缩减测试矩阵。
+
+- idle-check 走宿主机独立 Bash 路径；--release 明确授权停止占用 HCU 的 Docker 容器，控制与证据不得依赖释放目标容器。

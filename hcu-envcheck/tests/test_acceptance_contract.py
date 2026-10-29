@@ -8,6 +8,8 @@ never opens SSH/Docker connections or runs a GPU workload.
 from __future__ import annotations
 
 import csv
+import copy
+import hashlib
 import io
 import json
 import os
@@ -42,8 +44,10 @@ def matrix_cases(root, hostfile):
     import string
     text = SCRIPT.read_text(encoding="utf-8").split('<<CASES\n', 1)[1].split('\nCASES\n', 1)[0]
     values = dict(RUN_DIR=str(root), HOSTFILE=str(hostfile), SHARED_ENV_SCRIPT='/target/shared.sh',
-                  NODE_LOCAL_ENV_SCRIPT='/target/local.sh', CONTAINER_ENV_SCRIPT='/target/container.sh')
-    values.update({key: 'dry' for key in ('ACTIVE_MODE','PROFILE_MODE','NETWORK_MODE','DIAGNOSTIC_MODE','SCRIPT_MODE','CONTEXT_MODE')})
+                  NODE_LOCAL_ENV_SCRIPT='/target/local.sh', CONTAINER_ENV_SCRIPT='/target/container.sh',
+                  SHARED_RCCL_ENV_SCRIPT='/target/shared-rccl.sh', NODE_LOCAL_RCCL_ENV_SCRIPT='/target/local-rccl.sh',
+                  CONTAINER_RCCL_ENV_SCRIPT='/target/container-rccl.sh')
+    values.update({key: 'dry' for key in ('PROFILE_MODE','NETWORK_MODE')})
     (root / 'launcher-hostfile').write_text('n01\nn02\n', encoding='utf-8')
     return list(csv.DictReader(io.StringIO(string.Template(text).substitute(values)), delimiter='\t'))
 
@@ -70,14 +74,10 @@ def emit_fixture(root, case, meta):
             report[section] = {'nodes':{'n[01-02]':record}}
         path = directory / 'cluster-result.json'
     elif kind == 'active':
-        leaf = Path(case['directory']).name
-        profile = leaf if leaf in {'rccl-tests','rocblas'} else 'worker'
-        requested = leaf.removeprefix('launcher-') if leaf.startswith('launcher-') else (
-            meta.get('launcher','mpirun-torchrun') if case['operation'] in {'rccl','gemm'} and profile=='worker'
-            else 'mpirun' if profile=='rccl-tests' else 'mpirun-torchrun')
-        effective = ('server-client' if case['operation']=='ib-write-bw' else 'node-script' if case['operation']=='custom'
-                     else profile if profile!='worker' else 'local' if len(nodes)==1 else requested)
-        dispatched = nodes if effective in {'node-script','ssh-torchrun','rocblas'} else nodes[:1]
+        profile = 'rccl-tests' if case['operation']=='rccl' else None
+        requested = 'mpirun' if case['operation']=='rccl' else 'direct'
+        effective = ('server-client' if case['operation']=='ib-write-bw' else 'rccl-tests')
+        dispatched = nodes[:1]
         group = {'group':'group-000', 'nodes':list(nodes), 'leader':nodes[0], 'status':status,
                  'launcher':effective, 'requested_launcher':requested, 'execution_profile':profile,
                  'commands':[{'node':node, 'command':['bash','-c','source /target/env.sh; exec true']} for node in dispatched]}
@@ -102,7 +102,7 @@ def emit_fixture(root, case, meta):
                   'env_script':case['env_script'], 'nodes':list(nodes), 'group_count':1, 'groups':[group]}
         path = directory / 'active-result.json'
     else:
-        report = {'schema_version':'1.1' if kind == 'script' else '1.0', 'operation':case['operation'], 'status':status,
+        report = {'schema_version':'1.0', 'operation':case['operation'], 'status':status,
                   'scenario':case['scenario'], 'env_script':case['env_script'],
                   'execution_scope':'container' if case['scenario']=='per-node-container' else 'host', 'nodes':{}}
         for node in nodes:
@@ -114,7 +114,7 @@ def emit_fixture(root, case, meta):
                 (stdout.parent/'stderr.log').write_text('', encoding='utf-8')
                 record.update(returncode=0, stdout=str(stdout), stderr=str(stdout.parent/'stderr.log'))
             report['nodes'][node] = record
-        path = directory / ('script-result.json' if kind == 'script' else case['operation']+'-result.json')
+        path = directory / (case['operation']+'-result.json')
     write_json(path,report)
     status = report.get('status', report.get('cluster', {}).get('status'))
     return f'RESULT        {status}\nJSON          {path}\n'
@@ -165,85 +165,21 @@ class AcceptanceContractTests(unittest.TestCase):
         case=dict(self.case(name),mode='real')
         text=emit_fixture(self.root,case,self.meta)
         (self.root/'logs'/(name+'.log')).write_text(text,encoding='utf-8')
-        filename='script-result.json' if case['kind']=='script' else 'active-result.json'
+        filename='active-result.json'
         path=next((self.root/case['directory']).rglob(filename))
         return case,path,json.loads(path.read_text(encoding='utf-8'))
 
     def verify_one(self, case, rc=0):
         return self.contract['verify_case'](self.root,case,dict(returncode=rc,log_returncode=0),self.meta)
 
-    def test_full_matrix_includes_all_new_operations_and_container_script(self):
-        code,report=self.validate()
-        self.assertEqual(code,0,[item for item in report['cases'] if item.get('error')])
-        for scenario in ('shared-conda','node-local-conda','per-node-container'):
-            operations={case['operation'] for case in self.cases if case['scenario']==scenario}
-            self.assertTrue({'platform','resource','platform,resource','nhc','ib-write-bw','rccl','gemm','custom','script'} <= operations)
-            self.assertNotIn('ib-state', operations)
-        self.assertIn('per-node-container-script',[item['case'] for item in report['cases']])
 
     def test_rccl_binary_matrix_does_not_silently_select_only_all_reduce(self):
         source = SCRIPT.read_text(encoding='utf-8')
         for scenario in ('shared-conda', 'node-local-conda', 'per-node-container'):
             block = source.split('# ' + scenario + '-rccl-tests:', 1)[1].split('\n# ', 1)[0]
-            self.assertNotIn('--script-arg=--tests', block)
-            self.assertIn('--nproc-per-node "$RCCL_NPROC_PER_NODE"', block)
+            self.assertNotIn('--tests', block)
+            self.assertIn('--gpus-per-node "$RCCL_GPUS_PER_NODE"', block)
 
-    def test_one_non_launcher_failure_is_not_hidden_by_all_other_successes(self):
-        # Only GEMM fails to create its report; other 50 command receipts/artifacts are valid.
-        case=self.case('node-local-conda-gemm')
-        report_path=next((self.root/case['directory']).rglob('active-result.json'))
-        report_path.unlink()
-        code, report=self.validate()
-        self.assertEqual(code,1)
-        errors=[item['case'] for item in report['cases'] if item['execution_state']=='INTERFACE_ERROR']
-        self.assertEqual(errors,['node-local-conda-gemm'])
-
-    def test_actual_dryrun_reports_match_acceptance_contract_without_network(self):
-        from cluster_run.cli import main
-        for original in self.cases:
-            if original['mode'] != 'dry' or original['kind'] not in {'active','script','diagnostic'}:
-                continue
-            with self.subTest(case=original['case']):
-                case = dict(original, directory='actual/' + original['directory'], env_script='/target/fixture-env.sh')
-                args = [case['scenario'], case['operation'], '-f', case['hostfile'], '--env-script',case['env_script'],
-                        '--output-dir', str(self.root/case['directory']), '--dry-run']
-                if case['scenario'] == 'per-node-container':
-                    args += ['--container','worker','-i','image:tag']
-                if case['operation'] in {'script','custom'}:
-                    args += ['--script','/target/context.py']
-                if case['kind'] == 'active':
-                    args += ['--group-size','2' if case['operation']=='ib-write-bw' or '/launcher-' in case['directory'] else '1']
-                if '/launcher-' in case['directory']:
-                    args += ['--profile', 'worker', '--launcher', case['directory'].split('/launcher-')[1]]
-                elif case['directory'].endswith('/rccl-tests'):
-                    pass  # The RCCL default must exercise the real binary profile.
-                elif case['directory'].endswith('/rocblas'):
-                    args += ['--profile','rocblas']
-                elif case['operation'] == 'rccl':
-                    args += ['--profile', 'worker']
-                output=io.StringIO()
-                with patch('hcu_envcheck.baremetal.BaremetalClusterExecutor.execute', side_effect=AssertionError('dry-run contacted a node')):
-                    with redirect_stdout(output), redirect_stderr(output):
-                        code=main(args)
-                (self.root/'logs'/(case['case']+'.log')).write_text(output.getvalue(),encoding='utf-8')
-                result=self.contract['verify_case'](self.root,case,dict(returncode=code,log_returncode=0),self.meta)
-                self.assertEqual(result['execution_state'],'PLANNED_ONLY',result)
-
-    def test_container_script_missing_report_is_not_omitted_from_validation(self):
-        case=self.case('per-node-container-script')
-        next((self.root/case['directory']).rglob('script-result.json')).unlink()
-        self.assertEqual(self.validate()[0],1)
-
-    def test_exit_zero_without_launch_artifacts_does_not_pass(self):
-        case=self.case('shared-conda-gemm')
-        next((self.root/case['directory']).rglob('launch.json')).unlink()
-        self.assertEqual(self.validate()[0],1)
-
-    def test_wrong_node_scope_is_rejected(self):
-        case=self.case('per-node-container-script')
-        path=next((self.root/case['directory']).rglob('script-result.json'))
-        data=json.loads(path.read_text()); data['nodes'].pop('n02'); write_json(path,data)
-        self.assertEqual(self.validate()[0],1)
 
     def test_stale_report_is_rejected(self):
         case=self.case('shared-conda-resource')
@@ -284,154 +220,20 @@ class AcceptanceContractTests(unittest.TestCase):
         write_json(path,data)
         self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
 
-    def test_each_profile_and_launcher_field_is_checked_without_masking_other_cases(self):
-        changes=(('shared-conda-rccl-tests','active-result.json','profile','worker'),
-                 ('shared-conda-gemm','active-result.json','profile','rocblas'),
-                 ('shared-conda-rccl','active-result.json','launcher','mpirun'),
-                 ('per-node-container-launcher-mpirun','launch.json','requested_launcher','ssh-torchrun'),
-                 ('shared-conda-rocblas','launch.json','execution_profile','worker'),
-                 ('shared-conda-rccl','launch.json','launcher','ssh-torchrun'),
-                 ('per-node-container-launcher-ssh-torchrun','result.json','launcher','mpirun'))
-        for name,filename,field,value in changes:
-            with self.subTest(case=name,artifact=filename,field=field):
-                case=self.case(name)
-                path=next((self.root/case['directory']).rglob(filename))
-                original=path.read_text(encoding='utf-8')
-                data=json.loads(original); data[field]=value; write_json(path,data)
-                code,report=self.validate()
-                self.assertEqual(code,1)
-                self.assertEqual([item['case'] for item in report['cases'] if item.get('error')],[name])
-                path.write_text(original,encoding='utf-8')
 
-    def test_report_cannot_hide_wrong_group_profile_or_effective_launcher(self):
-        case=self.case('shared-conda-gemm')
-        path=next((self.root/case['directory']).rglob('active-result.json'))
-        original=path.read_text(encoding='utf-8')
-        for field,value in (('execution_profile','rocblas'),('launcher','local'),('requested_launcher','mpirun')):
-            with self.subTest(field=field):
-                data=json.loads(original); data['groups'][0][field]=value; write_json(path,data)
-                self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
+    def test_removed_rccl_worker_is_rejected_without_execution(self):
+        from tests.test_launch_contract import run_cli
+        case = self.case('shared-conda-rccl-tests')
+        result, calls = run_cli(self, ['shared-conda', 'rccl', '-f', case['hostfile'],
+                                    '--profile', 'worker', '--dry-run'])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('unsupported staged argument: --profile', result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(calls, [], 'rejected modes must never reach SSH or Docker')
 
-    def test_normal_worker_uses_configured_launcher_not_hardcoded_default(self):
-        self.meta['launcher']='ssh-torchrun'
-        case,path,data=self.real_fixture('shared-conda-gemm')
-        self.assertEqual(self.verify_one(case)['execution_state'],'EXECUTION_ATTEMPTED')
-        data['launcher']='mpirun-torchrun'; write_json(path,data)
-        self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
-
-    def test_actual_worker_dryrun_cannot_substitute_for_rccl_tests_profile(self):
-        from cluster_run.cli import main
-        case=dict(self.case('shared-conda-rccl-tests'),directory='wrong-profile/rccl-tests')
-        output=io.StringIO()
-        with patch('hcu_envcheck.baremetal.BaremetalClusterExecutor.execute',side_effect=AssertionError('network forbidden')):
-            with redirect_stdout(output),redirect_stderr(output):
-                rc=main(['shared-conda','rccl','-f',case['hostfile'],'--env-script',case['env_script'],
-                         '--output-dir',str(self.root/case['directory']),'--group-size','1','--profile','worker','--dry-run'])
-        self.assertEqual(rc,0,output.getvalue())
-        (self.root/'logs'/(case['case']+'.log')).write_text(output.getvalue(),encoding='utf-8')
-        result=self.verify_one(case)
-        self.assertEqual(result['execution_state'],'INTERFACE_ERROR',result)
-        self.assertIn('profile mismatch',result['error'])
-
-    def test_active_and_script_environment_and_scope_are_checked(self):
-        for name in ('shared-conda-gemm','per-node-container-script'):
-            case=self.case(name)
-            path=next((self.root/case['directory']).rglob('active-result.json' if case['kind']=='active' else 'script-result.json'))
-            original=path.read_text(encoding='utf-8')
-            for field,value in (('env_script','/wrong/env.sh'),('execution_scope','wrong-scope')):
-                with self.subTest(case=name,field=field):
-                    data=json.loads(original); data[field]=value; write_json(path,data)
-                    self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
-
-    def test_real_mpi_has_leader_evidence_but_ssh_and_pernode_need_every_node(self):
-        names=('shared-conda-gemm','shared-conda-rccl-tests','shared-conda-rocblas',
-               'per-node-container-launcher-mpirun','per-node-container-launcher-ssh-torchrun','shared-conda-custom')
-        for name in names:
-            with self.subTest(case=name):
-                case,path,data=self.real_fixture(name)
-                group=data['groups'][0]
-                expected=['n01','n02'] if group['launcher'] in {'ssh-torchrun','rocblas','node-script'} else ['n01']
-                self.assertEqual([item['node'] for item in group['node_results']],expected)
-                result=self.verify_one(case)
-                self.assertEqual(result['execution_state'],'EXECUTION_ATTEMPTED',result)
-                group['node_results'].pop(); write_json(path,data)
-                self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
-
-    def test_duplicate_or_wrong_worker_node_cannot_replace_missing_node(self):
-        for fault in ('duplicate','wrong-node'):
-            with self.subTest(fault=fault):
-                case,path,data=self.real_fixture('shared-conda-custom')
-                data['groups'][0]['node_results'][1]['node']='n01' if fault=='duplicate' else 'n03'
-                write_json(path,data)
-                self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
-
-    def test_top_pass_cannot_hide_group_worker_or_returncode_disagreement(self):
-        for fault in ('group-cancelled','worker-cancelled','worker-failed','pass-nonzero','unknown-worker',
-                      'group-incomplete','hidden-incomplete','interrupted'):
-            with self.subTest(fault=fault):
-                case,path,data=self.real_fixture('shared-conda-gemm')
-                group=data['groups'][0]; worker=group['node_results'][0]
-                if fault=='group-cancelled': group['status']='CANCELLED'
-                elif fault=='worker-cancelled': worker.update(status='CANCELLED',returncode=130)
-                elif fault=='worker-failed': worker.update(status='FAIL',returncode=1)
-                elif fault=='pass-nonzero': worker['returncode']=1
-                elif fault=='unknown-worker': worker['status']='UNKNOWN'
-                elif fault=='group-incomplete': group['status']='INCOMPLETE'
-                elif fault=='hidden-incomplete':
-                    group['status']='INCOMPLETE'; worker.update(status='INCOMPLETE',returncode=2)
-                else: data['interrupted']=True
-                write_json(path,data)
-                self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
-
-    def test_valid_worker_failure_and_incomplete_remain_reportable_outcomes(self):
-        for status,worker_rc,cli_rc in (('FAIL',1,2),('INCOMPLETE',2,0)):
-            with self.subTest(status=status):
-                case,path,data=self.real_fixture('shared-conda-gemm')
-                data['status']=data['groups'][0]['status']=status
-                data['groups'][0]['node_results'][0].update(status=status,returncode=worker_rc)
-                write_json(path,data)
-                self.assertEqual(self.verify_one(case,cli_rc)['execution_state'],'EXECUTION_ATTEMPTED')
-
-    def test_failfast_cancelled_peer_is_valid_only_with_failed_aggregate_and_confirmed_cleanup(self):
-        case,path,data=self.real_fixture('shared-conda-custom')
-        data['status']=data['groups'][0]['status']='FAIL'
-        first,second=data['groups'][0]['node_results']
-        first.update(status='FAIL',returncode=127)
-        second.update(status='CANCELLED',returncode=130)
-        data['cleanup']={'run_token':'test-token','nodes':{node:{'status':'CONFIRMED'} for node in self.meta['nodes']}}
-        write_json(path,data)
-        self.assertEqual(self.verify_one(case,2)['execution_state'],'EXECUTION_ATTEMPTED')
-        data['status']='PASS'; write_json(path,data)
-        self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
-
-    def test_serialized_cleanup_node_status_not_computed_property_controls_acceptance(self):
-        from dataclasses import asdict
-        from cluster_run.task_control import CancellationReport,NodeCancellation
-        for name in ('per-node-container-context-py','per-node-container-context-sh'):
-            for status in ('CONFIRMED','UNCONFIRMED','FAILED'):
-                with self.subTest(case=name,status=status):
-                    case,path,data=self.real_fixture(name)
-                    cleanup=asdict(CancellationReport('test-token',{node:NodeCancellation(node,
-                        status if node=='n02' else 'CONFIRMED','fixture') for node in self.meta['nodes']}))
-                    self.assertNotIn('confirmed',cleanup)
-                    data['cleanup']=cleanup; write_json(path,data)
-                    expected='EXECUTED_VERIFIED' if status=='CONFIRMED' else 'INTERFACE_ERROR'
-                    self.assertEqual(self.verify_one(case)['execution_state'],expected)
-
-    def test_child_and_basic_cleanup_cannot_be_hidden_by_top_level_status(self):
-        case,path,data=self.real_fixture('per-node-container-context-py')
-        data['groups'][0]['node_results'][0]['cleanup']={'status':'UNCONFIRMED'}
-        write_json(path,data)
-        self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
-        case=self.case('shared-conda-resource')
-        path=next((self.root/case['directory']).rglob('cluster-result.json'))
-        data=json.loads(path.read_text(encoding='utf-8'))
-        data['cluster']['cleanup']={'nodes':{'n01':{'status':'UNCONFIRMED'}}}
-        write_json(path,data)
-        self.assertEqual(self.verify_one(case)['execution_state'],'INTERFACE_ERROR')
 
     def test_precheck_is_blocked_not_executed_and_never_accepted_in_dryrun(self):
-        case=dict(self.case('per-node-container-rccl'),mode='real')
+        case=dict(self.case('per-node-container-rccl-tests'),mode='real')
         (self.root/'logs'/ (case['case']+'.log')).write_text(
             '[ERROR] nodes=n[01-02] code=DCU_BUSY reason=in use\nRESULT        PRECHECK_FAILED\n',encoding='utf-8')
         receipt=dict(returncode='3',log_returncode='0')
@@ -441,116 +243,151 @@ class AcceptanceContractTests(unittest.TestCase):
         case['mode']='dry'
         self.assertEqual(self.contract['verify_case'](self.root,case,receipt,self.meta)['execution_state'],'INTERFACE_ERROR')
 
-    def test_real_context_verifies_env_marker_node_and_scope(self):
-        case=dict(self.case('shared-conda-context-py'),mode='real')
-        emit_fixture(self.root,case,self.meta)
-        result=self.contract['verify_case'](self.root,case,dict(returncode=0,log_returncode=0),self.meta)
-        self.assertEqual(result['execution_state'],'EXECUTED_VERIFIED',result)
-        log=next((self.root/case['directory']).rglob('stdout.log'))
-        log.write_text(context_line('wrong-node',case,self.meta),encoding='utf-8')
-        self.assertEqual(self.contract['verify_case'](self.root,case,dict(returncode=0,log_returncode=0),self.meta)['execution_state'],'INTERFACE_ERROR')
 
-    def test_container_hostname_is_observed_not_used_as_physical_node_identity(self):
-        for name in ('per-node-container-context-sh','per-node-container-context-py'):
-            with self.subTest(case=name):
-                case=dict(self.case(name),mode='real')
-                emit_fixture(self.root,case,self.meta)
-                for log in (self.root/case['directory']).rglob('stdout.log'):
-                    log.write_text(context_line('worker-container',case,self.meta),encoding='utf-8')
-                result=self.contract['verify_case'](self.root,case,dict(returncode=0,log_returncode=0),self.meta)
-                self.assertEqual(result['execution_state'],'EXECUTED_VERIFIED',result)
-                self.assertEqual(set(result['runtime_context']),{'n01','n02'})
-                self.assertTrue(all(item['node']=='worker-container' for item in result['runtime_context'].values()))
+class CompactAcceptanceContractTests(unittest.TestCase):
+    """New Bash compact artifacts, independent of the frozen legacy matrix."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.hostfile = self.root / 'hosts'
+        self.hostfile.write_text('n01\nn02\n', encoding='utf-8')
+        self.case = dict(case='compact-ib', kind='active', mode='real', scenario='per-node-container',
+                         operation='ib-write-bw', directory='compact-ib', hostfile=str(self.hostfile),
+                         env_script='/target/env.sh', context='no')
+        self.meta = dict(started=time.time(), token='acceptance-fixture-token')
+        self.contract = validator()
+        self.public = self.root / self.case['directory'] / 'current-run'
+        self.state = self.public / '.state'
+        self.prepared = self.state / 'prepared/group-001'
+        self.prepared.mkdir(parents=True)
+        self.archive = self.public / 'group-001.log'
+        self.archive.write_bytes(b'')
+        self.log = self.root / 'logs' / (self.case['case'] + '.log')
+        self.log.parent.mkdir()
+        self.log.write_text('current Bash run\n', encoding='utf-8')
+        self.stage = '01-ib_write_bw'
+        self.prefix = f'stages/{self.stage}/groups/group-001/'
+        self.tokens = {'preflight': 'hcu_acceptance_preflight_0001', self.stage: 'hcu_acceptance_execute_00001'}
+        self.data = dict(schema_version=2, group='group-001', revision=4, tables={})
+        tasks, nodes, cleanup = [], [], []
+        for stage, token in self.tokens.items():
+            tasks.append(dict(stage_id=stage, phase='prepare' if stage == 'preflight' else 'execute',
+                item='' if stage == 'preflight' else 'ib_write_bw', iteration='0', token=token, status='PASS',
+                exit_code='0', execution_exit_code='0', cleanup='CONFIRMED', started_epoch='100', ended_epoch='101',
+                reason_code='OK', log=('prepared/group-001/' if stage == 'preflight' else self.prefix) + 'group.log'))
+            for node in ('n01', 'n02'):
+                nodes.append(dict(stage_id=stage, token=token, node=node, exit_code='0', cleanup='CONFIRMED', log='logical.log'))
+                cleanup.append(dict(stage_id=stage, token=token, node=node, source='normal', attempt='1', status='CONFIRMED',
+                    exit_code='0', evidence='cleanup.json', guard=dict(token=token, status='STOPPED', remaining=0,
+                                                                    tombstone=True, uncertain=False)))
+        self.table('tasks', tasks)
+        self.table('nodes', nodes)
+        self.table('cleanup', cleanup)
+        self.table('logs', [], fields=['stage_id','token','sources','offset','length','sha256'])
+        self.add_log('preflight', 'prepared/group-001/group.log', b'preflight raw\n')
+        self.add_log(self.stage, self.prefix + 'group.log', b'actual IB command and raw output\n')
+        commands = []
+        for role in ('server', 'client'):
+            command = dict(returncode=0, argv=['ib_write_bw', '--ib-dev=mlx5_0'])
+            for stream in ('stdout', 'stderr'):
+                source = self.prefix + f'ib/evidence/pair/{role}/{stream}.txt'
+                command[stream + '_path'] = source
+                self.add_log(self.stage, source, (role + ' raw\n').encode() if stream == 'stdout' else b'')
+            commands.append(command)
+        self.metadata = dict(run_token=self.tokens[self.stage], selected_nodes=['n01','n02'], status='PASS',
+            pairs=[dict(source='n01', destination='n02', status='PASS', commands=commands)])
+        self.table('ib', [dict(stage_id=self.stage, token=self.tokens[self.stage], metadata=self.metadata)])
+        self.report = dict(schema_version=1, protocol_version=1, final=True, status='PASS', planned=1,
+            control=dict(state_layout='compact-group-v2', scenario=self.case['scenario'], operation='ib-write-bw',
+                         env_script=self.case['env_script'], container='worker'),
+            groups=[dict(group='group-001', nodes='n01,n02', hostfile=str(self.prepared / 'hostfile'))],
+            stages=[dict(stage_id=self.stage, item='ib_write_bw', iteration='0')],
+            preflight=[dict(group='group-001', status='PASS', cleanup='CONFIRMED')],
+            results=[dict(stage_id=self.stage, group='group-001', nodes='n01,n02', status='PASS', exit_code='0',
+                          cleanup='CONFIRMED', dispatched=True)])
+        self.persist()
 
-    def test_container_context_still_rejects_missing_node_evidence_bad_token_and_scope(self):
-        for name in ('per-node-container-context-sh','per-node-container-context-py'):
-            for fault in ('missing-log','wrong-token','wrong-scope','missing-result'):
-                with self.subTest(case=name,fault=fault):
-                    case=dict(self.case(name),mode='real')
-                    emit_fixture(self.root,case,self.meta)
-                    log=next((self.root/case['directory']).rglob('stdout.log'))
-                    if fault=='missing-log':
-                        log.unlink()
-                    elif fault=='missing-result':
-                        path=next((self.root/case['directory']).rglob('script-result.json' if case['kind']=='script' else 'active-result.json'))
-                        data=json.loads(path.read_text(encoding='utf-8'))
-                        if case['kind']=='script': data['nodes'].pop('n02')
-                        else: data['groups'][0]['node_results'].pop()
-                        write_json(path,data)
-                    else:
-                        observed=dict(token='wrong' if fault=='wrong-token' else self.meta['token'],
-                                      node='worker-container',scope='host' if fault=='wrong-scope' else 'container',pid=1)
-                        log.write_text('HCU_CONTEXT_JSON '+json.dumps(observed)+'\n',encoding='utf-8')
-                    result=self.contract['verify_case'](self.root,case,dict(returncode=0,log_returncode=0),self.meta)
-                    self.assertEqual(result['execution_state'],'INTERFACE_ERROR',result)
+    def table(self, name, records, fields=None):
+        fields = fields or list(records[0])
+        self.data['tables'][name] = dict(fields=fields, rows=[[record[field] for field in fields] for record in records])
 
-    def test_container_hostname_relaxation_does_not_allow_cross_node_log_rebinding(self):
-        case,path,data=self.real_fixture('per-node-container-context-sh')
-        for log in (self.root/case['directory']).rglob('stdout.log'):
-            log.write_text(context_line('worker-container',case,self.meta),encoding='utf-8')
-        data['nodes']['n02']['stdout']=data['nodes']['n01']['stdout']
-        write_json(path,data)
-        result=self.verify_one(case)
-        self.assertEqual(result['execution_state'],'INTERFACE_ERROR',result)
-        self.assertIn('bound to wrong node',result['error'])
+    def add_log(self, stage, source, payload):
+        offset = self.archive.stat().st_size
+        with self.archive.open('ab') as stream:
+            stream.write(payload)
+        self.data['tables']['logs']['rows'].append([stage, self.tokens[stage], [source], offset, len(payload),
+                                                   hashlib.sha256(payload).hexdigest()])
 
-    def test_tool_error_or_cleanup_unconfirmed_never_pass(self):
-        case=self.case('shared-conda-gemm')
-        for code,text in ((3,'RESULT        TOOL_ERROR\n'),(3,'RESULT        CLEANUP_UNCONFIRMED\n'),(130,'RESULT        CANCELLED\n')):
-            with self.subTest(code=code,text=text):
-                (self.root/'logs'/ (case['case']+'.log')).write_text(text,encoding='utf-8')
-                result=self.contract['verify_case'](self.root,case,dict(returncode=code,log_returncode=0),self.meta)
-                self.assertEqual(result['execution_state'],'INTERFACE_ERROR')
+    def persist(self):
+        write_json(self.prepared / 'facts.json', self.data)
+        write_json(self.state / 'report.json', self.report)
 
-    def test_runtime_context_checks_every_group_not_only_last(self):
-        case=dict(self.case('per-node-container-context-py'),mode='real')
-        emit_fixture(self.root,case,self.meta)
-        path=next((self.root/case['directory']).rglob('active-result.json'))
-        report=json.loads(path.read_text(encoding='utf-8'))
-        original=report['groups'][0]
-        groups=[]
-        for index,node in enumerate(self.meta['nodes']):
-            name=f'group-{index:03d}'
-            directory=path.parent/'groups'/name
-            record=original['node_results'][index]
-            group=dict(original,group=name,nodes=[node],leader=node,node_results=[record],
-                       commands=[item for item in original['commands'] if item['node']==node])
-            stdout=directory/'nodes'/node/'stdout.log'
-            stdout.parent.mkdir(parents=True,exist_ok=True)
-            stdout.write_text(context_line(node,case,self.meta),encoding='utf-8')
-            (stdout.parent/'stderr.log').write_text('',encoding='utf-8')
-            write_json(directory/'result.json',group)
-            groups.append(group)
-        report.update(groups=groups,group_count=2)
-        write_json(path,report)
-        receipt=dict(returncode=0,log_returncode=0)
-        result=self.contract['verify_case'](self.root,case,receipt,self.meta)
-        self.assertEqual(result['execution_state'],'EXECUTED_VERIFIED',result)
-        self.assertEqual(set(result['runtime_context']),set(self.meta['nodes']))
-        first=path.parent/'groups/group-000/nodes/n01/stdout.log'
-        first.write_text(context_line('n01',case,dict(self.meta,token='stale')),encoding='utf-8')
-        result=self.contract['verify_case'](self.root,case,receipt,self.meta)
-        self.assertEqual(result['execution_state'],'INTERFACE_ERROR',result)
-        first.unlink()
-        result=self.contract['verify_case'](self.root,case,receipt,self.meta)
-        self.assertEqual(result['execution_state'],'INTERFACE_ERROR',result)
+    def verify(self, rc=0):
+        return self.contract['verify_case'](self.root, self.case, dict(returncode=rc,log_returncode=0), self.meta)
 
-    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'Linux full Shell fixture, never SSH')
-    def test_total_shell_reports_one_failed_non_launcher_case(self):
-        fake=self.root/'fake-cli.sh'
-        fake.write_text('#!/usr/bin/env bash\nexec "$PYTHON_BIN" "$FIXTURE_DRIVER" --fixture-cli "$@"\n',encoding='utf-8')
-        env=dict(os.environ, HCU_ACCEPTANCE_NESTED_TEST='1', HCU_CLUSTER_RUN=str(fake),
-                 PYTHON_BIN=sys.executable, CONTROLLER_PYTHON=sys.executable,
-                 FIXTURE_DRIVER=str(Path(__file__).resolve()), HOSTFILE=str(self.hostfile), ENV_SCRIPT='/target/env.sh',
-                 OUTPUT_DIR=str(self.root/'matrix'), FAIL_CASE='node-local-conda-gemm')
-        for name in ('CONTROLLER_ENV_SCRIPT','RUN_ACTIVE','RUN_PROFILES','RUN_NETWORK','RUN_DIAGNOSTICS','RUN_SCRIPTS','RUN_CONTEXT'):
-            env.pop(name,None)
-        run=subprocess.run(['bash',str(SCRIPT)],env=env,cwd=ROOT,capture_output=True,text=True,timeout=120)
-        self.assertNotEqual(run.returncode,0,run.stdout+run.stderr)
-        path=next((self.root/'matrix').glob('run_*/acceptance-result.json'))
-        report=json.loads(path.read_text())
-        failures=[case['case'] for case in report['cases'] if case['execution_state']=='INTERFACE_ERROR']
-        self.assertEqual(failures,['node-local-conda-gemm'],run.stdout+run.stderr)
+    def test_compact_ib_metadata_and_endpoint_fragments_need_no_runtime_or_legacy_json(self):
+        result = self.verify()
+        self.assertEqual(result['execution_state'], 'EXECUTION_ATTEMPTED', result)
+        self.assertEqual(result['pairs_executed'], 1)
+        self.assertEqual(result['nodes_reported'], ['n01','n02'])
+        self.assertFalse((self.state / 'runtime').exists())
+        self.assertFalse(list(self.public.rglob('ib-write-bw-result.json')))
+        self.assertFalse((self.state / 'stages').exists())
+
+    def test_staged_environment_scope_and_receipt_are_checked(self):
+        original = copy.deepcopy(self.report)
+        for change in ({'env_script':'/wrong.sh'}, {'container':''}, {'scenario':'shared-conda'}):
+            self.report = copy.deepcopy(original)
+            self.report['control'].update(change)
+            self.persist()
+            self.assertEqual(self.verify()['execution_state'], 'INTERFACE_ERROR')
+        self.report = original
+        self.persist()
+        self.assertEqual(self.verify(rc=1)['execution_state'], 'INTERFACE_ERROR')
+
+    def test_compact_missing_ib_metadata_never_uses_old_physical_json(self):
+        self.data['tables']['ib']['rows'] = []
+        write_json(self.state / self.prefix / 'ib-write-bw-result.json', self.metadata)
+        self.persist()
+        result = self.verify()
+        self.assertEqual(result['execution_state'], 'INTERFACE_ERROR')
+        self.assertIn('authoritative IB metadata', result['error'])
+
+    def test_missing_endpoint_fragment_cannot_be_replaced_with_stale_physical_log(self):
+        source = self.metadata['pairs'][0]['commands'][0]['stdout_path']
+        self.data['tables']['logs']['rows'] = [row for row in self.data['tables']['logs']['rows'] if source not in row[2]]
+        path = self.state / source
+        path.parent.mkdir(parents=True)
+        path.write_text('stale endpoint success', encoding='utf-8')
+        self.persist()
+        self.assertEqual(self.verify()['execution_state'], 'INTERFACE_ERROR')
+
+    def test_endpoint_checksum_corruption_is_rejected(self):
+        row = self.data['tables']['logs']['rows'][2]
+        with self.archive.open('r+b') as stream:
+            stream.seek(row[3])
+            stream.write(b'X')
+        self.assertEqual(self.verify()['execution_state'], 'INTERFACE_ERROR')
+
+    def test_unconfirmed_cleanup_or_missing_guard_proof_is_rejected(self):
+        original = copy.deepcopy(self.data)
+        self.data['tables']['cleanup']['rows'] = []
+        self.persist()
+        self.assertEqual(self.verify()['execution_state'], 'INTERFACE_ERROR')
+        self.data = original
+        fields = self.data['tables']['tasks']['fields']
+        self.data['tables']['tasks']['rows'][1][fields.index('cleanup')] = 'UNCONFIRMED'
+        self.persist()
+        self.assertEqual(self.verify()['execution_state'], 'INTERFACE_ERROR')
+
+    def test_missing_or_reordered_staged_results_do_not_pass(self):
+        self.report['results'] = []
+        self.persist()
+        self.assertEqual(self.verify()['execution_state'], 'INTERFACE_ERROR')
+        self.report['results'] = [dict(stage_id=self.stage, group='group-999')]
+        self.persist()
+        self.assertEqual(self.verify()['execution_state'], 'INTERFACE_ERROR')
 
 
 def fixture_cli(args):

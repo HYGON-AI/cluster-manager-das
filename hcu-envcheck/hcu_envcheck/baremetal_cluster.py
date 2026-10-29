@@ -1420,7 +1420,6 @@ def render_baremetal_markdown(report: dict[str, Any]) -> str:
     if extra.get("enabled"):
         lines.append("")
         ib_state = extra.get("ib_state") or {}
-        nhc = extra.get("nhc") or {}
         ib_write_bw = extra.get("ib_write_bw") or {}
         lines.extend(["## Cluster Extra Checks", ""])
         lines.append(
@@ -1434,27 +1433,6 @@ def render_baremetal_markdown(report: dict[str, Any]) -> str:
                 f"pass={sum(item.get('status') == 'PASS' for item in ib_nodes)}/"
                 f"{len(ib_nodes)}; transport={_fmt(ib_state.get('transport'))}"
             )
-        if nhc.get("enabled"):
-            nhc_nodes = nhc.get("nodes") or []
-            nhc_summary = (
-                f"- NHC: `{nhc.get('status', 'NOT_VERIFIED')}`; "
-                f"pass={sum(item.get('status') == 'PASS' for item in nhc_nodes)}/"
-                f"{len(nhc_nodes)}; transport={_fmt(nhc.get('transport'))}"
-            )
-            execution_reason_codes = {
-                "NHC_COMMAND_NOT_FOUND",
-                "NHC_EXECUTION_ERROR",
-                "NHC_EXECUTION_FAILED",
-                "NHC_RESULT_MARKER_MISSING",
-            }
-            if nhc.get("installation_source") and any(
-                item.get("reason_code") in execution_reason_codes
-                for item in nhc_nodes
-            ):
-                nhc_summary += (
-                    f"; installation_source={_fmt(nhc.get('installation_source'))}"
-                )
-            lines.append(nhc_summary)
         if ib_write_bw.get("enabled"):
             summary = ib_write_bw.get("summary") or {}
             lines.append(
@@ -1943,7 +1921,6 @@ def run_baremetal_cluster_preflight(
     cluster_extra_checks = None
     if probe_nodes and extra_checks is not None and (
         extra_checks.ib_state.enabled
-        or extra_checks.nhc.enabled
         or extra_checks.ib.enabled
     ):
         cluster_extra_checks = run_cluster_extra_checks(

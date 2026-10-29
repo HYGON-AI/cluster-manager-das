@@ -11,62 +11,15 @@ from hcu_envcheck.cluster_checks import (
     ClusterExtraCheckConfig,
     IBStateCheckConfig,
     IBWriteBandwidthConfig,
-    NHCCheckConfig,
     build_ib_test_plan,
     evaluate_ib_state_output,
     evaluate_ib_write_bw_output,
-    evaluate_nhc_output,
     run_cluster_extra_checks,
 )
 
 
 class ClusterExtraChecksTests(unittest.TestCase):
-    def test_nhc_output_requires_pass_marker(self):
-        passed = evaluate_nhc_output(0, "noise\n[CHECK RESULT]: PASSED\n", "", False)
-        self.assertEqual(passed["status"], "PASS")
-        self.assertEqual(passed["reason_code"], "NHC_CHECK_PASSED")
 
-        failed = evaluate_nhc_output(2, "[CHECK RESULT]: FAILED\n[CONTENT LIST]:\nib: bad\n", "", False)
-        self.assertEqual(failed["status"], "FAIL")
-        self.assertEqual(failed["reason_code"], "NHC_CHECK_FAILED")
-
-        findings = evaluate_nhc_output(
-            0,
-            "[CHECK RESULT]: ib_link_down,service_failed\n[CONTENT LIST]:\nib: bad\n",
-            "",
-            False,
-        )
-        self.assertEqual(findings["status"], "FAIL")
-        self.assertEqual(findings["reason_code"], "NHC_CHECK_FAILED")
-
-        missing = evaluate_nhc_output(0, "all good maybe\n", "", False)
-        self.assertEqual(missing["status"], "NOT_VERIFIED")
-        self.assertEqual(missing["reason_code"], "NHC_RESULT_MARKER_MISSING")
-        self.assertNotIn("installation_source", missing)
-
-        execution_failed = evaluate_nhc_output(2, "", "usage error\n", False)
-        self.assertEqual(execution_failed["status"], "NOT_VERIFIED")
-        self.assertEqual(execution_failed["reason_code"], "NHC_EXECUTION_FAILED")
-        self.assertIn("verify the host command", execution_failed["message"])
-
-        command_missing = evaluate_nhc_output(127, "", "run_nhc: not found\n", False)
-        self.assertEqual(command_missing["reason_code"], "NHC_COMMAND_NOT_FOUND")
-        self.assertNotIn("installation_source", command_missing)
-
-        custom_source = evaluate_nhc_output(
-            127,
-            "",
-            "run_nhc: not found\n",
-            False,
-            installation_source="/opt/site-tools/nhc",
-        )
-        self.assertEqual(custom_source["installation_source"], "/opt/site-tools/nhc")
-
-    def test_nhc_defaults_to_direct_run_nhc_without_unsupported_flags(self):
-        config = NHCCheckConfig(enabled=True)
-
-        self.assertEqual(config.argv(), ["run_nhc"])
-        self.assertIsNone(config.installation_source)
 
     def test_ib_plan_contains_one_all_direction_round_for_every_hca(self):
         plan = build_ib_test_plan(
@@ -138,48 +91,6 @@ Link type      : IB
         self.assertEqual(slow["status"], "FAIL")
         self.assertEqual(slow["reason_code"], "IB_BANDWIDTH_BELOW_THRESHOLD")
 
-    def test_run_cluster_extra_checks_adds_failed_nhc_to_node_record(self):
-        calls = []
-
-        def runner(argv, **kwargs):
-            calls.append(argv)
-            sentinel = re.search(r"(__HCU_ENVCHECK_RC_[0-9a-f]+__)", argv[-1]).group(1)
-            if "node1" in argv[-2]:
-                return subprocess.CompletedProcess(argv, 0, f"[CHECK RESULT]: PASSED\n{sentinel}=0\n", "")
-            return subprocess.CompletedProcess(argv, 2, f"[CHECK RESULT]: FAILED\n{sentinel}=2\n", "")
-
-        records = [
-            {"node": "node1", "status": "READY", "findings": [], "checks": []},
-            {"node": "node2", "status": "READY", "findings": [], "checks": []},
-        ]
-        with tempfile.TemporaryDirectory() as temp:
-            execution = BaremetalExecutionConfig(
-                output_root=Path(temp) / "evidence",
-                transport="ssh",
-                ssh_executable="/usr/bin/ssh",
-            )
-            extra = run_cluster_extra_checks(
-                nodes=["node1", "node2"],
-                records=records,
-                execution_config=execution,
-                config=ClusterExtraCheckConfig(
-                    nhc=NHCCheckConfig(enabled=True),
-                    ib=IBWriteBandwidthConfig(enabled=False),
-                ),
-                output_root=Path(temp) / "evidence",
-                runner=runner,
-                which=lambda name: "/usr/bin/ssh" if name == "ssh" else None,
-            )
-
-        self.assertEqual(extra["nhc"]["status"], "FAIL")
-        self.assertEqual(records[0]["status"], "READY")
-        self.assertEqual(records[1]["status"], "BLOCKED")
-        self.assertEqual(records[1]["findings"][0]["reason_code"], "NHC_CHECK_FAILED")
-        rendered_commands = "\n".join(call[-1] for call in calls)
-        self.assertIn("run_nhc", rendered_commands)
-        self.assertNotIn("sh -lc", rendered_commands)
-        self.assertNotIn("--read-only", rendered_commands)
-        self.assertNotIn("--fail-on-error", rendered_commands)
 
     def test_ib_runner_launches_server_and_client_from_controller(self):
         calls = []
@@ -226,7 +137,6 @@ CA 'mlx5_0'
                 execution_config=execution,
                 config=ClusterExtraCheckConfig(
                     ib_state=IBStateCheckConfig(enabled=True),
-                    nhc=NHCCheckConfig(enabled=False),
                     ib=IBWriteBandwidthConfig(
                         enabled=True,
                         minimum_average_gbps=200.0,

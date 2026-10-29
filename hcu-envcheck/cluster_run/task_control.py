@@ -40,19 +40,31 @@ _MARKER = "__HCU_TASK_STOP__="
 def _guard_command(mode: str, run_token: str, args: Sequence[str] = ()) -> list[str]:
     if not isinstance(run_token, str) or not _TOKEN_RE.fullmatch(run_token):
         raise ValueError("run_token must be 16..96 letters, digits, underscores or hyphens")
-    body = (Path(__file__).parent / "payloads" / "task_guard.sh").read_text(encoding="utf-8")
+    body = (Path(__file__).parent.parent / "hcu_envcheck" / "payloads" / "task_guard.sh").read_text(encoding="utf-8")
     # Bash otherwise reads BASH_ENV even with --norc. In particular stop must
     # not run a user startup hook that blocks or exits before installing STOP.
     return ["env", "-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc",
             "-c", body, "hcu-task-guard", mode, run_token, *args]
 
 
-def managed_command(command: Sequence[str], run_token: str) -> list[str]:
-    """Inline guard: no shared project installation or remote Python required."""
+def managed_command(command: Sequence[str], run_token: str, *, guard_file: str | Path | None = None) -> list[str]:
+    """Wrap argv with an explicit shared guard, or the standalone inline guard."""
     if isinstance(command, (str, bytes)) or not command or any(
         not isinstance(arg, str) or "\0" in arg for arg in command
     ):
         raise ValueError("command must be a nonempty sequence of strings without NUL")
+    if guard_file is not None:
+        if not isinstance(run_token, str) or not _TOKEN_RE.fullmatch(run_token):
+            raise ValueError("run_token must be 16..96 letters, digits, underscores or hyphens")
+        if not isinstance(guard_file, (str, Path)):
+            raise ValueError("guard_file must be an absolute target path")
+        guard_path = str(guard_file)
+        if not guard_path.startswith("/") or any(ord(char) < 32 or ord(char) == 127 for char in guard_path):
+            raise ValueError("guard_file must be an absolute target path without control characters")
+        # This is a target-visible path. Never read, copy or inline its body
+        # while constructing each command on the controller or IB leader.
+        return ["env", "-u", "BASH_ENV", "-u", "ENV", "bash", "--noprofile", "--norc",
+                guard_path, "run", run_token, "--", *command]
     return _guard_command("run", run_token, ["--", *command])
 
 
@@ -219,7 +231,7 @@ class RemoteTaskSession:
                 command = ["docker", "exec", *(["--user", self.container_user] if self.container_user else []),
                            self.container_name, *command]
             config = replace(
-                self.config, cancel_event=None,
+                self.config, cancel_event=None, group_log_root=None, group_log_groups=(),
                 output_root=self.config.output_root / "task-cancellation",
                 command_timeout_seconds=max(30.0, self.grace_seconds + self.verify_seconds + 15.0),
             )

@@ -16,9 +16,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cluster_run.extra_checks import run_group_ib, run_ib_state, run_nhc
+from cluster_run.extra_checks import run_group_ib, run_ib_state
 from hcu_envcheck.baremetal import BaremetalExecutionConfig
-from hcu_envcheck.cluster_checks import IBWriteBandwidthConfig, NHCCheckConfig
+from hcu_envcheck.cluster_checks import IBWriteBandwidthConfig
 
 
 TOKEN = "extra-checks-test-12345678"
@@ -76,8 +76,6 @@ class FakeRemote:
         marker = re.search(r"(__HCU_ENVCHECK(?:_IB)?_RC_[0-9a-f]+__)", argv[-1]).group(1)
         if "ibstat" in argv[-1]:
             output, code = IBSTAT, 0
-        elif "run_nhc" in argv[-1]:
-            output, code = "[CHECK RESULT]: PASSED\n", 0
         else:
             output, code = BANDWIDTH, self.client_rc
             if self.event is not None:
@@ -102,22 +100,6 @@ class _ExtraTestFixture(unittest.TestCase):
 
 
 class ExtraInterfaceTests(_ExtraTestFixture):
-    def test_nhc_retains_config_selection_removal_and_env(self):
-        remote = FakeRemote()
-        result = run_nhc(["node1", "node2"], runner=remote,
-                         config=NHCCheckConfig(config="/site/nhc.conf", selected="network,gpu",
-                                               removed="disk", extra_args=("--verbose",),
-                                               environment={"NHC_LEVEL": "site value"}),
-                         **self.options("nhc"))
-        self.assertEqual((result["status"], result["returncode"]), ("PASS", 0))
-        self.assertEqual(len(result["nodes"]), 2)
-        command = result["nodes"][0]["command"]["argv"]
-        rendered = shlex.join(command)
-        for expected in ("--config", "/site/nhc.conf", "--selected", "network,gpu",
-                         "--removed", "disk", "--verbose", "NHC_LEVEL=site value", TOKEN):
-            self.assertIn(expected, rendered)
-        self.assertIn("source /shared/env.sh", rendered)
-        self.assertTrue(Path(result["report_path"]).is_file())
 
     def test_ib_state_only_runs_ibstat(self):
         remote = FakeRemote()
@@ -182,14 +164,6 @@ class ExtraInterfaceTests(_ExtraTestFixture):
         self.assertEqual(result["reason_code"], "IB_WRITE_BW_TEST_LIMIT_EXCEEDED")
         self.assertTrue(all("ibstat" in call[-1] for call in remote.calls))
 
-    def test_remote_timeout_is_explicit_in_nhc_evidence(self):
-        def timeout_runner(argv, **kwargs):
-            marker = re.search(r"(__HCU_ENVCHECK_RC_[0-9a-f]+__)", argv[-1]).group(1)
-            return subprocess.CompletedProcess(argv, 124, f"{marker}=124\n", "")
-        result = run_nhc(["node1"], runner=timeout_runner, **self.options("timeout"))
-        self.assertEqual((result["status"], result["returncode"]), ("INCOMPLETE", 2))
-        self.assertEqual(result["nodes"][0]["reason_code"], "NHC_CHECK_TIMEOUT")
-        self.assertTrue(result["nodes"][0]["command"]["timed_out"])
 
     def test_cancelled_before_start_does_not_launch(self):
         event = threading.Event()
@@ -222,7 +196,7 @@ class ExtraInterfaceTests(_ExtraTestFixture):
         for kwargs in ({"scope": "pod"}, {"scope": "container"},
                        {"scope": "container", "container": "bad;name"}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                run_nhc(["node1"], **kwargs, **self.options("invalid"))
+                run_ib_state(["node1"], **kwargs, **self.options("invalid"))
 
 
 @unittest.skipUnless(BASH, "Bash required for real environment/server-client wrapper regression")
@@ -240,7 +214,6 @@ class ShellExtraInterfaceTests(_ExtraTestFixture):
             f"export HCU_EXPECT_ENV=loaded\nexport PATH={shlex.quote(_target_path(self.bin))}:$PATH\n"
             f"export IB_FAKE_DIR={shlex.quote(_target_path(self.events))}\n", encoding="utf-8")
         self._tool("ibstat", "cat <<'EOF'\n" + IBSTAT + "EOF\n")
-        self._tool("run_nhc", 'printf "[CHECK RESULT]: ${FAKE_NHC_STATUS:-PASSED}\\n"\n')
         self._tool("ib_write_bw", '''
 port= server=
 for arg in "$@"; do
@@ -291,18 +264,6 @@ exec "$@"
         shell = 'export PATH=' + shlex.quote(_target_path(self.bin)) + ':$PATH\n' + argv[-1]
         return subprocess.run([BASH, "-c", shell], env=env, **kwargs)
 
-    def test_shell_nhc_sources_env_and_failed_source_blocks_command(self):
-        opts = self.options("shell-nhc") | {"env_script": _target_path(self.env)}
-        # task_guard has its own Linux process-tree tests. Here execute the real
-        # timeout/bootstrap/Docker payload to isolate adapter correctness.
-        with patch("cluster_run.extra_checks.managed_command", side_effect=lambda cmd, token: list(cmd)):
-            result = run_nhc(["node1"], runner=self.shell_runner, **opts)
-            self.assertEqual(result["status"], "PASS", result)
-            self.env.write_text("false\nexport HCU_EXPECT_ENV=loaded\n", encoding="utf-8")
-            failed = run_nhc(["node1"], runner=self.shell_runner,
-                             **(opts | {"output_dir": self.root / "failed-env"}))
-        self.assertEqual((failed["status"], failed["returncode"]), ("INCOMPLETE", 2))
-        self.assertEqual(len((self.events / "calls").read_text(encoding="utf-8").splitlines()), 1)
 
     def test_shell_paired_server_client_load_env_inside_container_workdir(self):
         with patch("cluster_run.extra_checks.managed_command", side_effect=lambda cmd, token: list(cmd)):
@@ -328,14 +289,6 @@ exec "$@"
         self.assertEqual((result["status"], result["returncode"]), ("FAIL", 1), result)
         self.assertTrue(all(pair["returncode"] == 7 for pair in result["pairs"]))
         self.assertTrue(all(pair["commands"][1]["returncode"] == 7 for pair in result["pairs"]))
-
-    def test_shell_nhc_health_failure_not_tool_failure(self):
-        self.extra_env["FAKE_NHC_STATUS"] = "FAILED"
-        with patch("cluster_run.extra_checks.managed_command", side_effect=lambda cmd, token: list(cmd)):
-            result = run_nhc(["node1"], runner=self.shell_runner,
-                             **(self.options("nhc-fail") | {"env_script": _target_path(self.env)}))
-        self.assertEqual((result["status"], result["returncode"]), ("FAIL", 1))
-        self.assertEqual(result["nodes"][0]["reason_code"], "NHC_CHECK_FAILED")
 
 
 if __name__ == "__main__":
