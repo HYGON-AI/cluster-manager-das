@@ -39,7 +39,7 @@ print(f'{TARGET_TOTAL_ITERATIONS=} (指定总训练步数)')
 
 from collections import defaultdict
 from typing import Dict, List
-import numpy as np
+import statistics
 
 
 class PeriodicTopNRankTFStats:
@@ -92,9 +92,9 @@ class PeriodicTopNRankTFStats:
     # =========================
     def _tf_stats(self, tfs: List[float]) -> Dict[str, float]:
         return {
-            "median": float(np.median(tfs)),
-            "mean": float(np.mean(tfs)),
-            "min": float(np.min(tfs)),
+            "median": statistics.median(tfs),
+            "mean": statistics.fmean(tfs),
+            "min": min(tfs),
             "samples": len(tfs),
         }
 

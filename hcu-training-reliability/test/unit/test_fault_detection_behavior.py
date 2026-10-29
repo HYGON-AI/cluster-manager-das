@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import deque
+import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -77,6 +79,37 @@ def test_run_nhc_returns_failed_nodes_and_command_failure(monkeypatch):
     assert detector.write_run_nhc_error.call_count == 2
 
 
+def test_run_nhc_uses_host_command_by_default(monkeypatch):
+    monkeypatch.delenv("RUN_NHC_EXEC_MODE", raising=False)
+    assert FaultDetection._run_nhc_command() == "run_nhc"
+
+
+def test_run_nhc_uses_configured_container(monkeypatch):
+    monkeypatch.setenv("RUN_NHC_EXEC_MODE", "container")
+    monkeypatch.setenv("DOCKER_CONTAINER_NAME", "chengxy")
+    monkeypatch.setattr(
+        "cluster_manager.launcher.fault_detection.read_hostfile",
+        lambda _: ["node01"],
+    )
+    execute = MagicMock(return_value=(0, clush_block("node01", "PASSED")))
+    monkeypatch.setattr(
+        "cluster_manager.launcher.fault_detection.CmdExecutor.execute_command",
+        execute,
+    )
+
+    assert FaultDetection().run_nhc(Path("hosts")) == (["node01"], [], True)
+    assert execute.call_args.args[0] == (
+        "clush -f 1000 -b --hostfile hosts "
+        "'docker exec -u root chengxy bash -lc run_nhc'"
+    )
+
+
+def test_run_nhc_rejects_unknown_execution_mode(monkeypatch):
+    monkeypatch.setenv("RUN_NHC_EXEC_MODE", "unknown")
+    with pytest.raises(ValueError, match="RUN_NHC_EXEC_MODE must be host or container"):
+        FaultDetection._run_nhc_command()
+
+
 def test_parse_memory_and_node_outputs():
     detector = FaultDetection()
     memory = (
@@ -116,6 +149,62 @@ def test_parse_hcu_output_skips_invalid_cards():
     assert parsed["node01"]["card0"]["vram"] == 40.0
     assert parsed["node01"]["card0"]["power"] == 210.0
     assert "node02" not in parsed
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+@pytest.mark.parametrize("field", [
+    "HCU memory use (%)",
+    "Average Graphics Package Power (W)",
+    "HCU use (%)",
+    "Available memory size (MiB)",
+])
+def test_parse_hcu_output_skips_nonfinite_card_but_keeps_valid_peer(field, value):
+    valid = {
+        "HCU memory use (%)": "40",
+        "Average Graphics Package Power (W)": "210",
+        "HCU use (%)": "80",
+        "Available memory size (MiB)": "100",
+    }
+    output = "node01: " + json.dumps({
+        "card0": {**valid, field: value},
+        "card1": valid,
+    })
+    parsed = FaultDetection()._parse_hcu_output(output)
+    assert set(parsed["node01"]) == {"card1"}
+    assert parsed["node01"]["card1"]["power"] == 210.0
+
+
+@pytest.mark.parametrize("seq", [
+    [10.0, float("nan")],
+    [10.0, float("inf")],
+    [10.0, float("-inf")],
+    [float("inf"), float("-inf")],
+])
+def test_nonfinite_samples_are_not_stable(seq):
+    assert FaultDetection()._is_stable(seq) is False
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("history_key", ["history", "use_history", "power_history"])
+def test_invalid_history_does_not_abort_detection_for_other_cards(history_key, value):
+    detector = FaultDetection()
+    for card in ["card0", "card1"]:
+        detector._state["node01"][card] = {
+            "history": deque([10.0] * 29, maxlen=30),
+            "use_history": deque([1.0] * 29, maxlen=30),
+            "power_history": deque([5.0] * 29, maxlen=30),
+        }
+    detector._state["node01"]["card0"][history_key][14] = value
+    current = {
+        "node01": {
+            card: {"vram": 10.0, "power": 5.0, "use": 1.0, "available": 100.0}
+            for card in ["card0", "card1"]
+        },
+    }
+    state, unhealthy, anomalies = detector._update_state_and_detect(current, 0)
+    assert set(state["node01"]) == {"card0", "card1"}
+    assert unhealthy == {"node01": ["card1"]}
+    assert not any(item.get("card") == "card0" for item in anomalies)
 
 
 @pytest.mark.parametrize(

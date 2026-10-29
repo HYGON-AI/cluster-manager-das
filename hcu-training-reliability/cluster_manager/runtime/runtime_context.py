@@ -259,7 +259,8 @@ class RuntimeContext:
         统一处理 runtime 故障
 
         fault_type:
-            rank  -> 单 rank 故障
+            global_rank -> 训练进程 rank，按 slots_per_node 映射
+            mpi_rank / rank -> MPI 进程标识，按 mpi_ranks_per_node 映射
             node  -> 节点故障
             proc  -> 训练进程异常
         """
@@ -271,19 +272,36 @@ class RuntimeContext:
             # --------------------------------
             # rank fault
             # --------------------------------
-            if fault_type in ("global_rank", "rank"):
-                slots_per_node = self.runtime_args["slots_per_node"]
-                # 解析rank（兼容两种类型）
+            if fault_type in ("global_rank", "mpi_rank", "rank"):
                 if fault_type == "global_rank":
                     rank = int(fault_info)
+                    ranks_per_node = self.runtime_args["slots_per_node"]
                 else:
                     rank = self._parse_rank_from_fault(fault_info)
+                    ranks_per_node = self.runtime_args.get("mpi_ranks_per_node")
+                    if ranks_per_node is None:
+                        logger.error(
+                            "[RuntimeContext] MPI rank placement is unknown; set "
+                            "--mpi-ranks-per-node (or MPI_RANKS_PER_NODE) to the "
+                            "training launcher's MPI processes per node"
+                        )
+                        return False
+                if (
+                    isinstance(ranks_per_node, bool)
+                    or not isinstance(ranks_per_node, int)
+                    or ranks_per_node <= 0
+                ):
+                    logger.error(
+                        "[RuntimeContext] Invalid ranks per node for %s: %r",
+                        fault_type, ranks_per_node,
+                    )
+                    return False
                 # 安全校验rank值
                 if not isinstance(rank, int) or rank < 0:
                     logger.error(f"[RuntimeContext] 无效的rank值: {rank}")
                     return False
 
-                nodeno = rank // slots_per_node
+                nodeno = rank // ranks_per_node
                 # Out of range means the rank cannot be mapped onto a node in the
                 # current allocation. Reporting failure keeps the caller from
                 # restarting on the very node that just died: add_fault_nodes_no
@@ -292,12 +310,13 @@ class RuntimeContext:
                 if required_nodes and nodeno >= required_nodes:
                     logger.error(
                         f"[RuntimeContext] rank {rank} is outside the "
-                        f"{required_nodes}x{slots_per_node} allocation"
+                        f"{required_nodes}x{ranks_per_node} {fault_type} allocation"
                     )
                     return False
                 logger.info(
                     f"[RuntimeContext] rank fault detected "
-                    f"rank={rank} nodeno={nodeno}"
+                    f"type={fault_type} rank={rank} "
+                    f"ranks_per_node={ranks_per_node} nodeno={nodeno}"
                 )
                 self.node_pool_proxy.add_fault_nodes_no(
                     nodeno, fault_reason=fault_reason

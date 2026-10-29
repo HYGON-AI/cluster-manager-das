@@ -19,6 +19,7 @@ export DOCKER_CONTAINER_SSH_PORT="${DOCKER_CONTAINER_SSH_PORT:-36000}"
 export MPIRUN_ALLOW_RUN_AS_ROOT="${MPIRUN_ALLOW_RUN_AS_ROOT:-1}"
 
 export DOCKER_CONTAINER_NAME="${DOCKER_CONTAINER_NAME:-cluster-manager}"
+export RUN_NHC_EXEC_MODE="${RUN_NHC_EXEC_MODE:-host}"
 export DOCKER_IMAGE="${DOCKER_IMAGE:?Set DOCKER_IMAGE to the training image}"
 export DOCKER_HOST_SHARE_ROOT="${DOCKER_HOST_SHARE_ROOT:-}"
 export DOCKER_CONTAINER_SHARE_ROOT="${DOCKER_CONTAINER_SHARE_ROOT:-}"
@@ -29,6 +30,11 @@ export PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 export MEGATRON_SCRIPT_PATH="${MEGATRON_SCRIPT_PATH:-}"
 SLOTS="${SLOTS:-8}"
+# 训练容器内每节点 MPI 进程数，默认等于 SLOTS，适用于 MPI 直接启动各训练进程。
+# mpirun 每节点启动一个 torchrun 时必须改为 1：
+# 启动前 export MPI_RANKS_PER_NODE=1
+# 仅用于 MPI/prterun 退出日志的故障节点映射，不控制训练节点数或 GPU 数。
+export MPI_RANKS_PER_NODE="${MPI_RANKS_PER_NODE:-${SLOTS}}"
 RUN_PATH="${RUN_PATH:-${DOCKER_EXEC_PATH:-/workspace/train/run.sh}}"
 HOSTFILE="${HOSTFILE:?Set HOSTFILE to the training hostfile}"
 if [[ ! -r "${HOSTFILE}" ]]; then
@@ -57,5 +63,6 @@ fi
 nohup "${PYTHON_BIN}" "${CLUSTER_MANAGER_MAIN}" \
   --nodes_num "${NODES_NUM}" \
   --slots "${SLOTS}" \
+  --mpi-ranks-per-node "${MPI_RANKS_PER_NODE}" \
   --exec "${RUN_PATH}" \
   --hostfile "${HOSTFILE}" >> "${LOG_DIR}/cluster_manager.log" 2>&1 &
