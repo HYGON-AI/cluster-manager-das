@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import  Dict, List, Optional, Set, Union, Callable, Tuple, Any
 from cluster_manager.config.global_config import logger
 from datetime import datetime
-import numpy as np
 from collections import defaultdict
 import cluster_manager.config.global_config as global_config
 #import matplotlib.pyplot as plt
@@ -237,7 +236,7 @@ class TrainingDataRecorder:
         # ========== 图1: LM Loss 趋势 ==========
         if base_iters:
             ax1.plot(base_iters, base_losses, label='LM Loss', color='blue', linewidth=1.5)
-            avg_loss = np.mean(base_losses)
+            avg_loss = statistics.fmean(base_losses)
             ax1.axhline(y=avg_loss, color='red', linestyle='--', linewidth=2, label=f'Avg: {avg_loss:.6f}')
 
             # ========== 核心：设置纵轴范围（避免差异放大） ==========
@@ -254,7 +253,7 @@ class TrainingDataRecorder:
         if time_iters:
             ax2.plot(time_iters, time_values, label='Elapsed Time (ms)', color='orange', linewidth=1.5)
             # 添加平均值水平线
-            avg_time = np.mean(time_values)
+            avg_time = statistics.fmean(time_values)
             ax2.axhline(y=avg_time, color='red', linestyle='--', linewidth=2, label=f'Avg: {avg_time:.2f} ms')
 
             # 设置纵轴范围
@@ -271,7 +270,7 @@ class TrainingDataRecorder:
         if tflops_iters:
             ax3.plot(tflops_iters, tflops_values, label='TFLOP/s/GPU', color='green', linewidth=1.5)
             # 添加平均值水平线
-            avg_tflops = np.mean(tflops_values)
+            avg_tflops = statistics.fmean(tflops_values)
             ax3.axhline(y=avg_tflops, color='red', linestyle='--', linewidth=2, label=f'Avg: {avg_tflops:.2f} TFLOP/s/GPU')
             
             # 设置纵轴范围
@@ -288,7 +287,7 @@ class TrainingDataRecorder:
         if grad_iters:
             ax4.plot(grad_iters, grad_norms, label='Grad Norm', color='purple', linewidth=1.5)
             # 添加平均值水平线
-            avg_grad = np.mean(grad_norms)
+            avg_grad = statistics.fmean(grad_norms)
             ax4.axhline(y=avg_grad, color='red', linestyle='--', linewidth=2, label=f'Avg: {avg_grad:.2f}')
 
             # 设置纵轴范围（处理尖峰，避免尖峰压缩其他数据）
@@ -307,7 +306,7 @@ class TrainingDataRecorder:
         if lr_iters:
             ax5.plot(lr_iters, lr_values, label='Learning Rate', color='darkred', linewidth=1.5)
             # 添加平均值水平线（学习率通常是变化的，平均值仅作参考）
-            avg_lr = np.mean(lr_values)
+            avg_lr = statistics.fmean(lr_values)
             ax5.axhline(y=avg_lr, color='black', linestyle='--', linewidth=2, label=f'Avg: {avg_lr:.6f}')
 
             # 设置纵轴范围（学习率是单调衰减，可手动设置更合理的范围）
@@ -327,11 +326,11 @@ class TrainingDataRecorder:
         # --- 性能指标统计报告（新增学习率统计）---
         logger.info("\n" + "="*50)
 
-        base_avg_time = np.mean(base_losses)
-        base_avg_tflops = np.mean(time_values)
-        base_avg_grad = np.mean(tflops_values)
-        base_avg_loss = np.mean(grad_norms)
-        base_avg_lr = np.mean(lr_values)  # 新增：学习率平均值
+        base_avg_time = statistics.fmean(base_losses)
+        base_avg_tflops = statistics.fmean(time_values)
+        base_avg_grad = statistics.fmean(tflops_values)
+        base_avg_loss = statistics.fmean(grad_norms)
+        base_avg_lr = statistics.fmean(lr_values)  # 新增：学习率平均值
 
         logger.info(f"{'Metric':<40} | {'Average Value':<15}")
         logger.info("-" * 60)

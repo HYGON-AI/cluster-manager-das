@@ -16,7 +16,7 @@ import shlex
 from datetime import datetime
 from collections import defaultdict, deque
 import statistics
-import numpy as np
+import math
 
 from cluster_manager.config.global_config import logger
 import  cluster_manager.config.global_config as global_config
@@ -357,6 +357,28 @@ class FaultDetection:
             f.write(result)
             f.write('-'*100)
 
+    @staticmethod
+    def _run_nhc_command() -> str:
+        """Build the NHC command executed by clush on every target host."""
+        mode = os.getenv("RUN_NHC_EXEC_MODE", "host").strip().lower()
+        if mode == "host":
+            return "run_nhc"
+        if mode == "container":
+            container_name = (
+                os.getenv("DOCKER_CONTAINER_NAME")
+                or os.getenv("CONTAINER_NAME")
+                or "cluster-manager"
+            ).strip()
+            if not container_name:
+                raise ValueError(
+                    "DOCKER_CONTAINER_NAME or CONTAINER_NAME must be set when "
+                    "RUN_NHC_EXEC_MODE=container"
+                )
+            return shlex.join(
+                ["docker", "exec", "-u", "root", container_name, "bash", "-lc", "run_nhc"]
+            )
+        raise ValueError("RUN_NHC_EXEC_MODE must be host or container")
+
 
     def run_nhc(self, hostfile: str, timeout: int = 300) -> Tuple[List[str], List[str], bool]:
         """
@@ -365,7 +387,9 @@ class FaultDetection:
         :param timeout: 命令执行超时时间（秒），默认 300 秒
         :return: PASSED 节点列表
         """
-        cmd = f"clush -f 1000 -b --hostfile {hostfile} run_nhc"
+        nhc_command = shlex.quote(self._run_nhc_command())
+        hostfile_arg = shlex.quote(os.fspath(hostfile))
+        cmd = f"clush -f 1000 -b --hostfile {hostfile_arg} {nhc_command}"
         all_nodes = read_hostfile(hostfile)
 
         err_code, output = CmdExecutor.execute_command(
@@ -617,7 +641,8 @@ class FaultDetection:
         
         
     def _run_nhc(self, nodes_str: str, timeout: int):
-        cmd = f"clush -f 1024 -b -w {nodes_str} run_nhc"
+        nhc_command = shlex.quote(self._run_nhc_command())
+        cmd = f"clush -f 1024 -b -w {shlex.quote(nodes_str)} {nhc_command}"
         nhc_output = self._run_clush(cmd, timeout)
         if nhc_output:
             lines = nhc_output.splitlines()
@@ -630,7 +655,8 @@ class FaultDetection:
         if not isinstance(nodes,str):
             nodes = ','.join(nodes)
         
-        cmd = f"clush -f 1024 -b -w {nodes} run_nhc"
+        nhc_command = shlex.quote(self._run_nhc_command())
+        cmd = f"clush -f 1024 -b -w {shlex.quote(nodes)} {nhc_command}"
         nhc_output = self._run_clush(cmd, timeout)
         if nhc_output:
             passed = self.parse_clush_output(nhc_output)
@@ -764,6 +790,10 @@ class FaultDetection:
                     use = float(card_info.get("HCU use (%)", "0"))
                     available = float(card_info.get("Available memory size (MiB)", "0"))
                 except (ValueError, TypeError):
+                    continue
+
+                if not all(math.isfinite(value) for value in (vram, power, use, available)):
+                    logger.warning("[HCU] Skip non-finite metrics for %s/%s", node, card_key)
                     continue
 
                 data[node][card_key] = {
@@ -929,19 +959,23 @@ class FaultDetection:
         n = len(seq)
         if n < 2:
             return 0.0
-        x = np.arange(n)
-        y = np.array(seq)
-        slope, _ = np.polyfit(x, y, 1)
-        return slope
+        x_mean = (n - 1) / 2
+        y_mean = statistics.fmean(seq)
+        numerator = sum(
+            (index - x_mean) * (value - y_mean)
+            for index, value in enumerate(seq)
+        )
+        denominator = sum((index - x_mean) ** 2 for index in range(n))
+        return numerator / denominator if denominator else 0.0
 
     def _is_stable(self, seq: List[float], rel_tol: float = 0.05) -> bool:
         """判断序列是否稳定（变异系数小于 rel_tol）"""
-        if len(seq) < 2:
+        if len(seq) < 2 or not all(math.isfinite(value) for value in seq):
             return False
-        mean_val = np.mean(seq)
+        mean_val = statistics.fmean(seq)
         if mean_val == 0:
             return True   # 全零视为稳定
-        std_val = np.std(seq)
+        std_val = statistics.pstdev(seq)
         return (std_val / mean_val) < rel_tol
 
 
@@ -965,11 +999,13 @@ class FaultDetection:
             history.append(vram)
 
             # 1）显存泄漏检测
-            if len(history) == history.maxlen:
+            # A previously collected invalid sample must not crash statistics
+            # or be dropped to make an incomplete window appear stable.
+            if len(history) == history.maxlen and all(math.isfinite(value) for value in history):
                 slope = self._calc_slope(list(history))
-                mean_vram = np.mean(history)
+                mean_vram = statistics.fmean(history)
                 norm_slope = slope / max(mean_vram, 1)
-                volatility = np.std(history) / max(mean_vram, 1)
+                volatility = statistics.pstdev(history) / max(mean_vram, 1)
                 if norm_slope > 0.01 and volatility < 0.1:
                     msg = f"斜率={norm_slope:.4f}, 波动={volatility:.4f}"
                     logger.warning(f"[MEM_LEAK][{node_name}][{card_key}] {msg}")
@@ -1074,7 +1110,7 @@ class FaultDetection:
                     self._is_stable(list(history)) and
                     self._is_stable(list(use_history)) and
                     self._is_stable(list(power_history)) and
-                    np.mean(use_history) < 5):
+                    statistics.fmean(use_history) < 5):
                     msg = f"VRAM/use/power 长时间稳定且利用率低"
                     logger.error(
                         f"[HANG][{node}][{card_key}] "

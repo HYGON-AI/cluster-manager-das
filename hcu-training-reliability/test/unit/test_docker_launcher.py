@@ -37,6 +37,7 @@ def test_start_docker_uses_container_ssh_port_as_its_own_default():
         'DOCKER_CONTAINER_SSH_PORT="${DOCKER_CONTAINER_SSH_PORT:-36000}"'
         in content
     )
+    assert 'RUN_NHC_EXEC_MODE="${RUN_NHC_EXEC_MODE:-host}"' in content
     assert 'DOCKER_CONTAINER_SSH_PORT="${MPIRUN_PLM_RSH_ARGS:-36000}"' not in content
 
 

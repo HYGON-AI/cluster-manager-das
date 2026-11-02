@@ -70,6 +70,14 @@ def test_invalid_schedule_fails_fast(monkeypatch):
         main_module.validate_training_args(make_args())
 
 
+def test_invalid_run_nhc_exec_mode_fails_fast(monkeypatch):
+    monkeypatch.setattr(global_config, "CLUSTER_SCHEDULE", "NONE")
+    monkeypatch.setenv("RUN_NHC_EXEC_MODE", "invalid")
+
+    with pytest.raises(ValueError, match="RUN_NHC_EXEC_MODE must be host or container"):
+        main_module.validate_training_args(make_args())
+
+
 def test_build_runtime_args_maps_training_and_slurm_fields(monkeypatch):
     monkeypatch.setattr(global_config, "CLUSTER_SCHEDULE", "SLURM")
     args = make_args(
@@ -95,6 +103,33 @@ def test_missing_common_argument_fails_fast(monkeypatch):
 
     with pytest.raises(ValueError, match="--exec"):
         main_module.validate_training_args(make_args(exec=None))
+
+
+def test_mpi_layout_cli_overrides_environment(monkeypatch):
+    monkeypatch.setenv("MPI_RANKS_PER_NODE", "4")
+    monkeypatch.setattr("sys.argv", [
+        "hcu-cluster-inspect", "--nodes_num", "2", "--slots", "4",
+        "--mpi-ranks-per-node", "1",
+    ])
+    args = main_module.parse_args()
+    runtime = main_module.build_runtime_args(args)
+    assert runtime["mpi_ranks_per_node"] == 1
+    assert runtime["slots_per_node"] == 4
+
+
+def test_mpi_layout_from_environment(monkeypatch):
+    monkeypatch.setenv("MPI_RANKS_PER_NODE", "1")
+    monkeypatch.setattr("sys.argv", ["hcu-cluster-inspect"])
+    args = main_module.parse_args()
+    assert main_module.build_runtime_args(args)["mpi_ranks_per_node"] == 1
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_mpi_layout_must_be_positive(value):
+    with pytest.raises(ValueError, match="--mpi-ranks-per-node"):
+        main_module.validate_training_files(
+            make_args(mpi_ranks_per_node=value), "NONE"
+        )
 
 
 @pytest.mark.parametrize(

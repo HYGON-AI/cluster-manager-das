@@ -544,7 +544,7 @@ class ParallelTopologyValidator:
         
         try:
             import time
-            import numpy as np
+            import statistics
             import socket
             
             # 获取当前节点信息用于错误诊断
@@ -578,19 +578,20 @@ class ParallelTopologyValidator:
                 latencies.append((end - start) * 1000)  # ms
             
             # 计算统计信息
-            latencies = np.array(latencies)
+            latency_mean_ms = statistics.fmean(latencies)
+            latency_std_ms = statistics.pstdev(latencies)
             data_size_bytes = num_elements * 4
-            bandwidth_gbps = (data_size_bytes * 8 / 1e9) / (latencies.mean() / 1000)
+            bandwidth_gbps = (data_size_bytes * 8 / 1e9) / (latency_mean_ms / 1000)
             
             return {
                 "group_name": group.name,
                 "operation": "AllReduce",
                 "data_size_mb": data_size_mb,
                 "num_iterations": num_iterations,
-                "latency_mean_ms": float(latencies.mean()),
-                "latency_std_ms": float(latencies.std()),
-                "latency_min_ms": float(latencies.min()),
-                "latency_max_ms": float(latencies.max()),
+                "latency_mean_ms": latency_mean_ms,
+                "latency_std_ms": latency_std_ms,
+                "latency_min_ms": min(latencies),
+                "latency_max_ms": max(latencies),
                 "bandwidth_gbps": float(bandwidth_gbps),
             }
             
@@ -650,7 +651,7 @@ class ParallelTopologyValidator:
         
         try:
             import time
-            import numpy as np
+            import statistics
             
             # 使用预创建的进程组
             torch_group = group.group
@@ -710,9 +711,10 @@ class ParallelTopologyValidator:
                 end = time.perf_counter()
                 latencies.append((end - start) * 1000)
             
-            latencies = np.array(latencies)
+            latency_mean_ms = statistics.fmean(latencies)
+            latency_std_ms = statistics.pstdev(latencies)
             data_size_bytes = num_elements * 4
-            bandwidth_gbps = (data_size_bytes * 8 / 1e9) / (latencies.mean() / 1000)
+            bandwidth_gbps = (data_size_bytes * 8 / 1e9) / (latency_mean_ms / 1000)
             
             return {
                 "group_name": group.name,
@@ -721,10 +723,10 @@ class ParallelTopologyValidator:
                 "num_iterations": num_iterations,
                 "partner_rank": partner_global_rank if (is_sender or is_receiver) else None,
                 "role": "sender" if is_sender else ("receiver" if is_receiver else "idle"),
-                "latency_mean_ms": float(latencies.mean()),
-                "latency_std_ms": float(latencies.std()),
-                "latency_min_ms": float(latencies.min()),
-                "latency_max_ms": float(latencies.max()),
+                "latency_mean_ms": latency_mean_ms,
+                "latency_std_ms": latency_std_ms,
+                "latency_min_ms": min(latencies),
+                "latency_max_ms": max(latencies),
                 "bandwidth_gbps": float(bandwidth_gbps),
             }
             
@@ -766,7 +768,7 @@ class ParallelTopologyValidator:
         
         try:
             import time
-            import numpy as np
+            import statistics
             
             # 使用预创建的进程组
             torch_group = group.group
@@ -799,9 +801,10 @@ class ParallelTopologyValidator:
                 end = time.perf_counter()
                 latencies.append((end - start) * 1000)
             
-            latencies = np.array(latencies)
+            latency_mean_ms = statistics.fmean(latencies)
+            latency_std_ms = statistics.pstdev(latencies)
             total_data_bytes = num_elements_per_pair * 4 * group_size * group_size
-            bandwidth_gbps = (total_data_bytes * 8 / 1e9) / (latencies.mean() / 1000)
+            bandwidth_gbps = (total_data_bytes * 8 / 1e9) / (latency_mean_ms / 1000)
             
             return {
                 "group_name": group.name,
@@ -809,10 +812,10 @@ class ParallelTopologyValidator:
                 "data_size_mb": data_size_mb,
                 "group_size": group_size,
                 "num_iterations": num_iterations,
-                "latency_mean_ms": float(latencies.mean()),
-                "latency_std_ms": float(latencies.std()),
-                "latency_min_ms": float(latencies.min()),
-                "latency_max_ms": float(latencies.max()),
+                "latency_mean_ms": latency_mean_ms,
+                "latency_std_ms": latency_std_ms,
+                "latency_min_ms": min(latencies),
+                "latency_max_ms": max(latencies),
                 "bandwidth_gbps": float(bandwidth_gbps),
             }
             

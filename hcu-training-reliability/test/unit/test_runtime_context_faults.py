@@ -90,9 +90,11 @@ def test_parse_rank_rejects_malformed_values(text):
         ctx._parse_rank_from_fault(text)
 
 
-def make_fault_context(slots=8, nodes=0):
+def make_fault_context(slots=8, nodes=0, mpi_ranks=None):
     ctx = object.__new__(RuntimeContext)
     ctx.runtime_args = {"slots_per_node": slots, "required_nodes_num": nodes}
+    if mpi_ranks is not None:
+        ctx.runtime_args["mpi_ranks_per_node"] = mpi_ranks
     ctx.node_pool_proxy = MagicMock()
     return ctx
 
@@ -103,10 +105,10 @@ def test_prte_exit_rank_maps_to_the_node_that_died():
     Simulated with ``kill`` on m09r2n10, PRTE reported
     ``[prterun-m09r2n09-2091658@1,11]``; rank 11 over 8 slots is node index 1.
     """
-    ctx = make_fault_context(slots=8, nodes=2)
+    ctx = make_fault_context(slots=8, nodes=2, mpi_ranks=8)
     reason = {"type": "exit"}
     assert ctx.handle_runtime_fault(
-        "[prterun-m09r2n09-2091658@1,11]", "rank", reason
+        "[prterun-m09r2n09-2091658@1,11]", "mpi_rank", reason
     )
     ctx.node_pool_proxy.add_fault_nodes_no.assert_called_once_with(
         1, fault_reason=reason
@@ -115,7 +117,7 @@ def test_prte_exit_rank_maps_to_the_node_that_died():
 
 def test_rank_outside_the_allocation_is_rejected():
     """add_fault_nodes_no would blacklist nothing and the job would loop."""
-    ctx = make_fault_context(slots=8, nodes=2)
+    ctx = make_fault_context(slots=8, nodes=2, mpi_ranks=8)
     assert ctx.handle_runtime_fault("[prterun-host-1@1,16]", "rank") is False
     ctx.node_pool_proxy.add_fault_nodes_no.assert_not_called()
 
@@ -130,11 +132,44 @@ def test_global_rank_fault_maps_to_node_number():
 
 
 def test_mpi_rank_fault_maps_to_node_number():
-    ctx = make_fault_context(slots=4)
+    ctx = make_fault_context(slots=4, mpi_ranks=4)
     assert ctx.handle_runtime_fault("Process name: [[1,1],9]", "rank")
     ctx.node_pool_proxy.add_fault_nodes_no.assert_called_once_with(
         2, fault_reason=None
     )
+
+
+@pytest.mark.parametrize("fault_type", ["mpi_rank", "rank"])
+def test_mpi_torchrun_rank_uses_node_launcher_count(fault_type):
+    ctx = make_fault_context(slots=4, nodes=2, mpi_ranks=1)
+    running_nodes = ["p8c7", "p8c9"]
+    marked_nodes = []
+    ctx.node_pool_proxy.add_fault_nodes_no.side_effect = (
+        lambda index, fault_reason: marked_nodes.append(running_nodes[index])
+    )
+    assert ctx.handle_runtime_fault("[prterun-p8c7-27072@1,1]", fault_type)
+    assert marked_nodes == ["p8c9"]
+
+
+def test_training_rank_still_uses_training_slots_with_torchrun():
+    ctx = make_fault_context(slots=4, nodes=2, mpi_ranks=1)
+    assert ctx.handle_runtime_fault("6", "global_rank")
+    ctx.node_pool_proxy.add_fault_nodes_no.assert_called_once_with(
+        1, fault_reason=None
+    )
+
+
+@pytest.mark.parametrize("mpi_ranks", [None, 0, -1, True, "bad", 1.5])
+def test_missing_or_invalid_mpi_layout_does_not_mark_a_node(mpi_ranks):
+    ctx = make_fault_context(slots=4, nodes=2, mpi_ranks=mpi_ranks)
+    assert not ctx.handle_runtime_fault("[prterun-p8c7-27072@1,1]", "mpi_rank")
+    ctx.node_pool_proxy.add_fault_nodes_no.assert_not_called()
+
+
+def test_mpi_rank_bounds_use_mpi_layout_not_training_world_size():
+    ctx = make_fault_context(slots=4, nodes=2, mpi_ranks=1)
+    assert not ctx.handle_runtime_fault("[prterun-p8c7-27072@1,2]", "mpi_rank")
+    ctx.node_pool_proxy.add_fault_nodes_no.assert_not_called()
 
 
 def test_node_and_process_fault_paths():
