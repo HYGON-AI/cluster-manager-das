@@ -82,7 +82,6 @@ setuptools.setup(
     cmdclass={},
     ext_modules=[],
     install_requires=[
-        "numpy>=1.24",
         "pytz>=2023.3",
         "PyYAML>=6.0",
         "requests>=2.31",

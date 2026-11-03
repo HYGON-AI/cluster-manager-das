@@ -4,6 +4,7 @@
 import os
 import subprocess
 import shlex
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -15,6 +16,7 @@ from cluster_manager.launcher.mpirun_launcher import MPIRunLauncher
 from cluster_manager.monitor.log_fault_handler import FaultHandler
 from cluster_manager.monitor.log_monitor import LogMonitor
 from cluster_manager.monitor.log_tracker import LogFileTracker
+from cluster_manager.monitor.nhc_monitor import NHCMonitor
 
 
 def test_mpirun_start_returns_nonzero_process_result(monkeypatch):
@@ -113,6 +115,40 @@ def test_mpirun_docker_stop_preserves_remote_and_container_shells(
     assert '"$CM_STOP_PATTERN"' in container_argv[-1]
     assert "train-worker --role=leader" not in container_argv[-1]
     assert host_cleanup.startswith(" train-container ")
+
+
+def test_nhc_monitor_skips_clush_when_node_sets_are_empty():
+    manager = object.__new__(NHCMonitor)
+    pool = SimpleNamespace(
+        running_nodes=[],
+        running_nodes_filepath="running_nodes.txt",
+        backup_nodes=[],
+        abnormal_nodes=[],
+        abnormal_nodes_filepath="abnormal_nodes.txt",
+    )
+    manager._proxy = SimpleNamespace(
+        pool_lock=threading.RLock(),
+        _node_pool=pool,
+        _slurm_mgr=None,
+    )
+    manager._proxy._try_load_additional_nodes = MagicMock(
+        side_effect=lambda: setattr(manager, "_running", False)
+    )
+    manager._clean_old_node_status = MagicMock()
+    manager.detector = MagicMock()
+    manager._running = True
+    manager.interval = 0
+    manager._cycle_count = 0
+    manager._enable_hw_check = False
+    manager._enable_slurm_check = False
+    manager.QUEUE_CHECK_MULTIPLIER = 1
+    manager.NHC_CHECK_MULTIPLIER = 1
+    manager.HW_CHECK_MULTIPLIER = 1
+    manager.RECOVERY_CHECK_MULTIPLIER = 1
+
+    manager.run()
+
+    manager.detector.run_nhc.assert_not_called()
 
 
 def test_fixed_log_truncation_requires_reopen(tmp_path):

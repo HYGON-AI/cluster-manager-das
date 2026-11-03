@@ -150,7 +150,7 @@ class NHCMonitor(threading.Thread):
                         running_nodes_filepath = pool.running_nodes_filepath
                         running_nodes = set(pool.running_nodes)
 
-                        if running_nodes_filepath:
+                        if running_nodes and running_nodes_filepath:
                             self._perform_nhc_check(running_nodes_filepath, running_nodes)
 
                 # ===================== Step 2: HCU 硬件信息检测 (每 HW_CHECK_MULTIPLIER 轮) =====================
@@ -168,7 +168,13 @@ class NHCMonitor(threading.Thread):
                         error_nodes = set(pool.abnormal_nodes)
                         abnormal_nodes_filepath = pool.abnormal_nodes_filepath
 
-                        if not backup_nodes or len(error_nodes) >= len(backup_nodes):
+                        # An empty abnormal-node hostfile is valid when the
+                        # cluster is healthy.  Do not pass it to clush: clush
+                        # treats an empty target set as an error (exit code 2,
+                        # "No node to run on").
+                        if error_nodes and (
+                            not backup_nodes or len(error_nodes) >= len(backup_nodes)
+                        ):
                             passed, _, probe_ok = self.detector.run_nhc(abnormal_nodes_filepath)
                             if not probe_ok:
                                 logger.warning("[NodeCheckManager] recovery probe failed, skip abnormal-node recovery this cycle.")

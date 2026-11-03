@@ -19,7 +19,6 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils.dataframe import dataframe_to_rows
 import pandas as pd
-import numpy as np
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import mmap
@@ -2584,13 +2583,16 @@ class LogAnalyzer(LogProcessor):
             new_columns['综合性能评分'] = 50
         
         # 计算性能等级
-        conditions = [
-            new_columns['综合性能评分'] >= 80,
-            new_columns['综合性能评分'] >= 60,
-            new_columns['综合性能评分'] >= 40
-        ]
-        choices = ['优秀', '良好', '中等', '待优化']
-        new_columns['性能等级'] = np.select(conditions, choices[:3], default=choices[3])
+        def performance_level(score):
+            if score >= 80:
+                return '优秀'
+            if score >= 60:
+                return '良好'
+            if score >= 40:
+                return '中等'
+            return '待优化'
+
+        new_columns['性能等级'] = new_columns['综合性能评分'].map(performance_level)
         
         # 计算每个节点的总耗时（使用原始数据，但只计算有效列）
         total_durations = df_perf[valid_duration_cols].sum(axis=1)
