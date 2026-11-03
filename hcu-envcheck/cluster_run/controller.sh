@@ -3,7 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Test item -> concurrent groups -> barrier. Bash owns execution and cleanup.
 set -uo pipefail
-ROOT=$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd) || exit 70
+# Logical (non -P) cd: must not resolve ancestor directory symlinks (e.g. a
+# site's /public -> /public2 mount alias), so ROOT stays the path the caller
+# used -- the same absolute path that must also be visible inside containers.
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd) || exit 70
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 2; }
 source "$ROOT/hcu_envcheck/logging.sh" || die 'cannot load logging helpers'
 source "$ROOT/hcu_envcheck/state_runtime.sh" || die 'cannot load state runtime helpers'
