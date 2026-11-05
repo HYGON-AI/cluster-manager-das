@@ -534,8 +534,19 @@ def device_evidence(root: Path, task: Path, result: dict, nodes: list[dict]):
 
 def parse(root: Path, stage: dict, group: dict, final: bool = False) -> dict:
     task = root / "stages" / stage["stage_id"] / "groups" / group["group"]
-    records = rows(task / "task.tsv")
+    task_tsv = task / "task.tsv"
+    records = rows(task_tsv)
     fact = records[0] if records else {}
+    if final and fact.get("status", "PENDING") not in TERMINAL:
+        # T-2026-10-28: a stat()-based cache hit in facts.load_group can still
+        # match a just-superseded revision across the controller (host) /
+        # reporting (container) filesystem-attribute-cache boundary, so the
+        # one read that must be authoritative (this final tick) forces a
+        # real re-read once before accepting a non-terminal status as done.
+        from .facts import invalidate
+        invalidate(task_tsv)
+        records = rows(task_tsv)
+        fact = records[0] if records else {}
     # dispatched distinguishes "planned but never launched" from launched
     # tasks. A BLOCKED task.tsv is a placeholder the scheduler writes for a
     # group that was never dispatched in this stage, so it is not executed.
