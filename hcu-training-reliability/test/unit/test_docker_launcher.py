@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import os
 from pathlib import Path
 import shlex
@@ -23,6 +23,10 @@ def _container_share_root(monkeypatch):
     # Production start scripts set this to the host-mounted shared directory;
     # tests provide a deterministic container path for the generated setup.
     monkeypatch.setenv("DOCKER_CONTAINER_SHARE_ROOT", "/share")
+    monkeypatch.setattr(
+        "cluster_manager.launcher.container_ssh.ContainerSSHManager.configure",
+        MagicMock(return_value=(0, [])),
+    )
 
 
 def test_factory_creates_docker_launcher(monkeypatch):
@@ -86,7 +90,9 @@ def test_docker_cluster_prepare_then_start_launches_coordinator(tmp_path, monkey
     assert "docker image inspect" in prepare_command
     assert "docker run -dit" in prepare_command
     assert "-v /opt/hyhal:/opt/hyhal:ro" in prepare_command
-    assert "-v /root/.ssh:/root/.ssh:ro" in prepare_command
+    assert "-v /root/.ssh:" not in prepare_command
+    assert "id_ed25519_cluster_manager" in prepare_command
+    assert shlex.split(prepare_command)[1] == "-S"
     assert "docker exec -d -u root train /usr/sbin/sshd -D -p" in prepare_command
     assert "nohup sshd" not in prepare_command
     # Training starts in the first allocated host's container through SSH.
@@ -130,6 +136,35 @@ def test_prepare_new_containers_reuses_existing_container(tmp_path, monkeypatch)
     assert "clush" in command
     assert "docker container inspect" in command
     assert "docker rm -f" not in command
+
+
+def test_ssh_setup_failure_blocks_container_preparation(tmp_path, monkeypatch):
+    monkeypatch.setenv("DOCKER_IMAGE", "registry/train:latest")
+    configure = MagicMock(return_value=(1, ["node02"]))
+    monkeypatch.setattr(
+        "cluster_manager.launcher.container_ssh.ContainerSSHManager.configure", configure
+    )
+    with patch(
+        "cluster_manager.launcher.docker_launcher.CmdExecutor.execute_command",
+        return_value=(0, ""),
+    ):
+        result = DockerLauncher().prepare_new_containers("/work/run.sh", _slots_file(tmp_path))
+    assert result == (1, ["node02"])
+    configure.assert_called_once_with(["node01", "node02"])
+
+
+def test_failed_container_creation_does_not_exchange_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("DOCKER_IMAGE", "registry/train:latest")
+    configure = MagicMock()
+    monkeypatch.setattr(
+        "cluster_manager.launcher.container_ssh.ContainerSSHManager.configure", configure
+    )
+    with patch(
+        "cluster_manager.launcher.docker_launcher.CmdExecutor.execute_command",
+        return_value=(7, "create failed"),
+    ):
+        assert DockerLauncher().prepare_containers("/work/run.sh", _slots_file(tmp_path)) == (7, [])
+    configure.assert_not_called()
 
 
 def test_docker_start_never_installs_an_rsh_agent(tmp_path, monkeypatch):
@@ -357,8 +392,8 @@ def test_stop_script_kills_targets_without_killing_itself(tmp_path):
 @pytest.mark.parametrize(
     "reuse,state,start_code,expected_code,expected_actions",
     [
-        # Both new and reused containers check the read-only SSH mount and
-        # ensure that the detached sshd is running.
+        # Both new and reused containers initialize local keys and ensure
+        # that the detached sshd is running before the key exchange.
         ("1", "true", 0, 0, ["container", "exec", "exec"]),
         ("true", "false", 0, 0, ["container", "start", "exec", "exec"]),
         ("1", "missing", 0, 0, ["container", "image", "image", "run", "exec", "exec"]),
