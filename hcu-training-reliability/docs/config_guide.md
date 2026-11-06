@@ -118,6 +118,24 @@ Docker launcher 变量（仅 `CLUSTER_LAUNCH_MODE=docker` 使用）：
 在 `CLUSTER_LAUNCH_MODE=docker` 下，容器准备由 `clush --hostfile` 并发执行到所有训练节点，训练脚本只在
 hostfile 第一台节点的容器内通过 `docker exec -d` 启动。
 
+容器准备流程会自动建立 root 用户的容器间 SSH 免密访问：
+
+1. 各容器在本地生成独立的 `/root/.ssh/id_ed25519_cluster_manager`，复用容器时保留已有私钥。
+2. 管理器通过宿主机 SSH 收集容器公钥和 SSH 服务端公钥，将当前节点集合的公钥写入各容器
+   `authorized_keys` 的管理区块。私钥不离开容器，不依赖共享目录交换密钥。
+3. 更新 `/root/.ssh/config` 的管理区块，配置 root、`DOCKER_CONTAINER_SSH_PORT`、专用私钥和严格主机密钥校验；
+   服务端公钥存放在 `known_hosts_cluster_manager`。管理区块之外的已有授权及客户端配置保留。
+4. 验证协调节点到所有节点（含自身），以及各节点到协调节点的免密连接。任何阶段失败都会阻止本轮训练启动。
+   故障替换节点时，对新分配的整个节点集合重新交换公钥并验证，更新管理区块中的旧节点授权。
+
+镜像必须提供 `python3`、`ssh`、`ssh-keygen` 和 `/usr/sbin/sshd`。管理器到宿主机仍需事先具备免密 SSH
+及执行 Docker 的权限；训练脚本的容器 SSH 端口应与 `DOCKER_CONTAINER_SSH_PORT` 一致，例如 `11452`。
+自动配置适用于容器内 root 用户，按 hostfile 中的节点名称/IP 建立连接。
+
+新建容器不再挂载宿主机 `/root/.ssh`。复用旧容器时，若 `/root/.ssh` 或其父目录仍是挂载目录，
+准备流程会报错，避免改写宿主机或共享密钥。应先结束旧训练，再移除该 SSH 挂载并重建容器；
+设置 `DOCKER_REUSE_CONTAINER=1` 不会自动改变既有容器的挂载。
+
 NHC 的分发始终由宿主机上的 `clush` 完成。设置 `RUN_NHC_EXEC_MODE=container` 后，各目标宿主机执行
 `docker exec -u root ${DOCKER_CONTAINER_NAME} bash -lc run_nhc`；因此容器必须已经存在且可运行，并且容器内
 能够通过 `PATH` 找到 `run_nhc`。保持默认值 `host` 时，各目标宿主机直接执行 `run_nhc`。

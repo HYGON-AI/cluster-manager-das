@@ -8,6 +8,7 @@ from typing import List
 from cluster_manager.config.global_config import logger, MPI_LAUNCH_TIMEOUT
 from cluster_manager.launcher.base_launcher import BaseLauncher
 from cluster_manager.executor.cmd_executor import CmdExecutor
+from cluster_manager.launcher.container_ssh import ContainerSSHManager, INIT_SCRIPT
 class MPIRunLauncher(BaseLauncher):
 
     def __init__(self):
@@ -121,10 +122,8 @@ class MPIRunLauncher(BaseLauncher):
         mounts = ""
         if self.docker_host_share and self.docker_container_share:
             mounts += f" -v {shlex.quote(self.docker_host_share)}:{shlex.quote(self.docker_container_share)}"
-        # Match the known-good training container.  The host SSH directory is
-        # intentionally read-only: container setup must never copy keys into
-        # it; it only verifies authorized_keys before starting sshd.
-        mounts += " -v /opt/hyhal:/opt/hyhal:ro -v /root/.ssh:/root/.ssh:ro"
+        # Keep SSH credentials in each container, independent of host keys.
+        mounts += " -v /opt/hyhal:/opt/hyhal:ro"
         run_args = f" {self.docker_extra_args}" if self.docker_extra_args else ""
         # A recovery allocation may contain a newly added node. Existing
         # containers must be kept while missing containers are created.
@@ -166,29 +165,33 @@ class MPIRunLauncher(BaseLauncher):
         )
 
     def _docker_ssh_setup_command(self, _slotsfile: str) -> str:
-        """Configure the shared root key and container sshd for inner MPI.
-
-        The inner training script connects to peer containers on the host
-        network using the configured container SSH port.  The host's
-        read-only ``/root/.ssh`` is reused; no key is copied or generated there.
-        """
+        """Create a container-local key and start sshd before exchanging keys."""
         container = shlex.quote(self.container_name)
         setup = (
             "set -eu; "
             "command -v sshd >/dev/null 2>&1 || "
             "{ echo 'openssh-server/sshd is required inside the Docker image'; exit 127; }; "
+            "command -v ssh >/dev/null; command -v ssh-keygen >/dev/null; "
+            "command -v python3 >/dev/null; "
             "mkdir -p /run/sshd; "
-            "test -r /root/.ssh/authorized_keys || "
-            "{ echo 'host /root/.ssh/authorized_keys is required' >&2; exit 127; }; "
-            "ssh-keygen -A >/dev/null 2>&1 || true; "
+            + shlex.join(['python3', '-c', INIT_SCRIPT, '/root/.ssh']) + "; "
+            "ssh-keygen -A; "
+            "test -r /etc/ssh/ssh_host_ed25519_key.pub; "
         )
+
         return (
-            f"docker exec -u root {container} bash -lc {shlex.quote(setup)}; "
+            'docker exec -u root -e CM_NEW_CONTAINER="${cm_new_container:-0}" '
+            f"{container} bash -lc {shlex.quote(setup)}; "
             f"if ! docker exec {container} pgrep -f '[s]shd.*-p {self.container_ssh_port}' >/dev/null 2>&1; then "
             f"docker exec -d -u root {container} /usr/sbin/sshd -D -p {self.container_ssh_port} "
             "-o PermitRootLogin=yes -o PasswordAuthentication=no -o PubkeyAuthentication=yes "
             "-o AuthorizedKeysFile=/root/.ssh/authorized_keys; fi"
         )
+
+    def _configure_container_ssh(self, hosts):
+        return ContainerSSHManager(
+            self.container_name, self.host_ssh_port, self.container_ssh_port
+        ).configure(hosts)
 
     def _mpirun_command(self, rank_command: str, slotsfile: str, count: int) -> str:
         command = [self.mpirun_bin, "-np", str(count), "--hostfile", slotsfile]
@@ -209,6 +212,9 @@ class MPIRunLauncher(BaseLauncher):
         if prepare_code != 0:
             logger.error("[MPI-DOCKER-PREPARE] failed nodes=%s", prepare_nodes)
             return prepare_code, prepare_nodes
+        ssh_code, ssh_failed = self._configure_container_ssh(hosts)
+        if ssh_code:
+            return ssh_code, ssh_failed
         rank_command = self._docker_rank_command(exec_path, slotsfile)
         # Inline the rank command so no launcher file must be copied to every host.
         cmd = self._mpirun_command(rank_command, slotsfile, len(hosts))

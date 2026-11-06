@@ -1,20 +1,18 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-"""Docker launcher for the mpirun + docker start mode.
+"""Docker launcher with host-side preparation and container-side training MPI.
 
-Two MPI layers are involved and they must not be confused:
+The host and container SSH paths have separate purposes and ports:
 
-* The *outer* layer runs on the hosts.  ``cluster_manager`` uses mpirun only to
-  fan a container-preparation command out to every node in the hostfile, so each
-  node ends up with the training container running.  It talks to the host sshd
-  (``MPIRUN_PLM_RSH_ARGS`` contains the port, defaulted by the deployment
-  script to ``36000``).
+* Host-side preparation uses clush to create/reuse the containers, followed by
+  host SSH to exchange their public keys. ``MPI_HOST_SSH_PORT`` selects the
+  host SSH port for the manager's direct connections (default ``22``).
 * The *inner* layer runs inside the container.  The training script starts its
   own mpirun, which reaches the peer containers through the sshd that each
   container exposes on the host network.  The port for that layer belongs to the
   training script (its own ``plm_rsh_args``), not to cluster_manager.
 
-Because the inner layer already has a working container-to-container ssh path,
+Container preparation installs and verifies the container-to-container SSH path;
 no ``plm_rsh_agent`` wrapper is installed.  PRTE invokes such an agent as
 ``agent <ssh args> HOST COMMAND`` -- a wrapper that reads ``$1`` as the hostname
 receives ``-p`` instead and makes ssh reject the remote command as a port
@@ -102,7 +100,7 @@ class DockerLauncher(MPIRunLauncher):
         hosts = self._hosts(hostfile)
         reuse_existing = True if only_missing else None
         command = (
-            f"clush -f 1000 -b --hostfile {shlex.quote(hostfile)} "
+            f"clush -S -f 1000 -b --hostfile {shlex.quote(hostfile)} "
             f"{shlex.quote(self._docker_prepare_command(exec_path, hostfile, reuse_existing))}"
         )
         logger.info(
@@ -116,7 +114,8 @@ class DockerLauncher(MPIRunLauncher):
         )
         if code != 0:
             logger.error("[DOCKER-CLUSTER-PREPARE] failed code=%s output=%s", code, output)
-        return code, []
+            return code, []
+        return self._configure_container_ssh(hosts)
 
     def prepare_new_containers(self, exec_path, hostfile) -> Tuple[int, List[str]]:
         """Prepare containers for a newly allocated/replacement node set.
